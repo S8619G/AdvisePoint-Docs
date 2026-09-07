@@ -12,7 +12,15 @@ const readline = require("node:readline");
 const { spawn } = require("node:child_process");
 
 const OWNER = "S8619G";
-const REPO = "advisepoint-docs";
+// v1.0.1.1: Repo name must match GitHub's canonical mixed-case spelling.
+// GitHub's REST API is case-insensitive for the owner/repo path, so the
+// DEFAULT_API_URL below works either way. But asset download URLs come back
+// from the API in the repo's *canonical* case ("AdvisePoint-Docs"), and the
+// isTrustedAssetUrl() prefix check is case-sensitive by default — so if REPO
+// is lowercase here, every asset URL is silently rejected and the updater
+// throws "Release asset ... was not found" even though the asset is right
+// there. That was the v1.0.0 -> v1.0.1 in-app updater failure.
+const REPO = "AdvisePoint-Docs";
 const DEFAULT_API_URL =
   `https://api.github.com/repos/${OWNER}/${REPO}/releases/latest`;
 const MAX_REDIRECTS = 8;
@@ -135,9 +143,14 @@ function isTrustedAssetUrl(value) {
     if (process.env.APD_UPDATE_API_URL) {
       return parsed.protocol === "http:" || parsed.protocol === "https:";
     }
+    // v1.0.1.1: case-insensitive path comparison. GitHub can return either
+    // the canonical repo casing or lower-cased path segments depending on
+    // how the release was created and which redirect chain the client hits.
+    // Lower-case both sides so the check tolerates any variant.
+    const expectedPrefix = `/${OWNER}/${REPO}/releases/download/`.toLowerCase();
     return parsed.protocol === "https:" &&
       parsed.hostname === "github.com" &&
-      parsed.pathname.startsWith(`/${OWNER}/${REPO}/releases/download/`);
+      parsed.pathname.toLowerCase().startsWith(expectedPrefix);
   } catch {
     return false;
   }
@@ -164,7 +177,26 @@ async function fetchLatestRelease() {
       item.size > 0)
     : null;
   if (!asset) {
-    throw new Error(`Release asset ${expectedName} was not found`);
+    // v1.0.1.1: enumerate what the API actually returned so this class of
+    // bug is diagnosable from update.log without needing the source tree.
+    // The prior message just showed the expected name and gave no hint
+    // whether the asset was missing, mis-named, or filtered by the trust
+    // check.
+    const rawList = Array.isArray(release.assets)
+      ? release.assets
+          .map((a) => {
+            const name = typeof a?.name === "string" ? a.name : "(no name)";
+            const url = typeof a?.browser_download_url === "string" ? a.browser_download_url : "(no url)";
+            const size = Number.isSafeInteger(a?.size) ? a.size : "?";
+            const trusted = isTrustedAssetUrl(url) ? "trusted" : "UNTRUSTED_URL";
+            return `${name} [${size} bytes, ${trusted}, ${url}]`;
+          })
+          .join("; ")
+      : "(release.assets is not an array)";
+    throw new Error(
+      `Release asset ${expectedName} was not found. ` +
+      `API returned ${Array.isArray(release.assets) ? release.assets.length : 0} asset(s): ${rawList || "(none)"}`,
+    );
   }
   const hashMatch = String(release.body || "").match(/^\s*sha256:\s*([a-f0-9]{64})\s*$/im);
   return {
