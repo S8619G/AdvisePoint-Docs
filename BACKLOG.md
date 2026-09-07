@@ -1290,21 +1290,43 @@ Filter/sort-candidate fields on the doc type:
 Six sortable/filterable fields is at the threshold where the current
 fixed-dropdown row starts feeling cluttered on smaller windows.
 
-## Backup & Restore (planned for v1.0.0)
+## Backup & Restore (planned for v1.0.3)
 
 **Filed:** 2026-09-03
-**Target release:** v1.0.0 (the AdvisePoint Docs rename)
-**User decision on scope:** ship as a headline v1.0.0 feature, with both
-Wipe-and-Replace and Merge import modes. Merge intentionally allows
-duplicates through without warnings — users clean up afterward with the
-existing duplicate checker.
+**Retargeted:** 2026-09-07 (originally v1.0.0, moved to v1.0.3 after
+v1.0.0 shipped without it; user chose to defer so the whole feature
+ships as one release)
+**Target release:** v1.0.3
+**User decisions on scope:**
+
+* Ship both Wipe-and-Replace and Merge import modes as one release.
+  Merge intentionally allows duplicates through without warnings —
+  users clean up afterward with the existing duplicate checker.
+* Ship manual Export + Import PLUS in-server scheduled backups
+  (see "Scheduled backups" section below — added 2026-09-07 after user
+  asked whether backup runs when the tab is closed).
+
+### Corrections vs the original 2026-09-03 spec
+
+* **DB filename** in the current data folder is `rag.db`, not `kie.db`.
+  Export/import paths must use `rag.db`.
+* **Data folder** is `%LOCALAPPDATA%\AdvisePoint Docs\` in v1.0.0+
+  (renamed from `%LOCALAPPDATA%\KyoInfoExplorer\`). Confirmed live in
+  v1.0.2.
+* **Zip encoder** — the v0.9.31 pure-Node encoder is in-memory-only
+  with no ZIP64 support and is insufficient for hundreds-of-MB backups
+  with `pages/**`. Add the `archiver` npm dependency (streaming, ZIP64,
+  industry-standard, no native deps) for this feature. Keep the
+  in-memory encoder for diagnostics export.
+* **better-sqlite3 v11.7.0 supports `VACUUM INTO`** — confirmed in
+  earlier analysis; safe to use for the consistent-snapshot path.
 
 ### What to build
 
 A Settings-panel "Backup & Restore" section with two primary actions:
 
 1. **Export backup** — produces a single `.zip` containing:
-   * `db/kie.db` — SQLite snapshot written via `VACUUM INTO` so it is
+   * `db/rag.db` — SQLite snapshot written via `VACUUM INTO` so it is
      transactionally consistent even if writes are happening.
    * `pages/**` — every file under `RAG_PAGES_DIR` (page renders and
      extracted text) so the viewer works after restore with no re-render.
@@ -1314,9 +1336,13 @@ A Settings-panel "Backup & Restore" section with two primary actions:
    * `manifest.json` — `{ app_version, schema_version, exported_at,
      document_count, chunk_count, pages_bytes }` for validation and
      compatibility checks on import.
-   * Reuse the pure-Node ZIP encoder that already ships for diagnostics
-     export (added in v0.9.31) — no new native dependency.
-   * Suggested filename: `kie-backup-YYYYMMDD-HHMMSS.zip`.
+   * Use the `archiver` npm package (streaming, ZIP64, no native deps).
+     The v0.9.31 in-memory pure-Node encoder is retained for diagnostics
+     export but is insufficient for hundreds-of-MB backups — see the
+     "Corrections" section at the top of this entry.
+   * Suggested filename: `advisepoint-docs-backup-YYYYMMDD-HHMMSS.zip`
+     (matches the scheduled-backup filename pattern; makes retention
+     filtering trivial).
 
 2. **Import backup** — accepts a `.zip` produced by Export and offers
    a mode picker:
@@ -1388,15 +1414,74 @@ A Settings-panel "Backup & Restore" section with two primary actions:
    UI state all present. Search works immediately with no
    re-embedding, no re-ingest.
 
-### Explicitly out of scope for v1.0.0
+### Scheduled backups (added 2026-09-07 for v1.0.3)
 
-* Scheduled/automatic backups with retention policy — nice to have,
-  defer to a later release.
+User context question that drove this: "Will this backup feature still
+operate if the browser tab is not running?" Backup is server-side, so
+it runs whenever the Node server is running — tab optional. But if the
+launcher window is closed, the server exits and no backup can run.
+
+Option chosen: **Option 2 — manual + in-server scheduled backups**
+(runs while the launcher is open; skips if the app is fully closed).
+Option 3 (Windows Task Scheduler) was rejected as too complex for now
+and may need admin rights. Revisit if users ask for truly-offline
+recurring backups in a later release.
+
+#### What to build
+
+* **Scheduler module** — server-side. Single-process app, so use
+  `setInterval` + a persisted "next run" timestamp rather than a full
+  cron library. On server start, compute the next scheduled run from
+  the persisted last-run timestamp and the configured cadence; fire
+  once now if we missed a scheduled slot while the app was closed
+  (with a small grace window — e.g. don't fire if the app has only
+  been open 30 s and we missed by an hour).
+* **Settings UI additions** in the Backup & Restore card:
+  * **Automatic backup** — radio: Off / Daily / Weekly
+  * **Time of day** — for Daily/Weekly (default 02:00 local, but only
+    fires if the app is open at that time)
+  * **Backup folder** — path picker; default
+    `%LOCALAPPDATA%\AdvisePoint Docs\backups\`
+  * **Keep last N backups** — numeric input, default 7; oldest are
+    deleted automatically after each successful run
+  * **Last backup** — read-only display of timestamp + status
+    (success / failed with reason)
+* **Persisted settings** — add a small `app_settings` table (or extend
+  the existing settings table if one already exists) with columns for
+  `backup_cadence`, `backup_time`, `backup_folder`, `backup_retention`,
+  `backup_last_run_at`, `backup_last_status`, `backup_last_error`.
+* **Retention policy** — after a successful scheduled backup, delete
+  the oldest backup files in the backup folder if the count exceeds
+  the configured retention. Only delete files matching the
+  `advisepoint-docs-backup-*.zip` pattern so we don't touch anything
+  else the user may have placed there.
+* **Filename convention for scheduled backups** —
+  `advisepoint-docs-backup-YYYYMMDD-HHMMSS.zip` (matches manual export
+  filename pattern; retention filter is straightforward).
+* **Logging** — scheduled runs write to `server.log` with clear
+  `[BACKUP]` prefix, and the last-run status is surfaced in the
+  Settings UI. Consider a small "Backup history" collapsible section
+  showing the last 10 runs with timestamps and outcomes.
+* **Concurrency guard** — if a manual backup is in progress when the
+  scheduled run fires (or vice versa), skip and log; do not queue.
+
+#### Not doing yet
+
+* Truly-offline scheduled backups (Windows Task Scheduler / service).
+  Revisit if users report needing them.
+* Notification / toast when scheduled backup completes. Optional
+  polish; the Settings status readout is sufficient.
+
+### Explicitly out of scope for v1.0.3
+
+* Windows Task Scheduler integration for backups that run when the
+  app is fully closed (see "Not doing yet" above).
 * Import-side duplicate detection — user has requested we skip this
   deliberately and lean on the existing duplicate checker.
 * Encrypted backups — not requested; add later if a user asks.
 * Selective / partial export (single doc, single folder) — not asked
   for; the full-DB backup covers the stated use case.
+* Cloud-target backups (S3, Google Drive, OneDrive). Not asked for.
 
 ### Rough effort estimate (from planning session on 2026-09-03)
 
