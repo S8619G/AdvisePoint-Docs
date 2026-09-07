@@ -412,6 +412,78 @@ bumped one more size step to `text-base`, bumped weight to `font-bold`,
 and added underline-on-hover for a clearer link affordance. Dark-mode
 contrast confirmed clean during user evaluation.
 
+## Zip filename — version-free canonical name (v1.0.3 — PLANNED)
+
+**Filed:** 2026-09-07
+**Target release:** v1.0.3
+**Status:** planned, not implemented
+**Ask:** Release zips are named `AdvisePoint-Docs-v<VERSION>.zip`. When
+Windows Explorer extracts them it creates a wrapper folder named after
+the zip (e.g. `AdvisePoint-Docs-v1.0.2\`) that contains the real app
+folder. After the in-place updater bumps the app to v1.0.3, the wrapper
+folder still says `v1.0.2` and misleads the user about what's actually
+installed.
+
+### Decision
+
+Adopt Option 1a from the 2026-09-07 discussion: rename the release asset
+to `AdvisePoint-Docs.zip` (no version) starting with v1.0.3. Version
+identity remains discoverable via the GitHub release page title, the
+git tag, the release notes SHA-256, and the app's header / About view.
+
+One-time cost: v1.0.2's updater expects `AdvisePoint-Docs-v<VERSION>.zip`
+and will not find `AdvisePoint-Docs.zip`, so v1.0.2 users must do a
+single manual download of v1.0.3 from the release page. After that,
+auto-updates resume normally.
+
+### Changes to make when building v1.0.3
+
+1. **`packaging/updater/updater.cjs`** — broaden `expectedName` matcher
+   (currently line ~170) to accept EITHER `advisepoint-docs.zip` OR
+   `advisepoint-docs-v<VERSION>.zip` (case-insensitive). Prefer the
+   version-free name when both are present. The legacy pattern can be
+   dropped in v1.1.0 after enough time on the new naming.
+2. **Packaging invocation** — pass `--output
+   /home/user/workspace/AdvisePoint-Docs.zip` to
+   `scripts/package-windows.mjs`. Keep the local file in
+   `/home/user/workspace/` versioned for archival
+   (`AdvisePoint-Docs-v1.0.3.zip`) via a copy, but upload as
+   `AdvisePoint-Docs.zip`.
+3. **Release upload script** — upload asset with `name` parameter set to
+   `AdvisePoint-Docs.zip`, not the versioned filename. Update the
+   `create_release_v1_0_3.py` template accordingly.
+4. **Release notes** — open with a clearly labeled "Upgrade note for
+   v1.0.2 users" callout explaining that this release must be downloaded
+   manually (in-app updater in v1.0.2 can't locate the renamed asset)
+   and that auto-updates resume in v1.0.4+.
+5. **Wiki convention** — update
+   `projects/kyo-info-explorer-YsNMksjdR3.Nlw.5pQCZUw/knowledge/concepts/conventions.md`
+   to record the new zip-naming rule and the transitional matcher rule
+   in the updater.
+6. **Share to user** — continue calling `share_file` with the same
+   versioned display name pattern (`AdvisePoint-Docs-v1.0.3.zip`) so the
+   asset appears in the artifact history with a distinguishable name,
+   even though the file uploaded to GitHub is `AdvisePoint-Docs.zip`.
+
+### Rejected alternatives
+
+- **Option 1b (change filename in v1.0.3 without updater compat)** —
+  breaks auto-updates for every existing install. Rejected.
+- **Option 1 with 2-step rollout (updater fix in v1.0.3, rename in
+  v1.0.4)** — no manual-download cost, but pushes the visible
+  naming fix out another release. Rejected in favor of
+  fixing it once.
+- **Option 2 (versioned zip filename, version-free inner wrapper folder)**
+  — requires users to know to move only the inner folder, which they
+  won't. Rejected.
+- **Option 3 (self-extracting exe or MSI)** — breaks the portable-app
+  positioning, requires code-signing to avoid SmartScreen warnings.
+  Rejected.
+- **Option 4 (version-free filename + VERSION.txt marker inside)** —
+  marker file has to be updated by the in-place updater to stay
+  truthful, or it lies. Not worth the maintenance cost when the app's
+  About view already shows the version.
+
 ## Favicon — tab icon shows document + chevron mark (v1.0.3 — STAGED)
 
 **Filed:** 2026-09-07
