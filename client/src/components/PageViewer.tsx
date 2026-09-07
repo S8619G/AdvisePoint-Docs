@@ -19,7 +19,7 @@
 //   - Keyboard: `[` and `]` always navigate pages. ArrowLeft/Right navigate
 //     pages when zoom == 1, and pan the image when zoomed in.
 
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   Dialog,
   DialogContent,
@@ -121,6 +121,15 @@ export function PageViewerDialog({
   //                and rolls over to the next / previous page at the edges.
   const [fitMode, setFitMode] = useState<"fit" | "readable">("fit");
 
+  // v1.0.2 - Fit-mode auto-promotion. Fit renders the image at a reduced
+  // resolution (max-w-full max-h-full) so it fits the viewport; CSS-scaling
+  // that shrunken render pixelates badly. When the user tries to zoom in
+  // from Fit, promote to Readable (natural-size render) first, then apply
+  // the same zoom step so the intent is preserved. Ref so the useZoomPan
+  // callback stays stable across mode changes.
+  const fitModeRef = useRef(fitMode);
+  useEffect(() => { fitModeRef.current = fitMode; }, [fitMode]);
+
   // Refs so the wheel-page-nav callback (installed once in useZoomPan) can
   // reach the freshest pageNumber and status without re-binding on every
   // render.
@@ -161,7 +170,32 @@ export function PageViewerDialog({
       // which is exactly what clampPan expects (it multiplies by zoom).
       return { width: el.clientWidth, height: el.clientHeight };
     },
+    // v1.0.2 - Auto-promote to Readable on any zoom-in from Fit. The hook
+    // fires this before actually zooming and, if we return true, aborts its
+    // own zoom. We swap to Readable (which sets zoom to READABLE_ZOOM = 1
+    // at natural image size) so the promoted view is already a crisp
+    // render. The user's next `+` / wheel / double-click will then scale
+    // the natural-size render, which stays sharp.
+    onZoomInFromFit: () => {
+      if (fitModeRef.current !== "fit") return false;
+      promoteToReadable();
+      return true;
+    },
   });
+
+  // v1.0.2 - Shared helper for auto-promotion. Mirrors the Fit->Readable
+  // path of the toolbar toggle (setFitMode + setZoom + scrollToEdge dance)
+  // but without changing the toggle's own behavior. Landing at the top of
+  // the page matches the toggle: the user just asked to see this page
+  // magnified, so start at the top of it.
+  const promoteToReadable = useCallback(() => {
+    setFitMode("readable");
+    zoom.setZoom(READABLE_ZOOM);
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => zoom.scrollToEdge("top"));
+    });
+    landAtRef.current = "top";
+  }, [zoom]);
 
   // v0.9.25 - preserve zoom on page change and land at the requested edge.
   // Fit mode: always center (there's nothing to scroll).

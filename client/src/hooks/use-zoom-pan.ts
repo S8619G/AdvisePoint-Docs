@@ -76,6 +76,17 @@ export type UseZoomPanOptions = {
   // If omitted, panning falls back to the classic (vp * (zoom - 1)) / 2 model,
   // which only allows panning when zoom > 1.
   getContentSize?: () => { width: number; height: number } | null;
+  // v1.0.2 - Fit-mode zoom promotion. When the consumer renders the image at
+  // a reduced resolution while at zoom=1 ("Fit" mode) and a full-resolution
+  // render is only available in a separate mode ("Readable"), CSS-scaling the
+  // Fit-mode image looks pixelated. This callback lets the consumer intercept
+  // any zoom-in gesture that would cross zoom=1 upward and swap modes
+  // instead. Return `true` to indicate the consumer handled the intent (the
+  // hook aborts its own zoom); return `false` (or omit) to let the hook
+  // proceed normally. Fires for: `+` button (zoomIn/zoomOut are external and
+  // covered by the consumer), Ctrl+wheel-up, wheel-zoom mode, and
+  // double-click.
+  onZoomInFromFit?: () => boolean;
 };
 
 export type UseZoomPanReturn = {
@@ -194,7 +205,18 @@ export function useZoomPan(opts: UseZoomPanOptions = {}): UseZoomPanReturn {
     });
   }, [clampPan]);
 
-  const zoomIn = useCallback(() => setZoom(zoomRef.current * ZOOM_STEP), [setZoom]);
+  // v1.0.2 - Keep the promotion callback in a ref so wheel/double-click
+  // handlers can read the freshest reference without re-binding.
+  const onZoomInFromFitRef = useRef(opts.onZoomInFromFit);
+  onZoomInFromFitRef.current = opts.onZoomInFromFit;
+
+  const zoomIn = useCallback(() => {
+    // v1.0.2 - Give the consumer a chance to promote out of Fit mode before
+    // we scale up a low-resolution render. If it handles the intent (returns
+    // true), skip our own zoom.
+    if (zoomRef.current <= 1.001 && onZoomInFromFitRef.current?.()) return;
+    setZoom(zoomRef.current * ZOOM_STEP);
+  }, [setZoom]);
   const zoomOut = useCallback(() => setZoom(zoomRef.current / ZOOM_STEP), [setZoom]);
   const reset = useCallback(() => setState({ zoom: 1, panX: 0, panY: 0 }), []);
   const resetPan = useCallback(() => setState((prev) => (prev.panX === 0 && prev.panY === 0 ? prev : { ...prev, panX: 0, panY: 0 })), []);
@@ -388,6 +410,10 @@ export function useZoomPan(opts: UseZoomPanOptions = {}): UseZoomPanReturn {
         if (e.ctrlKey || e.metaKey) return;
         e.preventDefault();
         e.stopPropagation();
+        // v1.0.2 - Fit-mode zoom promotion. When crossing zoom=1 upward,
+        // give the consumer a chance to swap modes instead of scaling up a
+        // low-resolution Fit render.
+        if (stateRef.current.zoom <= 1.001 && dY < 0 && onZoomInFromFitRef.current?.()) return;
         setState((prev) => {
           const factor = Math.exp(-dY * 0.0015);
           const newZoom = clamp(prev.zoom * factor, MIN_ZOOM, MAX_ZOOM);
@@ -408,6 +434,8 @@ export function useZoomPan(opts: UseZoomPanOptions = {}): UseZoomPanReturn {
       if (e.ctrlKey || e.metaKey) {
         e.preventDefault();
         e.stopPropagation();
+        // v1.0.2 - Same Fit-mode zoom promotion as the "zoom" wheel mode.
+        if (stateRef.current.zoom <= 1.001 && dY < 0 && onZoomInFromFitRef.current?.()) return;
         setState((prev) => {
           const factor = Math.exp(-dY * 0.0015);
           const newZoom = clamp(prev.zoom * factor, MIN_ZOOM, MAX_ZOOM);
@@ -495,6 +523,10 @@ export function useZoomPan(opts: UseZoomPanOptions = {}): UseZoomPanReturn {
     e.preventDefault();
     const vp = viewportRef.current;
     if (!vp) return;
+    // v1.0.2 - Fit-mode zoom promotion. Double-click from zoom=1 is a
+    // "zoom in" gesture too; give the consumer a chance to swap modes
+    // rather than scaling up a low-resolution Fit render.
+    if (stateRef.current.zoom <= 1.001 && onZoomInFromFitRef.current?.()) return;
     setState((prev) => {
       if (prev.zoom > 1.001) {
         return { zoom: 1, panX: 0, panY: 0 };

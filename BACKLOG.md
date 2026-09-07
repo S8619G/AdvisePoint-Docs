@@ -389,46 +389,64 @@ closing the tab is sufficient before immediately retrying.
 * Confirm the shutdown endpoint rejects GET, non-loopback, missing-header,
   and cross-origin requests.
 
-## "Back to library" link — larger, bold (next beta)
+## "Back to library" link — larger, bold — SHIPPED
 
 **Filed:** 2026-09-03
-**Target release:** v0.9.32
-**Status:** Implemented for v0.9.32.
+**Shipped in:** v0.9.32 (initial pass) and further strengthened in a later
+build carried into v1.0.x.
+**Status:** DONE. Confirmed live in v1.0.1.1 (2026-09-07).
 **Ask:** Make the "← Back to library" link in the doc-detail header easier
 to see.
 
-### Change
+### What actually shipped
 
-`client/src/pages/library.tsx` around line 1214. Current classes:
-
-```tsx
-className="text-xs text-muted-foreground hover:text-foreground"
-```
-
-Change to:
+`client/src/pages/library.tsx` (link-back on the doc-detail header). Final
+classes used in v1.0.1.1:
 
 ```tsx
-className="text-sm font-semibold text-foreground hover:text-primary"
+className="text-base font-bold text-foreground hover:text-primary hover:underline underline-offset-4"
 ```
 
-That gives:
+Stronger than the original spec proposed (`text-sm font-semibold`) —
+bumped one more size step to `text-base`, bumped weight to `font-bold`,
+and added underline-on-hover for a clearer link affordance. Dark-mode
+contrast confirmed clean during user evaluation.
 
-* `text-xs` → `text-sm` (12px → 14px, matches the primary nav links).
-* `text-muted-foreground` → `text-foreground` (full contrast instead of
-  the low-contrast muted gray that made it hard to spot).
-* Adds `font-semibold` for the bold weight the user asked for.
-* Hover color moves to `text-primary` so the affordance still reads as
-  a link on hover instead of collapsing into the same color it already
-  is at rest.
+## Page viewer — sharper zoom from Fit mode — SHIPPED
 
-Optionally: bump the arrow to a lucide `ChevronLeft` icon at `h-4 w-4`
-for better visual weight, but text arrow is fine and lower risk.
+**Filed:** 2026-09-07
+**Shipped in:** v1.0.2
+**Status:** DONE. Confirmed in v1.0.2 build.
+**Ask:** In the page viewer, opening a doc in whole-page "Fit" view and
+then zooming in produced badly pixelated text. Zoom worked well only after
+manually switching to Readable mode first.
 
-### Verify
+### Root cause
 
-* Screenshot the doc-detail page at desktop and mobile widths.
-* Confirm it doesn't visually crowd the title `<h1>` sitting below it.
-* Confirm dark-mode contrast is still clean.
+Fit mode renders the page image with `max-w-full max-h-full` — shrunk to
+fit the viewport, typically well below the source resolution. `use-zoom-pan`
+uses CSS `transform: scale(...)` on that already-shrunk render, so scaling
+up any factor > 1 just enlarged pixels.
+
+### What shipped
+
+Added fit-mode auto-promotion. Any zoom-in gesture initiated while in Fit
+mode now first switches to Readable (which re-renders the image at natural
+size) instead of scaling up the low-res render. Covered entry points:
+
+* `+` toolbar button
+* Keyboard `+` / `=`
+* Ctrl + wheel-up (both "zoom" and "scroll" wheel modes)
+* Double-click on the page
+
+Implemented as a new `onZoomInFromFit?: () => boolean` option on
+`useZoomPan`. The hook calls it whenever a zoom-in gesture is about to
+cross `zoom = 1` upward and, if it returns true, aborts its own zoom.
+`PageViewer` supplies a callback that calls `promoteToReadable()` (swap
+fitMode + set zoom to `READABLE_ZOOM` + scrollToEdge("top")), which
+mirrors the toolbar's Fit->Readable path.
+
+Zoom-out and the explicit toolbar toggle keep their original behavior.
 
 ## Delete confirmation dialog — verbose warning before document delete (v1.0.1 BUG FIX — STAGED)
 
