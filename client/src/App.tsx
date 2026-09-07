@@ -9,7 +9,7 @@ import Upload from "@/pages/upload";
 import Library from "@/pages/library";
 import Query from "@/pages/query";
 import SchemaPage from "@/pages/schema";
-import { Database, FileUp, Library as LibraryIcon, Search, Settings } from "lucide-react";
+import { FileUp, Library as LibraryIcon, Search, Settings } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { APP_VERSION } from "./version";
 import { UpdateBanner } from "@/components/UpdateBanner";
@@ -38,12 +38,18 @@ function TopNav() {
     <header className="sticky top-0 z-40 border-b border-border/60 bg-background/80 backdrop-blur">
       <div className="mx-auto flex max-w-[1400px] items-center gap-6 px-6 py-3">
         <Link href="/" className="flex items-center gap-2">
-          <span className="grid h-7 w-7 place-items-center rounded-md bg-primary text-primary-foreground">
-            <Database className="h-4 w-4" />
-          </span>
+          {/* Header brand mark — served from /public/favicon.svg. The SVG has
+              its own navy tile + light-blue border, so we do NOT wrap it in a
+              colored container. Height matches the surrounding text baseline. */}
+          <img
+            src="/favicon.svg"
+            alt=""
+            aria-hidden="true"
+            className="h-7 w-7"
+          />
           <span className="font-semibold tracking-tight">AdvisePoint Docs</span>
-          <span className="ml-1 rounded-md border border-amber-400/40 bg-amber-500/10 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-amber-600 dark:text-amber-400">
-            v{APP_VERSION} BETA
+          <span className="ml-1 rounded-md border border-primary/40 bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-primary">
+            v{APP_VERSION}
           </span>
         </Link>
         <nav className="flex items-center gap-1">

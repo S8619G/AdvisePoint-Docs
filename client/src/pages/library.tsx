@@ -12,6 +12,16 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { PageViewerDialog } from "@/components/PageViewer";
 import { Image as ImageIcon } from "lucide-react";
 import { AUDIENCES, CONFIDENTIALITY, LIFECYCLE_STATUS, RELEASE_CHANNELS, releaseChannelLabel } from "@shared/schema";
@@ -1229,6 +1239,9 @@ function DocDetail({ id }: { id: string }) {
   // start page is remembered so "Open page X" then tabbing away and
   // back opens X, not page 1.
   const [pageViewerOpen, setPageViewerOpen] = useState(false);
+  // v1.0.1: Delete confirmation dialog state. Kept local (not persisted to
+  // the tab store) so navigating away and back doesn't reopen it.
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const pageViewerStart = detail?.pageViewerStart;
   const setPageViewerStart = useCallback((n: number | undefined) => {
     updateDocDetail(id, { pageViewerStart: n });
@@ -1315,9 +1328,50 @@ function DocDetail({ id }: { id: string }) {
           <Button variant="outline" size="sm" onClick={() => openPageViewer(1)} data-testid="button-view-pages">
             <ImageIcon className="mr-2 h-3.5 w-3.5" />View original pages
           </Button>
-          <Button variant="destructive" size="sm" onClick={() => del.mutate()} data-testid="button-delete">
+          {/* v1.0.1: Delete now requires explicit confirmation. Previous
+              behavior was one-click destructive with zero warning — a serious
+              footgun, especially on trackpads. AlertDialog defaults focus to
+              Cancel so Enter is safe. */}
+          <Button
+            variant="destructive"
+            size="sm"
+            onClick={() => setDeleteConfirmOpen(true)}
+            data-testid="button-delete"
+          >
             <Trash2 className="mr-2 h-3.5 w-3.5" />Delete
           </Button>
+          <AlertDialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Delete this document?</AlertDialogTitle>
+                <AlertDialogDescription asChild>
+                  <div className="space-y-2">
+                    <p>This will permanently remove:</p>
+                    <ul className="list-disc pl-5 space-y-1">
+                      <li>The document file and its extracted text</li>
+                      <li>All rendered pages and thumbnails</li>
+                      <li>Search index entries (this document will no longer appear in Query results)</li>
+                      <li>Any document-specific settings (Product Model, Document Type, custom metadata)</li>
+                    </ul>
+                    <p className="font-semibold text-destructive">This action cannot be undone.</p>
+                  </div>
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel data-testid="button-delete-cancel">Cancel</AlertDialogCancel>
+                <AlertDialogAction
+                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                  onClick={() => {
+                    setDeleteConfirmOpen(false);
+                    del.mutate();
+                  }}
+                  data-testid="button-delete-confirm"
+                >
+                  Delete document
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
         </div>
       </div>
 

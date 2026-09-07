@@ -1,18 +1,33 @@
-// Text extraction from uploaded files (PDF, DOCX, TXT, MD)
-// Runs entirely locally — no external API calls.
+// server/extract.ts
+//
+// Thin async wrapper around a long-lived worker_threads Worker that runs
+// the actual PDF/DOCX/TXT/MD extraction off the main event loop.
+//
+// Why: pdf-parse and mammoth block Node's single-threaded event loop for
+// many seconds on large files. While blocked, /api/health and /api/heartbeat
+// can't respond, and the client shows a false "backend down" modal even
+// though the upload is fine. Moving extraction to a worker keeps the event
+// loop responsive so health polls succeed throughout the upload.
+//
+// Design decisions:
+//   - Pool size 1. pdf-parse has non-trivial cold-start cost; reusing one
+//     worker across uploads avoids that. Two uploads land at once? The
+//     second waits for the first, which is exactly what happened before
+//     (extract was serialized by the event loop anyway).
+//   - Worker script is hand-written CJS at server/workers/extract-worker.cjs
+//     (dev) / dist/workers/extract-worker.cjs (packaged). NOT bundled by
+//     esbuild — it require()s pdf-parse and mammoth from node_modules at
+//     runtime, which the portable zip already ships.
+//   - Buffer is transferred (not copied) via postMessage transferList.
+//     Even a 100 MB PDF moves to the worker with zero memcpy cost.
+//   - If the worker crashes, respawn on the next request. Never leave the
+//     server permanently unable to extract.
 
-// pdf-parse (v2) exposes a PDFParse class; mammoth exports a namespace.
-// Load lazily so a broken install of one doesn't kill server startup.
-function loadPdfParse() {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const mod = require("pdf-parse");
-  return mod.PDFParse;
-}
-function loadMammoth() {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const mod = require("mammoth");
-  return mod.default ?? mod;
-}
+import { Worker } from "node:worker_threads";
+import { existsSync } from "node:fs";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 
 export type ExtractResult = {
   text: string;
@@ -20,81 +35,143 @@ export type ExtractResult = {
   format: "pdf" | "docx" | "text" | "markdown";
 };
 
-export async function extractTextFromFile(
-  filename: string,
-  buffer: Buffer,
-): Promise<ExtractResult> {
-  const lower = filename.toLowerCase();
-
-  if (lower.endsWith(".pdf")) {
-    const PDFParse = loadPdfParse();
-    // The buffer we receive is a Node Buffer; pdf-parse v2 wants a Uint8Array-compatible value.
-    const parser = new PDFParse({ data: new Uint8Array(buffer) });
-    try {
-      const result = await parser.getText();
-      return {
-        text: normalizePdfText(result.text ?? ""),
-        page_count: typeof result.total === "number" ? result.total : (Array.isArray(result.pages) ? result.pages.length : null),
-        format: "pdf",
-      };
-    } finally {
-      try { await parser.destroy(); } catch { /* best-effort cleanup */ }
-    }
+// ---------------------------------------------------------------------------
+// Worker script path resolution.
+//
+// dev:      tsx server/index.ts runs from repo root
+//           -> server/workers/extract-worker.cjs
+// prod:     dist/index.cjs runs from wherever the launcher puts it
+//           -> dist/workers/extract-worker.cjs (next to index.cjs)
+//
+// We try packaged layout first, dev layout second. __dirname behaves
+// differently under CJS vs ESM tsx; handle both.
+// ---------------------------------------------------------------------------
+function resolveWorkerPath(): string {
+  // In the bundled CJS output, __dirname is dist/. In dev under tsx-ESM,
+  // import.meta.url is server/extract.ts. Handle both.
+  let here: string;
+  try {
+    // ESM branch (tsx dev mode). @ts-expect-error avoided by runtime check.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const metaUrl = (import.meta as any)?.url as string | undefined;
+    here = metaUrl ? dirname(fileURLToPath(metaUrl)) : __dirname;
+  } catch {
+    here = __dirname;
   }
 
-  if (lower.endsWith(".docx")) {
-    const mammoth = loadMammoth();
-    // convertToMarkdown preserves heading levels — perfect for our heading-aware chunker
-    const result = await mammoth.convertToMarkdown({ buffer });
-    return {
-      text: result.value ?? "",
-      page_count: null,
-      format: "docx",
-    };
-  }
+  const candidates = [
+    // Packaged: dist/index.cjs sits next to dist/workers/
+    resolve(here, "workers", "extract-worker.cjs"),
+    // Dev: server/extract.ts sits next to server/workers/
+    resolve(here, "workers", "extract-worker.cjs"),
+    // Fallback: repo-root relative (in case cwd is odd)
+    resolve(process.cwd(), "server", "workers", "extract-worker.cjs"),
+    resolve(process.cwd(), "dist", "workers", "extract-worker.cjs"),
+  ];
 
-  if (lower.endsWith(".md") || lower.endsWith(".markdown")) {
-    return {
-      text: buffer.toString("utf8"),
-      page_count: null,
-      format: "markdown",
-    };
-  }
-
-  if (lower.endsWith(".txt")) {
-    return {
-      text: buffer.toString("utf8"),
-      page_count: null,
-      format: "text",
-    };
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
   }
 
   throw new Error(
-    `Unsupported file type: ${filename}. Supported: .pdf, .docx, .txt, .md`,
+    "extract-worker.cjs not found in any expected location. " +
+      "Checked: " +
+      candidates.join(", "),
   );
 }
 
-// PDFs come out of pdf-parse with awkward line breaks — collapse them into paragraphs
-// while preserving double-newline paragraph breaks and heading-like lines.
-function normalizePdfText(raw: string): string {
-  // Normalize line endings
-  let s = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+// ---------------------------------------------------------------------------
+// Worker lifecycle: lazy spawn, respawn on death.
+// ---------------------------------------------------------------------------
+let worker: Worker | null = null;
+const pending = new Map<
+  string,
+  { resolve: (r: ExtractResult) => void; reject: (e: Error) => void }
+>();
 
-  // Remove form feeds
-  s = s.replace(/\f/g, "\n\n");
+function attachWorker(w: Worker): void {
+  w.on("message", (msg: { id: string; ok: boolean; result?: ExtractResult; error?: string }) => {
+    const p = pending.get(msg.id);
+    if (!p) return; // stray message — ignore
+    pending.delete(msg.id);
+    if (msg.ok && msg.result) {
+      p.resolve(msg.result);
+    } else {
+      p.reject(new Error(msg.error ?? "unknown extraction error"));
+    }
+  });
 
-  // Join lines within a paragraph: a single newline followed by a lowercase letter
-  // is almost always a wrap, not a real break.
-  s = s.replace(/([^\n])\n(?=[a-z0-9(\[])/g, "$1 ");
+  w.on("error", (err) => {
+    console.error("[extract-worker] worker error:", err);
+    // Fail every in-flight request; the caller will get a clean error and can retry.
+    const inflight = Array.from(pending.entries());
+    pending.clear();
+    for (const [, p] of inflight) {
+      p.reject(new Error(`extraction worker error: ${err.message}`));
+    }
+    // Force next request to spawn a fresh worker.
+    if (worker === w) worker = null;
+  });
 
-  // Collapse runs of 3+ newlines
-  s = s.replace(/\n{3,}/g, "\n\n");
+  w.on("exit", (code) => {
+    if (code !== 0) {
+      console.error(`[extract-worker] worker exited with code ${code}`);
+    }
+    const inflight = Array.from(pending.entries());
+    pending.clear();
+    for (const [, p] of inflight) {
+      p.reject(new Error(`extraction worker exited (code ${code})`));
+    }
+    if (worker === w) worker = null;
+  });
+}
 
-  // Trim trailing spaces per line
-  s = s
-    .split("\n")
-    .map((l) => l.replace(/[ \t]+$/, ""))
-    .join("\n");
+function ensureWorker(): Worker {
+  if (worker) return worker;
+  const scriptPath = resolveWorkerPath();
+  const w = new Worker(scriptPath);
+  attachWorker(w);
+  worker = w;
+  return w;
+}
 
-  return s.trim();
+// ---------------------------------------------------------------------------
+// Public API — same signature as before. Existing callers work unchanged.
+// ---------------------------------------------------------------------------
+export function extractTextFromFile(
+  filename: string,
+  buffer: Buffer,
+): Promise<ExtractResult> {
+  return new Promise<ExtractResult>((resolvePromise, rejectPromise) => {
+    const id = randomUUID();
+    pending.set(id, { resolve: resolvePromise, reject: rejectPromise });
+
+    // Transfer the underlying ArrayBuffer (not a copy). We slice into a fresh
+    // ArrayBuffer view first because Node Buffer often shares an ArrayBuffer
+    // with other Buffers — transferring the shared one would neuter them all.
+    const view = buffer.buffer.slice(
+      buffer.byteOffset,
+      buffer.byteOffset + buffer.byteLength,
+    );
+
+    try {
+      const w = ensureWorker();
+      w.postMessage({ id, filename, buffer: view }, [view]);
+    } catch (err) {
+      pending.delete(id);
+      rejectPromise(err instanceof Error ? err : new Error(String(err)));
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Test hook — lets a test suite tear down the worker between cases.
+// Not called by production code.
+// ---------------------------------------------------------------------------
+export async function _shutdownExtractWorker(): Promise<void> {
+  const w = worker;
+  worker = null;
+  if (w) {
+    await w.terminate();
+  }
 }

@@ -430,6 +430,534 @@ for better visual weight, but text arrow is fine and lower risk.
 * Confirm it doesn't visually crowd the title `<h1>` sitting below it.
 * Confirm dark-mode contrast is still clean.
 
+## Delete confirmation dialog — verbose warning before document delete (v1.0.1 BUG FIX — STAGED)
+
+**Filed:** 2026-09-07 · **Target release:** v1.0.1 (promoted from v1.0.2 same day) · **Classification:** bug fix · **Status:** implemented, uncommitted, awaiting v1.0.1 build trigger
+
+### Problem
+
+On the doc detail page, the red **Delete** button in the upper-right corner
+(`client/src/pages/library.tsx` line 1318) fires immediately on click with
+zero confirmation. Misclick = permanent data loss with no undo. This is a
+serious footgun, especially for service techs using a laptop trackpad in
+the field.
+
+### Fix
+
+Wrap the Delete button in a confirmation dialog (shadcn `<AlertDialog>` —
+already used elsewhere in the app) that requires an explicit second click
+to proceed.
+
+**Dialog copy (verbose, per user request):**
+
+> **Delete this document?**
+>
+> This will permanently remove:
+> - The document file and its extracted text
+> - All rendered pages and thumbnails
+> - Search index entries (this document will no longer appear in Query results)
+> - Any document-specific settings (Product Model, Document Type, custom
+>   metadata)
+>
+> **This action cannot be undone.**
+>
+> [Cancel] [Delete document]
+
+- Default focus on **Cancel** (safer default).
+- **Delete document** button uses the same destructive red as the trigger.
+- Escape key = cancel; Enter = default action (Cancel).
+
+### Implementation notes
+
+- Replace the `onClick={() => del.mutate()}` handler on the Delete button
+  with an `onClick` that opens a local `<AlertDialog>` state.
+- Wire the dialog's confirm action to `del.mutate()`.
+- No backend changes. No schema changes. No settings.
+- Keep the existing toast ("Document deleted") and post-delete navigation
+  (`window.location.hash = "/library"`).
+
+### Testing checklist
+
+- Click Delete → dialog opens, document still present.
+- Cancel → dialog closes, document still present, no mutation fired.
+- Confirm → document deleted, toast shows, navigation to library.
+- Escape key closes dialog without deleting.
+- Click outside dialog closes without deleting.
+- Rapid double-click on trigger does NOT double-fire the mutation.
+- Screen reader announces the dialog title and body correctly.
+
+### Effort estimate
+
+~30 minutes. Shipped as part of the v1.0.1 batch alongside the icon
+integration, version-pill fix, and worker-thread PDF extractor.
+
+### Related but separate
+
+A proper Trash / recycle-bin feature with configurable retention and
+restore is spec'd separately below ("Trash & Restore"). When that ships,
+this dialog's copy changes to reflect the new soft-delete behavior
+(e.g. "Move to trash? You can restore this within N days…").
+
+## Trash & Restore — app-managed soft delete with configurable retention (post-v1.0.x)
+
+**Filed:** 2026-09-07 · **Target release:** TBD (v1.1.0 candidate as a
+headline feature) · **Depends on:** v1.0.1 delete confirmation dialog
+(above) shipping first, so the two changes don't collide.
+
+### Rationale
+
+Even with the v1.0.1 confirmation dialog in place, misclicks and
+misjudgments still cost users their data. A service tech who deletes
+"MFP-4500 Service Manual" thinking it's the old revision, then realizes
+the next morning it was the current one, has no recourse today. A proper
+trash system with configurable retention gives users a safety net without
+cluttering the primary library view.
+
+### Architecture decision: app-managed trash folder
+
+After comparing three approaches (Windows Recycle Bin only, app-managed
+folder only, hybrid), we chose **app-managed trash folder** as the
+primary storage.
+
+**Why not Windows Recycle Bin as primary:**
+
+- User or OS can silently break it: manual Empty Recycle Bin, size-limit
+  auto-purge, Storage Sense timed cleanup, Recycle Bin disabled per
+  drive, files over size limit skip Recycle Bin entirely with no error.
+- No stable Node API to query Recycle Bin state — requires PowerShell +
+  Shell.Application COM interop, slow and fragile.
+- User can restore files themselves via Explorer, moving them elsewhere,
+  breaking our restore path.
+- Failure UX becomes "sorry, gone, not our fault" — worse than not
+  offering restore at all.
+
+**Why app-managed folder wins:**
+
+- 100% restore reliability within the retention window.
+- Accurate trash size, count, expiry — always.
+- Consistent with existing "data folder never touched on updates" rule
+  (see concepts/data-and-storage in the project wiki).
+- Simpler implementation, fewer edge cases.
+- Cross-platform-friendly if a Mac build ever happens.
+
+**Optional future enhancement:** a "Also send a copy to Windows Recycle
+Bin" setting could add belt-and-suspenders behavior for users who want
+it. NOT in the initial MVP — add only if requested after real usage.
+
+### Storage layout
+
+```
+%LOCALAPPDATA%\AdvisePoint Docs\
+  trash\
+    <doc_id>.apdoc.zip     ← bundled document
+    <doc_id>.meta.json     ← restore metadata (see below)
+```
+
+**Bundle contents (`.apdoc.zip`):**
+
+- `manifest.json` — full document metadata (title, product model,
+  document type, custom fields, chunk IDs, upload date, original source
+  filename, delete timestamp, retention expiry)
+- `document.<ext>` — the original uploaded file (PDF, DOCX, etc.)
+- `extracted.txt` — the extracted text
+- `pages/` — all rendered page PNGs from `%LOCALAPPDATA%\AdvisePoint
+  Docs\pages\<doc_id>\`
+- `chunks.json` — FTS index entries exported for this document
+- `settings.json` — doc-specific settings (Product Model, Document Type,
+  metadata)
+
+Bundle is created with standard zip (deflate), no encryption. Users
+should be able to inspect a `.apdoc.zip` in Explorer if they want to
+verify what's preserved.
+
+**Sidecar `.meta.json`:**
+
+Small JSON file kept OUTSIDE the zip so the Trash view can render
+quickly without unzipping every bundle. Contains:
+
+```json
+{
+  "doc_id": "...",
+  "title": "MFP-4500 Service Manual",
+  "product_model": "MFP-4500",
+  "document_type": "service_manual",
+  "page_count": 342,
+  "size_bytes": 47582934,
+  "deleted_at": "2026-09-07T14:00:00Z",
+  "expires_at": "2026-10-07T14:00:00Z",
+  "bundle_path": "<doc_id>.apdoc.zip"
+}
+```
+
+### Backend changes
+
+**Database:**
+
+- No `deleted_at` column on `documents` — soft delete removes the row
+  from `documents` entirely and creates the trash bundle. This keeps
+  the query surface simple: no need to audit every SELECT to add
+  `WHERE deleted_at IS NULL`. The trash folder + sidecars are the
+  authoritative record of deleted docs.
+- Trash discovery = read `%LOCALAPPDATA%\AdvisePoint Docs\trash\*.meta.json`.
+
+**Endpoints:**
+
+- `DELETE /api/documents/:id` — changes behavior: bundles + moves to
+  trash instead of hard delete. Accepts optional `?permanent=true`
+  query param for the "Delete permanently now" case.
+- `GET /api/trash` — lists all `.meta.json` sidecars, sorted by
+  deleted_at desc. Fast (no zip inspection).
+- `POST /api/trash/:doc_id/restore` — unpacks the bundle, re-inserts
+  into `documents`, restores pages to `pages/`, rebuilds chunks in FTS
+  index, restores settings. Deletes the bundle + sidecar. Returns the
+  restored document.
+- `DELETE /api/trash/:doc_id` — permanently deletes bundle + sidecar.
+- `DELETE /api/trash` — empties trash (with confirmation on the client).
+- `GET /api/trash/stats` — returns `{ count, total_size_bytes,
+  oldest_deleted_at }` for the Settings panel and trash badge.
+
+**Purge job:**
+
+- Runs on server startup + every hour thereafter (setInterval, cleared
+  on shutdown).
+- Reads all sidecars, finds any where `expires_at < now()`, deletes
+  bundle + sidecar.
+- Uses the same worker-thread pattern as the v1.0.1 PDF extractor to
+  avoid stalling the event loop if trash is large.
+- Logs each purge to the server log with doc title + size, so users
+  investigating disk space can trace where it went.
+
+**Settings storage:**
+
+- New table `app_settings (key TEXT PRIMARY KEY, value TEXT)`, or
+  reuse an existing settings mechanism if one exists.
+- Keys: `trash.retention_days` (default: `30`),
+  `trash.enabled` (default: `true`),
+  `trash.confirm_on_permanent_delete` (default: `true`).
+
+### Client UI
+
+**New Settings panel (or route):**
+
+The app currently has a Settings icon in the top nav that isn't fully
+wired to a dedicated settings surface. This feature is a good excuse
+to build that surface. Sections:
+
+1. **Trash & Restore**
+   - Toggle: "Enable Trash (recommended)" — default on
+   - Slider or preset picker: Retention period — 7 / 30 / 90 days /
+     Forever (default 30)
+   - Read-only stats: "Current trash: 3 documents, 127 MB"
+   - Button: "Open Trash" → navigates to trash view
+   - Button: "Empty trash now" (with confirmation)
+
+**New Trash view (`/library/trash` or `/trash`):**
+
+- Table/grid of soft-deleted docs, showing:
+  - Thumbnail (first page render, extracted from bundle on demand)
+  - Title, product model, document type
+  - Deleted timestamp + "Expires in N days" countdown
+  - Bundle size
+  - Row actions: **Restore** | **Delete permanently**
+- Bulk selection: [Restore selected] [Delete selected permanently]
+- Header: trash size total, count, [Empty trash] button
+- Empty state: "Nothing in trash. Deleted documents appear here for N
+  days before being permanently removed."
+
+**Library view touches:**
+
+- Small badge on the Settings icon (or a new "Trash" nav item) showing
+  trash count when > 0.
+- Toast after soft-delete: "Moved to trash · [Undo]" — undo restores
+  immediately, expires after ~5 seconds.
+
+**Delete confirmation dialog updates (evolves from v1.0.1 dialog):**
+
+- If trash enabled:
+  > "Move to trash?
+  >
+  > This document will be preserved in trash for N more days, after
+  > which it will be permanently deleted. You can restore it any time
+  > before then from Settings → Trash.
+  >
+  > [Cancel] [Move to trash] [Delete permanently]"
+- If trash disabled: fall back to v1.0.1's verbose "permanently remove"
+  copy.
+- "Delete permanently" from the Trash view: separate second dialog
+  with the strongest language.
+
+### Restore edge cases
+
+- **Restore when doc_id already exists in `documents`:** should never
+  happen (delete removes the row), but if it does (imported same doc
+  fresh while old copy in trash), refuse restore with clear message
+  offering to open the existing doc instead.
+- **Restore when Product Model or Document Type has been deleted since:**
+  restore the doc with those fields set to whatever's in the manifest;
+  the missing type/model will appear as an unknown value in the UI
+  until the user reassigns. Do NOT silently drop the field.
+- **Restore when FTS index schema has changed since delete:** rebuild
+  chunks from `extracted.txt` on restore rather than trusting the
+  cached `chunks.json`. Slightly slower but avoids stale-schema bugs
+  across app versions.
+- **Restore when bundle is corrupt/unreadable:** show error, offer to
+  remove the sidecar (which will hide the entry from Trash view).
+- **Disk full during restore:** partial restore rollback — delete any
+  files we wrote, do not re-insert the row.
+
+### Settings/data-folder implications
+
+- Trash lives in `%LOCALAPPDATA%\AdvisePoint Docs\trash\` — consistent
+  with the "data folder never touched on updates" rule. App updates
+  will not disturb trash.
+- If a user manually deletes the trash folder, sidecars go with the
+  bundles — the app has no memory of them. This is acceptable; user
+  chose it.
+- Trash size counts toward the "data folder is getting big" mental
+  model. Consider adding trash size as a separate line in whatever
+  storage-diagnostic UI eventually appears.
+
+### Migration
+
+No migration needed. Feature is additive: pre-existing documents
+behave normally; when deleted after the update, they go to trash.
+Existing hard-deleted documents remain hard-deleted (no way to
+recover them retroactively).
+
+### Testing checklist
+
+- Delete document with trash enabled → bundle appears in trash folder,
+  sidecar created, doc gone from library, toast shows Undo option.
+- Undo toast → restores immediately, no bundle left behind.
+- Delete document with trash disabled → hard delete, no bundle created.
+- Restore document from trash view → fully functional, pages render,
+  Query results include it again, all metadata intact.
+- Restore doc whose Product Model was deleted since → doc restored,
+  model field shows as unknown.
+- Permanent delete from trash view → bundle + sidecar gone, no recovery.
+- Empty trash → all bundles + sidecars gone.
+- Purge job on startup with expired items → removes them, logs each.
+- Purge job with 100+ expired items → event loop stays responsive
+  (heartbeat + upload requests still work during purge).
+- Retention change from 30 → 7 days with existing trash items dated
+  15 days ago → those items purge on next hourly cycle.
+- Retention change from 30 → 90 days → existing items get their
+  expires_at extended? OR do they keep their original expiry? Decide
+  before implementation. Recommendation: **keep original expiry**
+  (setting change is prospective, not retroactive) with a note in the
+  Settings UI.
+- Fresh install with no trash folder → folder created lazily on first
+  delete.
+- Bundle over 4GB → does zip creation succeed? (Node's zip libs vary
+  in ZIP64 support.) Test with a large multi-manual doc.
+- App update from pre-trash version → no crashes, trash folder created
+  on first delete post-update.
+
+### Effort estimate
+
+**~2-3 days done properly:**
+
+- ~half day: backend endpoints (delete, restore, list, permanent delete,
+  stats, purge job with worker-thread offloading)
+- ~half day: bundle format + zip creation + unzip/restore logic
+- ~1 day: Trash view UI + Settings panel + delete-dialog evolution +
+  undo-toast wiring + badge on nav
+- ~half day: edge-case testing + docs
+
+Good candidate for **v1.1.0 as a headline feature**, giving it enough
+time for its own release cycle rather than piggybacking on a smaller
+version bump.
+
+### Out of scope for MVP
+
+- Windows Recycle Bin secondary copy (optional future enhancement).
+- Encrypted bundles.
+- Cross-machine restore ("export bundle from laptop A, restore on
+  laptop B") — the format supports it in principle but the UI flow is
+  a separate feature; treat as bring-your-own workflow initially.
+- Trash for other entity types (Product Models, Document Types) —
+  documents first, expand only if needed.
+
+## Text-to-Speech reader — read sections or selections aloud (post-v1.0.x)
+
+Allow the user to have any portion of a document read aloud in a human-quality
+voice. Two triggers: highlight-a-passage-and-click-play, or click the reader
+button in the doc header to read the current section top-to-bottom. Playback
+controls (play/pause/stop/speed/voice), remembered per-user preferences, and
+visual highlight of the currently-spoken sentence.
+
+### Rationale
+
+Service techs frequently need to reference a manual while their hands are on
+the printer — screws in one hand, screwdriver in the other, phone tucked
+under chin. A read-aloud feature turns the doc viewer into a hands-free
+reference. Also useful for accessibility (users with visual fatigue or
+reading difficulties) and for long procedural sections where following along
+by ear is easier than scanning.
+
+### Three implementation paths considered
+
+**Path 1 — Browser Web Speech API (RECOMMENDED for MVP):**
+
+- Uses `window.speechSynthesis` — built into every modern browser.
+- Zero cost, zero server changes, zero bundle bloat, works offline.
+- Voice quality depends on what Windows SAPI voices are installed on the
+  user's machine. Default David/Zira sound robotic; if the user installs
+  the free Microsoft Natural voices (Aria, Guy, Jenny, Christopher, etc.
+  via Settings → Time & Language → Speech → Add voices), quality jumps to
+  genuinely pleasant "human voice" territory.
+- We can detect voice quality via `voice.name` and surface a one-time
+  inline hint ("Install Microsoft Natural voices for better quality → link
+  to Settings") when only low-quality voices are present.
+- Effort estimate: **~3 hours** for a full MVP with all the controls below.
+
+**Path 2 — Cloud TTS (ElevenLabs / Azure Neural / OpenAI TTS):**
+
+- Truly indistinguishable-from-human quality.
+- Kills the offline / air-gapped story — service techs in printer closets
+  with no WiFi lose the feature.
+- Requires user's own API key + billing management on their end.
+- Effort estimate: ~1-2 days (proxy endpoint, streaming, chunking for the
+  5000-char API limits, caching to avoid re-synthesizing the same paragraph
+  and burning credits, settings UI for API key and voice picker).
+- Cost per user: ElevenLabs is ~$0.30/1000 chars cheap tier, ~$5/1000 chars
+  high-quality. A 20-page manual section could easily be $2-5 per read
+  (caching mitigates).
+
+**Path 3 — Bundled local neural TTS (Piper):**
+
+- Ship Piper binary (~15MB) + 1-2 voice models (~50-100MB each) inside the
+  portable zip. Fully local, offline, human-quality.
+- Voice quality: very good — better than SAPI defaults, close to (but not
+  quite matching) ElevenLabs. See rhasspy/piper voice samples.
+- **Bloats the portable zip from 54MB to 150-250MB** — meaningful for
+  download and USB-stick distribution scenarios.
+- More moving parts to test on customer machines (native binary, model
+  path resolution, disk I/O). First-sentence cold-start of 1-3 sec on
+  typical hardware.
+- Effort estimate: ~3-5 days.
+
+### Recommendation: ship Path 1 first, evaluate later
+
+Build the Web Speech API MVP as the headline feature of a future release.
+Treat it as validation of the feature itself — do users actually use it? On
+what content? Is SAPI quality the ceiling they hit? If yes, revisit Path 2
+or Path 3 with real usage data. If no, we saved ourselves days of work and
+avoided bloating the portable zip or requiring an API key.
+
+Do NOT combine paths in the MVP. The temptation is to build a settings
+switch "local vs cloud" from day one — resist it. Every path except the
+chosen MVP is dead code until we know the feature is used.
+
+### MVP feature spec (Path 1)
+
+**Trigger 1 — Read selection:**
+
+- When the user highlights any text inside the document detail view, a
+  small floating pill appears near the selection: **🔊 Read selection**
+- Clicking it starts playback of the selected text.
+- If the user clears the selection while playing, playback continues to
+  the end of the previously-selected passage (does not stop mid-word).
+
+**Trigger 2 — Read current section:**
+
+- Small speaker icon in the doc detail header (next to the existing
+  "Back to library" link).
+- Clicking it starts reading the currently-visible section from the top.
+- If a specific section anchor is in the URL (e.g. `/library/doc/foo#s-3`),
+  playback starts at that section, not the top of the doc.
+
+**Controls (bottom-of-viewport floating bar, appears only during playback):**
+
+- Play / Pause / Stop
+- Previous sentence / Next sentence (uses `onboundary` events to know
+  sentence boundaries)
+- Speed slider (0.5x – 2.0x, default 1.0x)
+- Voice picker (dropdown populated from `speechSynthesis.getVoices()`,
+  filtered to `voice.lang.startsWith('en')` and sorted with
+  `localService === false` neural voices first)
+- Close button (stops playback and hides the bar)
+
+**Visual feedback during playback:**
+
+- Currently-spoken sentence highlighted with a soft primary-color
+  background in the doc viewer. Uses `speechSynthesis`'s `onboundary`
+  event with `name === 'sentence'` where supported, falls back to
+  word-level boundary counts otherwise.
+- Auto-scroll toggle in the control bar — when on, scroll the viewport
+  to keep the currently-spoken sentence centered.
+
+**Persisted settings (localStorage, keyed like other prefs):**
+
+- Preferred voice (name string)
+- Preferred speed
+- Auto-scroll on/off
+- Have-seen-natural-voices-hint (boolean, so we don't nag the user every
+  session if they've dismissed the install-natural-voices banner)
+
+**Voice-quality hint:**
+
+- On first mount, check `speechSynthesis.getVoices()`. If all English
+  voices have `localService === true` AND `voice.name` matches known
+  low-quality names (David, Zira, Mark, Hazel), show a one-time inline
+  banner in the reader control bar:
+  > "For better voice quality, install Microsoft Natural voices in
+  > Windows Settings → Time & Language → Speech → Add voices."
+- Dismissible with an X. Dismissal stored in localStorage.
+- Never shown if the user already has a neural voice available.
+
+**Chunking strategy:**
+
+- Web Speech API can choke on long strings (browser-dependent, but 1000+
+  chars can silently fail in Chrome). Split input into sentence-level
+  utterances using a simple regex (`/(?<=[.!?])\s+/`), enqueue each as
+  a separate `SpeechSynthesisUtterance`, wire `onend` of each to trigger
+  the next.
+- This also makes Previous / Next sentence controls trivial to implement.
+
+**What we do NOT build in the MVP:**
+
+- Cloud TTS / bring-your-own-API-key
+- Bundled Piper binary
+- Custom voice training / voice cloning
+- Downloading synthesized audio as MP3 (nice-to-have; add later if
+  requested)
+- Reading whole documents end-to-end (start with sections and selections
+  only; whole-doc reading has scroll/UX implications worth thinking
+  through separately)
+
+### Testing checklist
+
+- Chrome, Edge, Firefox on Windows 10 and Windows 11
+- With and without Microsoft Natural voices installed
+- Text selection that spans multiple paragraphs
+- Text selection that includes a code block, table, or numbered list
+- Playback during scroll (does auto-scroll conflict with user scroll?)
+- Switching tabs mid-playback (does audio continue? should it pause?)
+- Very long section (5000+ chars) — verify chunking works, no silent fail
+- App version pill and header remain readable while the reader control
+  bar is shown
+- Playback state on page navigation — stop cleanly, don't leak an
+  utterance into the next page
+
+### Open design questions to resolve before implementation
+
+1. What happens if playback is active and the user navigates to a
+   different doc? Auto-stop and clear the bar, or ask?
+2. Should the reader be scoped only to the doc detail view, or also work
+   on Query results (read the answer + citations aloud)?
+3. Do we surface a keyboard shortcut? Suggestion: `Space` for play/pause
+   when the reader bar is visible and the user isn't in a text input.
+
+### Deferred to a later release, not the MVP
+
+- Cloud TTS (Path 2) integration — revisit after we see real MVP usage.
+- Bundled Piper (Path 3) integration — revisit only if MVP usage is
+  strong AND SAPI quality complaints are recurring.
+- Read-along mode for full documents with a persistent progress bar.
+- Bookmarks ("read from here later").
+- Export synthesized audio as MP3 for offline listening away from the app.
+
 ## v1.0.0 rename & rebrand — COMPLETED
 
 **Filed:** 2026-09-03 · **Completed:** 2026-09-05 (v1.0.0 build)

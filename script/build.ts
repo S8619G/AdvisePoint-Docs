@@ -1,6 +1,6 @@
 import { build as esbuild } from "esbuild";
 import { build as viteBuild } from "vite";
-import { rm, readFile } from "node:fs/promises";
+import { rm, readFile, mkdir, cp } from "node:fs/promises";
 
 // server deps to bundle to reduce openat(2) syscalls
 // which helps cold start times
@@ -57,6 +57,14 @@ async function buildAll() {
     external: externals,
     logLevel: "info",
   });
+
+  // Copy hand-written worker scripts (not bundled by esbuild — they require
+  // native deps like pdf-parse/mammoth from node_modules at runtime).
+  // See server/extract.ts for the runtime path resolution that expects them
+  // to live at dist/workers/ next to dist/index.cjs.
+  console.log("copying workers...");
+  await mkdir("dist/workers", { recursive: true });
+  await cp("server/workers", "dist/workers", { recursive: true });
 }
 
 buildAll().catch((err) => {
