@@ -722,6 +722,11 @@ export default function Query() {
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && submit()}
+                // v1.0.3: select the whole query on focus so typing a
+                // new search overwrites the prior one without needing to
+                // clear the field first. Matches the behavior of the
+                // "/" keyboard shortcut (focus + select).
+                onFocus={(e) => e.currentTarget.select()}
                 placeholder='Ask something… wrap terms in "quotes" to require an exact match ( / to focus )'
                 className="flex-1 border-0 shadow-none focus-visible:ring-0"
                 data-testid="input-query"

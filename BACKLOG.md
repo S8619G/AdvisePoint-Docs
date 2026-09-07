@@ -412,6 +412,26 @@ bumped one more size step to `text-base`, bumped weight to `font-bold`,
 and added underline-on-hover for a clearer link affordance. Dark-mode
 contrast confirmed clean during user evaluation.
 
+## Query search box — select-on-focus (v1.0.3 — STAGED)
+
+**Filed:** 2026-09-07
+**Target release:** v1.0.3
+**Status:** implemented on main, uncommitted release, awaiting v1.0.3 build
+**Ask:** In Query mode the previous search text persists in the input
+(correct behavior for reference), but starting a fresh search required
+manually clearing the field first. Should auto-select the whole query
+on focus so typing overwrites it.
+
+### What shipped (staged for v1.0.3)
+
+Added `onFocus={(e) => e.currentTarget.select()}` to the query input in
+`client/src/pages/query.tsx`. Matches the existing `/` keyboard shortcut
+behavior (which already does `focus()` + `select()`), so mouse-focus and
+keyboard-focus are now consistent — both leave the prior query selected
+and ready to be typed over. The user can still click twice or drag to
+deselect and edit the prior query in place if they want to iterate
+instead of replacing.
+
 ## Zip filename — version-free canonical name (v1.0.3 — PLANNED)
 
 **Filed:** 2026-09-07
