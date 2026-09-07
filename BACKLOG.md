@@ -412,6 +412,42 @@ bumped one more size step to `text-base`, bumped weight to `font-bold`,
 and added underline-on-hover for a clearer link affordance. Dark-mode
 contrast confirmed clean during user evaluation.
 
+## Favicon — tab icon shows document + chevron mark (v1.0.3 — STAGED)
+
+**Filed:** 2026-09-07
+**Target release:** v1.0.3 (alongside Backup & Restore)
+**Status:** implemented on main, uncommitted release, awaiting v1.0.3 build
+**Ask:** Browser tab was still showing an old / wrong icon (user described
+it as "the old stacked hard drive symbol").
+
+### Root cause
+
+`client/public/favicon.ico` contained only the two blue chevrons on a navy
+background — the document card that appears in `favicon.svg`,
+`favicon.png`, and `apple-touch-icon.png` was missing from every `.ico`
+frame (16, 24, 32, 48). Compounded by browsers aggressively caching
+favicons on `localhost:5000`, so users could keep seeing a pre-AdvisePoint
+icon even after we swapped assets.
+
+### What shipped (staged for v1.0.3)
+
+1. Regenerated `client/public/favicon.ico` from `favicon.svg` at five
+   sizes (16, 24, 32, 48, 64), so every frame is the full document +
+   chevron mark matching the other favicon assets. Generated with
+   ImageMagick: `magick -background none -density 300 favicon.svg
+   -resize NxN -gravity center -extent NxN PNG32:frame-N.png` per size,
+   then `magick frame-*.png favicon.ico`.
+2. Added a `?v=1.0.3` query string to every favicon `<link>` in
+   `client/index.html` so browsers stop serving whatever they've cached
+   for the app origin.
+
+### Convention going forward
+
+Bump the `?v=X.Y.Z` query string in `client/index.html` whenever *any*
+favicon asset changes, so existing installs pick up the new icon after
+an in-place update. The version tag doesn't have to match the app
+version — it just has to change.
+
 ## Page viewer — sharper zoom from Fit mode — SHIPPED
 
 **Filed:** 2026-09-07
