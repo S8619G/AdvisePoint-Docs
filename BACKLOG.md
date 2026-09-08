@@ -575,6 +575,151 @@ worth it as a hard release gate.
 - Keep the smoke test skippable via `SKIP_SMOKE=1` env var for debugging
   edge cases in CI.
 
+## Header — background rendering activity indicator (v1.0.4 — PLANNED)
+
+**Filed:** 2026-09-08
+**Target release:** v1.0.4
+**Status:** planned. Small header-bar addition.
+**Ask:** When uploading multiple manuals, page rendering (PDF → image
+extraction + OCR / text extraction on worker threads) can take a while
+to complete after the upload confirmation returns. Users have no visible
+signal that background work is in progress — or how much is left. Add
+a quiet activity indicator to the main page top row that only appears
+while rendering is active, and reveals real-time progress on hover.
+
+### Behavior
+
+1. **Placement:** Header/top row, positioned between the Query search
+   box and the stats counter (documents / pages count). Sized to match
+   the visual weight of the existing header icons, not larger.
+
+2. **Idle state:** Nothing rendered. Zero footprint when no work is
+   happening — header layout is unchanged from today.
+
+3. **Active state:** Animated circular arrow (Lucide `Loader2` or
+   `RefreshCw` with a `animate-spin` Tailwind class). Uses
+   `text-muted-foreground` so it doesn't compete for attention with the
+   Query field or primary CTAs.
+
+4. **Hover state (tooltip):** Show real-time status:
+   ```
+   Rendering pages
+   Document: Acme Copier Service Manual
+   Page 47 of 312
+   3 documents queued
+   ```
+   Update the tooltip content live while it's open (not just at open
+   time). Uses the existing shadcn `Tooltip` component pattern.
+
+5. **Transition to idle:** When the last queued page finishes, wait
+   ~2 seconds then fade out (so a fast single-page render still shows
+   a brief signal). No completion toast — the indicator disappearing
+   IS the signal.
+
+### Implementation
+
+#### Server — new endpoint `GET /api/render/status`
+
+Returns JSON:
+```json
+{
+  "active": true,
+  "current_document": {
+    "id": "...",
+    "title": "Acme Copier Service Manual",
+    "pages_done": 47,
+    "pages_total": 312
+  },
+  "queued_document_count": 3,
+  "queued_page_count": 848
+}
+```
+
+When no rendering work is active, returns `{"active": false}`.
+
+Render queue state is already tracked internally by `server/extract.ts`
+/ `server/workers/*` — the worker-thread manager knows what's in
+flight. This endpoint just exposes a snapshot of it. If no central
+queue struct exists today, add one in extract.ts and update it in the
+worker lifecycle callbacks (spawn / progress / done).
+
+#### Client — header component
+
+1. **New component `RenderStatusIndicator.tsx`** (or add to existing
+   header component if one exists). Uses SWR / react-query with a
+   polling interval of:
+   - **2 seconds** while `active: true`
+   - **10 seconds** while `active: false` (so a new upload lights it
+     up within 10s without hammering the endpoint)
+
+2. **Tooltip trigger:** shadcn `Tooltip` wrapping the spinner icon.
+   Content re-renders on each poll while open.
+
+3. **Fade-out on transition to idle:** ~2s delay + Tailwind
+   `transition-opacity` for the fade. Use a small `useEffect` with
+   `setTimeout` cleanup so a rapid off→on flip cancels the fade.
+
+#### Existing extract/render pipeline
+
+Audit `server/extract.ts`, `server/workers/pdf-worker.ts` (and any
+sibling workers) for existing progress bookkeeping. Likely candidates:
+any existing `_activeExtractions` map, per-document progress counters,
+or the `documents` table's status column. Reuse whatever's there
+instead of introducing a parallel counter.
+
+### Edge cases
+
+- **Upload finishes fast, no work queued.** Indicator never appears —
+  correct. The 10s idle poll interval means a fast render might
+  finish before the client learns it started, which is fine.
+- **Multiple documents in flight.** "Current document" is the one
+  the primary worker is on right now; "queued_document_count" covers
+  the rest. If we have N parallel workers, show the highest-progress
+  one in the tooltip primary line to give a sense of "almost done
+  with this batch."
+- **Server restart mid-render.** After restart, the render queue is
+  empty (worker threads don't persist), so indicator will correctly
+  report idle even if there were pages queued before the restart.
+  Note in the tooltip? Probably not — restarts are rare and users
+  can check document status individually if needed.
+- **Failed render.** Don't surface errors in the header indicator —
+  it's a status glyph, not an error UI. Existing per-document error
+  handling continues to run as-is.
+- **Very long queue.** Truncate the document title in the tooltip if
+  > 60 chars.
+
+### Testing
+
+- Upload one small document — confirm spinner appears briefly and
+  fades out cleanly.
+- Upload 5 large PDFs at once — confirm spinner stays on for the
+  full batch, tooltip cycles through documents, queued count
+  decreases live.
+- Hover over spinner while a long render is happening — confirm
+  tooltip content updates live (not stuck on the value at hover
+  start).
+- Confirm header layout is byte-identical to today when no
+  rendering is active (no reserved space, no phantom padding).
+- Confirm the 2s poll interval doesn't produce visible layout jitter
+  in the tooltip.
+
+### Effort estimate
+
+~3–4 hours:
+
+- ~1h: server endpoint + progress bookkeeping (depends on how much
+  of it already exists in extract.ts)
+- ~1h: client component + tooltip + polling logic
+- ~1h: fade transition + edge-case polish
+- ~30min: visual QA on the header at various viewport widths
+
+### Related / follow-on ideas (not for v1.0.4)
+
+- **Click the spinner to open a full render-queue panel** with per-
+  document progress bars. Overkill for v1.0.4; the tooltip is enough.
+- **System tray notification when a large batch completes.** Would
+  compose with the tray-icon idea if we ever add one.
+
 ## Backup Settings — show current backup size for storage planning (v1.0.4 — PLANNED)
 
 **Filed:** 2026-09-08
