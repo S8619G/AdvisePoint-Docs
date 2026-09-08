@@ -77,6 +77,7 @@ import {
   Upload,
   AlertTriangle,
   FileText,
+  ExternalLink,
 } from "lucide-react";
 import { Link } from "wouter";
 import { apiRequest } from "@/lib/queryClient";
@@ -420,6 +421,52 @@ export function DocxViewerDialog({
     });
   }, [fitZoom]);
 
+  // ---------- Open in Word (v1.0.6.3) ----------
+  //
+  // Download the retained original .docx via /api/documents/:id/original
+  // and hand it off to the OS. On Windows, the browser drops the file
+  // into Downloads and (via Chrome/Edge "Always open files of this
+  // type" or Windows shell association) launches whatever is registered
+  // for .docx -- Word for most of our users, LibreOffice/WordPad as a
+  // fallback. This is a strict download, not a preview: the /original
+  // route serves inline by default, so we override with the download
+  // attribute + a filename hint so the browser writes it out cleanly.
+  //
+  // Note on round-trip edits: any Save the user makes in Word lands on
+  // their local copy, NOT back in the library. Bringing an edited copy
+  // back into the library is deferred to v1.0.7 (drag-to-update flow
+  // with similarity detection).
+  const handleOpenInWord = useCallback(() => {
+    if (!meta?.has_original) return;
+    const url = `/api/documents/${encodeURIComponent(documentId)}/original`;
+    // Prefer the doc's original filename if we have it; fall back to the
+    // display title with .docx suffix so "Save As" defaults to something
+    // recognizable.
+    const rawName =
+      documentFileName ||
+      (documentTitle ? `${documentTitle}.docx` : "document.docx");
+    // Strip characters that browsers strip anyway, and guarantee the
+    // .docx extension so Windows shell association fires correctly.
+    const cleanName = rawName.replace(/[\\/:*?"<>|]+/g, "_");
+    const withExt = /\.docx$/i.test(cleanName)
+      ? cleanName
+      : `${cleanName}.docx`;
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = withExt;
+    // rel=noopener defends against target-hijacking even though we're
+    // same-origin; harmless and future-proof if we ever add target=_blank.
+    a.rel = "noopener";
+    a.style.display = "none";
+    document.body.appendChild(a);
+    try {
+      a.click();
+    } finally {
+      // Detach on next tick so the click event fully propagates first.
+      setTimeout(() => a.remove(), 0);
+    }
+  }, [meta?.has_original, documentId, documentFileName, documentTitle]);
+
   // ---------- Print ----------
   //
   // v1.0.6.1: use a hidden <iframe> instead of window.open. The previous
@@ -757,6 +804,15 @@ export function DocxViewerDialog({
               className="inline-flex items-center gap-1 h-7 px-2 rounded hover:bg-muted disabled:opacity-40"
             >
               <Maximize2 className="h-3.5 w-3.5" /> Fit
+            </button>
+            <button
+              type="button"
+              onClick={handleOpenInWord}
+              disabled={!meta?.has_original}
+              title="Download the original .docx so you can open, edit, print, or Save As in Microsoft Word (or your system’s default Word handler)."
+              className="inline-flex items-center gap-1 h-7 px-2 rounded hover:bg-muted disabled:opacity-40"
+            >
+              <ExternalLink className="h-3.5 w-3.5" /> Open in Word
             </button>
             <button
               type="button"
