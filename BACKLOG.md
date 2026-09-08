@@ -43,6 +43,7 @@ reordered, removed, or promoted to SHIPPED.
 
 - The **Header render-status indicator** (item 5) and **renderer timeout** (item 2) both touch queue bookkeeping. Land the timeout first so the indicator can consume the failed-doc signal for its red/badge state.
 - The **DOCX viewer** (item 4) reuses PageViewer's dialog chrome — the PageViewer fix (item 3) is a prerequisite so the mode switcher extends the same conditional tree cleanly.
+- **User-notification hard requirement:** every failure signal (toast, tooltip, badge, anywhere) MUST name the specific failing document by title. "A render failed" without saying which one is not acceptable in multi-document uploads. Both the renderer timeout entry (item 2) and the header render-status indicator entry (item 5) capture this.
 
 ---
 
@@ -785,24 +786,93 @@ with the doc reference. There is a small memory-leak risk if pdfjs
 is genuinely wedged in native code; document this in the code
 comment. Acceptable tradeoff versus a permanently-frozen queue.
 
-### User notification
+### User notification — REQUIREMENT: document must be named
 
-Existing PageViewer already handles `status: "error"` (see
-`client/src/components/PageViewer.tsx:591-593`), so no client work
-is required for the error state itself. But for multi-document
-uploads, we need something better than "go check each doc
-detail page."
+**Every failure signal to the user MUST include the failing
+document's title** (or filename as fallback). "A document failed to
+render" without saying which one is not acceptable — in a
+multi-document upload the whole point is knowing which file to re-
+upload, fix, or investigate.
 
-**Recommendation:** add a toast notification from the Upload page
-when a document in the batch enters `status: "error"` after
-rendering starts. Poll `/api/documents/:id/pages/status` for each
-recently-uploaded doc for ~5 minutes post-upload (already partially
-done by the library card poll?) and fire a toast on state change to
-`error` with the doc title and first-failure reason.
+Existing PageViewer already handles `status: "error"` inside the
+viewer for a single doc (see `client/src/components/PageViewer.tsx:
+591-593`), and the dialog header already shows the doc title — so
+the single-doc-in-viewer case is covered.
 
-Alternately, defer this to the Header render-status indicator
-(separate v1.0.4 entry) — that indicator can turn red or show a
-badge count when any doc in the recent queue has failed. Cleaner.
+**Multi-document upload case (the one that matters):**
+
+Add a toast notification from the Upload page when any document in
+the recent upload batch transitions to `status: "error"` while
+rendering. The toast MUST include:
+
+1. **Document title first**, followed by filename in parentheses if
+   different from the title. Example:
+   > "Render failed: KEY-OP-TRAINING Guide 5012
+   > (KEY-OP-TRAINING_Guide_5012.pdf) — page 47 timed out after 2
+   > minutes. Other documents in the batch continued."
+2. **The specific failure reason** from the server's `error` field
+   (page N timeout, malformed stream, etc.) — not just a generic
+   "render failed."
+3. **A hint that the batch continued** if there were other docs in
+   the queue, so users know it's isolated to this file.
+
+Implementation notes:
+
+- Poll `/api/documents/:id/pages/status` for each recently-uploaded
+  doc for ~5 minutes post-upload (or until it reaches `ready` /
+  `error`), then fire the toast on transition to `error`.
+- To get the title, either enrich the status endpoint response with
+  the doc title, or the client can look it up from its already-
+  cached `/api/documents` list keyed by `document_id`.
+- Reuse the existing shadcn `Toaster` component. Use
+  `variant: "destructive"` so failures visually stand out.
+- Keep the toast persistent (no auto-dismiss) until the user
+  dismisses it — render failures happen in the background and users
+  shouldn't miss them because the toast timed out.
+
+**Header render-status indicator interaction:**
+
+The separate v1.0.4 Header render-status indicator entry also needs
+to surface failed docs by name. When any doc in the recent queue
+has `status: "error"`, the indicator should switch from spinner to
+a red alert glyph, and its hover tooltip MUST list each failed doc
+by title:
+
+```
+Render errors (2)
+  • KEY-OP-TRAINING Guide 5012 — page 47 timed out
+  • Copier Service Manual A3 — pdf load exceeded 60s
+Hover to open Library for details.
+```
+
+The toast (user just uploaded) and header indicator (persistent
+visible signal for later reference) are complementary, not
+redundant.
+
+### Server-side change needed to make this work
+
+The current `document_render_status` schema tracks the failure
+reason (`error` column) but not the failing page number in a
+structured way. The recommendation is to keep `error` as a
+human-readable string but ALSO record structured detail:
+
+```ts
+interface RenderStatus {
+  document_id: string;
+  status: "pending" | "rendering" | "ready" | "error" | "missing";
+  rendered: number;
+  total: number;
+  error: string | null;
+  // NEW in v1.0.4:
+  failed_pages: number[] | null;  // for partial failures
+  first_failed_page: number | null;
+  updated_at: string;
+}
+```
+
+The title is already reachable via the `documents` table row — no
+schema change needed there — but the client should look it up and
+include it in every user-visible message per the requirement above.
 
 ### Edge cases
 
@@ -1166,6 +1236,27 @@ while rendering is active, and reveals real-time progress on hover.
    a brief signal). No completion toast — the indicator disappearing
    IS the signal.
 
+6. **Failure state (new, tied to the renderer timeout entry):** If
+   any document in the recent render batch reached `status: "error"`,
+   the indicator switches from the muted spinner to a red alert
+   glyph (Lucide `AlertCircle` with `text-destructive`). The
+   indicator STAYS VISIBLE in this state until the user dismisses
+   it (click to acknowledge), even after all rendering completes —
+   the disappearing-glyph rule only applies to clean completions.
+
+   Hover tooltip in failure state MUST list each failed document by
+   title, one line per failure, with the specific failure reason:
+   ```
+   Render errors (2)
+     • KEY-OP-TRAINING Guide 5012 — page 47 timed out
+     • Copier Service Manual A3 — pdf load exceeded 60s
+   Click to dismiss. Open Library for full details.
+   ```
+
+   Naming the document is a hard requirement, not a nice-to-have.
+   The whole point of this signal is knowing which file to re-
+   upload or investigate.
+
 ### Implementation
 
 #### Server — new endpoint `GET /api/render/status`
@@ -1174,6 +1265,15 @@ Returns JSON:
 ```json
 {
   "active": true,
+  "recent_failures": [
+    {
+      "document_id": "...",
+      "title": "KEY-OP-TRAINING Guide 5012",
+      "file_name": "KEY-OP-TRAINING_Guide_5012.pdf",
+      "error": "page 47 timed out after 120000ms",
+      "failed_at": "2026-09-08T13:47:00Z"
+    }
+  ],
   "current_document": {
     "id": "...",
     "title": "Acme Copier Service Manual",
