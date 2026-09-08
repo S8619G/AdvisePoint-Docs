@@ -69,6 +69,57 @@ successful update replaces the prior dist.bak; backup folders do not
 accumulate.
 
 
+INSTALL LOCATION - RECOMMENDED FOLDER SETUP
+-------------------------------------------
+
+Extract the AdvisePoint Docs folder to a plain local path like:
+
+      C:\AdvisePoint Docs\
+      D:\AdvisePoint Docs\
+      C:\Tools\AdvisePoint Docs\
+
+Do NOT extract or move it into:
+
+      OneDrive              (personal or business)
+      Dropbox
+      Google Drive
+      iCloud Drive
+      Box / Box Sync
+      Any network path starting with \\server\share
+
+Why this matters:
+
+  * Cloud-sync tools can mark files as online-only placeholders. When
+    the app or your browser tries to open one, the sync client has to
+    fetch it first, which can time out or fail silently.
+  * Corporate OneDrive tenants often apply Data Loss Prevention (DLP)
+    rules that block uploads to loopback services like this app.
+    Symptom: the Upload tab shows "Failed to fetch" and no request
+    ever reaches the server.
+  * Sync clients hold short-lived file locks while a file is being
+    written. Backups written into a sync folder can corrupt mid-write.
+  * Files inherit the Mark-of-the-Web from the sync source, so
+    SmartScreen popups keep coming back even after Setup Icon.
+
+Starting in v1.0.5 the app auto-detects the most common problem paths
+and shows an amber banner at the top of the window when it's running
+from one of them. The banner links back here and can be dismissed per
+location. It reappears if you later move the app to a different
+problem folder.
+
+If the app is already installed inside a cloud-sync folder:
+
+  1. Close the app (Task Manager -> AdvisePoint Docs -> End task, or
+     right-click the taskbar icon -> Close).
+  2. Move (not copy) the "AdvisePoint Docs" folder to a plain local
+     path like C:\AdvisePoint Docs\ .
+  3. Re-run "Setup Icon (run once).bat" from the new location so the
+     desktop shortcut points at the right place.
+  4. Launch the app. Your uploaded documents are unaffected because
+     they live in %LOCALAPPDATA%\AdvisePoint Docs\ , which is outside
+     the app folder and outside typical cloud-sync paths.
+
+
 ADDING YOUR OWN DOCUMENTS
 --------------------------
 

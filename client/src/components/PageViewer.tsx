@@ -80,9 +80,32 @@ interface Props {
   // preview matches the library card / detail page.
   documentTitleColor?: string | null;
   initialPage?: number;
+  // v1.0.5: original file name ("foo.docx", "notes.md", etc.). When
+  // present and the extension is not .pdf, the dialog switches to the
+  // reassembled-content viewer instead of the per-page image viewer.
+  // When absent or .pdf, the classic PDF page viewer renders.
+  documentFileName?: string | null;
 }
 
-export function PageViewerDialog({
+// v1.0.5: thin router. Non-PDF documents (DOCX / TXT / MD) have no per-page
+// image renders -- previously the viewer showed a permanent "Render error".
+// Route them to a text-content viewer that reassembles from the chunks
+// table via /api/documents/:id/content. Everything else stays on the PDF
+// page viewer that has been there since v0.9.7.
+export function PageViewerDialog(props: Props) {
+  const fileName = (props.documentFileName ?? "").toLowerCase();
+  const isNonPdf =
+    fileName.endsWith(".docx") ||
+    fileName.endsWith(".txt") ||
+    fileName.endsWith(".md") ||
+    fileName.endsWith(".markdown");
+  if (isNonPdf) {
+    return <DocumentContentViewerDialog {...props} />;
+  }
+  return <PdfPageViewerDialog {...props} />;
+}
+
+function PdfPageViewerDialog({
   open,
   onOpenChange,
   documentId,
@@ -1039,6 +1062,159 @@ ${imgsHtml}
           >
             Next <ChevronRight className="h-3.5 w-3.5" />
           </button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.5: DOCX / TXT / Markdown viewer.
+//
+// DOCX and other non-PDF documents have no per-page image renders in the
+// pages sidecar, so the classic PageViewer stayed permanently on its
+// "Render error" state for them. The new /api/documents/:id/content
+// endpoint reassembles the extracted text out of the chunks table, so we
+// can show the full body inside the same dialog chrome as the PDF viewer.
+//
+// Rendering is intentionally minimal for the v1.0.5 build:
+//   * No markdown-to-HTML pass. The client has no markdown library and
+//     we do not want to add one (plus DOMPurify) at 1.0.5 scope.
+//   * Content is rendered inside <pre className="whitespace-pre-wrap"> so
+//     headings, lists, and indentation all survive visually.
+//   * <Highlight> is reused for the in-viewer search input so hits get
+//     the same amber highlight as the query / library pages.
+//
+// A follow-up release can swap the <pre> for a real markdown renderer.
+// ---------------------------------------------------------------------------
+
+type ContentPayload = {
+  format: "docx" | "text" | "markdown";
+  markdown: string;
+  chunk_count: number;
+  char_count: number;
+};
+
+function DocumentContentViewerDialog({
+  open,
+  onOpenChange,
+  documentId,
+  documentTitle,
+  documentTitleColor,
+  documentFileName,
+}: Props) {
+  const [payload, setPayload] = useState<ContentPayload | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const [searchInput, setSearchInput] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
+
+  // Reset state whenever the dialog is (re)opened for a fresh document.
+  useEffect(() => {
+    if (!open) return;
+    setPayload(null);
+    setLoading(true);
+    setError(null);
+    setSearchInput("");
+    setDebouncedQuery("");
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch(`/api/documents/${documentId}/content`);
+        if (!resp.ok) {
+          const bodyText = await resp.text().catch(() => "");
+          let msg = `content: ${resp.status}`;
+          try {
+            const j = JSON.parse(bodyText);
+            if (j?.message) msg = j.message;
+          } catch {
+            if (bodyText) msg = bodyText.slice(0, 200);
+          }
+          throw new Error(msg);
+        }
+        const j = (await resp.json()) as ContentPayload;
+        if (!cancelled) setPayload(j);
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, documentId]);
+
+  // Debounce the in-viewer search so highlight recomputation stays cheap
+  // even on large DOCX bodies (~200 KB is a realistic upper bound).
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebouncedQuery(searchInput.trim()), 200);
+    return () => window.clearTimeout(t);
+  }, [searchInput]);
+
+  const formatLabel = payload
+    ? payload.format === "docx"
+      ? "DOCX"
+      : payload.format === "text"
+      ? "Text"
+      : "Markdown"
+    : "Document";
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-5xl p-0 gap-0 h-[90vh] flex flex-col">
+        <DialogHeader className="px-5 py-3 border-b border-border shrink-0">
+          <DialogTitle
+            className="text-sm font-medium truncate pr-8"
+            style={{ color: documentTitleColor ?? undefined }}
+          >
+            {documentTitle}
+          </DialogTitle>
+          <DialogDescription className="text-xs text-muted-foreground flex items-center gap-2 flex-wrap">
+            <span className="tabular-nums">{formatLabel} view</span>
+            {payload && (
+              <span className="tabular-nums text-muted-foreground/80">
+                {payload.chunk_count} sections · {payload.char_count.toLocaleString()} chars
+              </span>
+            )}
+            {documentFileName && (
+              <span className="text-muted-foreground/70 truncate">
+                {documentFileName}
+              </span>
+            )}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="px-5 py-2 border-b border-border shrink-0 flex items-center gap-2">
+          <input
+            type="text"
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
+            placeholder="Highlight text in document…"
+            className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-xs outline-none focus:ring-1 focus:ring-ring"
+            data-testid="input-content-highlight"
+          />
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-auto px-6 py-5">
+          {loading && (
+            <div className="text-sm text-muted-foreground">Loading document…</div>
+          )}
+          {!loading && error && (
+            <div className="text-sm text-destructive">
+              Could not load document content: {error}
+            </div>
+          )}
+          {!loading && !error && payload && (
+            <pre
+              className="whitespace-pre-wrap break-words font-sans text-sm leading-relaxed text-foreground"
+              data-testid="text-document-content"
+            >
+              <Highlight text={payload.markdown} query={debouncedQuery} />
+            </pre>
+          )}
         </div>
       </DialogContent>
     </Dialog>

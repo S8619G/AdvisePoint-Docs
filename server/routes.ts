@@ -13,6 +13,7 @@ import { join, resolve } from "node:path";
 import { platform, release as osRelease, hostname, arch, freemem, totalmem } from "node:os";
 import { buildZip } from "./zip";
 import { bootState, readRecentLogLines } from "./boot";
+import { detectInstallLocation } from "./install-location";
 import { APP_VERSION } from "../client/src/version";
 import {
   writeBackupTo,
@@ -95,6 +96,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         boot_completed_at: boot.boot_completed_at,
         uptime_ms: boot.uptime_ms,
         last_error: boot.last_error,
+        // v1.0.5: cloud-sync / UNC install-location detection. The client's
+        // InstallLocationBanner reads this to warn users that OneDrive et
+        // al. can silently break uploads via DLP rules, file locks, and
+        // online-only placeholders. Cached after the first call so this
+        // adds no meaningful cost to the /api/health poll.
+        install_location: detectInstallLocation(),
       };
       // v0.9.34: optional log tail. Off by default to keep the small /api/health
       // response small (it is polled every few seconds by the BackendDownOverlay);
@@ -569,6 +576,61 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (err: any) {
       console.error(`[pages] stream failed for ${req.params.id}/${n}:`, err);
       if (!res.headersSent) res.status(500).json({ message: "read failed" });
+    }
+  });
+
+  // v1.0.5: DOCX / TXT / MD viewer content endpoint. Returns the full
+  // extracted text of a non-PDF document, reassembled from the chunks
+  // table (chunks WHERE parent_id = :id ORDER BY chunk_index). This
+  // avoids adding a new column or sidecar file: extracted text is
+  // already durable in chunks.content after ingest, and joining it
+  // works retroactively for every previously-uploaded DOCX/TXT/MD.
+  //
+  // Returns 404 for PDFs -- they have per-page image endpoints already.
+  // Returns 404 for docs with no chunks (e.g. still being ingested).
+  //
+  // Format detection is best-effort from file_name; "markdown" is the
+  // renderer default because mammoth's DOCX -> markdown output is
+  // markdown-safe and TXT / MD fall through cleanly.
+  app.get("/api/documents/:id/content", (req, res) => {
+    try {
+      const doc = storage.getDocument(req.params.id);
+      if (!doc) return res.status(404).json({ message: "document not found" });
+
+      const fileName = (doc.file_name ?? "").toLowerCase();
+      const isPdf = fileName.endsWith(".pdf");
+      if (isPdf) {
+        return res.status(404).json({
+          message: "pdf viewer uses the page-image endpoints; use /pages/:n.jpg",
+        });
+      }
+
+      let format: "docx" | "text" | "markdown" = "markdown";
+      if (fileName.endsWith(".docx")) format = "docx";
+      else if (fileName.endsWith(".txt")) format = "text";
+      else if (fileName.endsWith(".md") || fileName.endsWith(".markdown")) format = "markdown";
+
+      const rows = storage.getChunksForDoc(req.params.id);
+      if (rows.length === 0) {
+        return res.status(404).json({ message: "no chunks stored for this document" });
+      }
+      // Sort defensively -- getChunksForDoc has no ORDER BY guarantee.
+      const ordered = [...rows].sort((a, b) => a.chunk_index - b.chunk_index);
+      // Join with blank lines so heading breaks and paragraph boundaries
+      // survive the reassembly. The chunker already trims chunk edges.
+      const markdown = ordered.map((c) => c.content).join("\n\n");
+
+      // v1.0.5: TXT is plain text -- flag it so the client wraps in <pre>
+      // instead of running it through a markdown renderer that would
+      // collapse whitespace.
+      res.json({
+        format,
+        markdown,
+        chunk_count: ordered.length,
+        char_count: markdown.length,
+      });
+    } catch (err) {
+      res.status(500).json({ message: err instanceof Error ? err.message : String(err) });
     }
   });
 

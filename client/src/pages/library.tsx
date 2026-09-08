@@ -69,6 +69,9 @@ interface Doc {
   // v0.9.30: optional accent color applied to the rendered document title.
   // Stored as a #RRGGBB hex. null (or absent) = use the default text color.
   title_color?: string | null;
+  // v1.0.5: original uploaded file name, needed so PageViewerDialog can
+  // route DOCX / TXT / MD to the content viewer instead of the PDF viewer.
+  file_name?: string | null;
 }
 
 export default function Library() {
@@ -1548,6 +1551,8 @@ function DocDetail({ id }: { id: string }) {
         documentTitle={data.document.title}
         documentTitleColor={data.document.title_color ?? null}
         initialPage={pageViewerStart}
+        // v1.0.5: file name drives PageViewerDialog's PDF-vs-content routing.
+        documentFileName={data.document.file_name ?? undefined}
       />
     </div>
   );

@@ -38,7 +38,14 @@ import type { DocumentPage } from "./storage";
 //   - 30 min whole-job wall clock: a 1000-page manual @ 5 s/page is ~80
 //     min, so this is a safety net for pathological docs, not a normal cap.
 //     If a legitimate huge manual needs more, raise the env var.
-const RENDER_PAGE_TIMEOUT_MS = Number(process.env.RAG_RENDER_PAGE_TIMEOUT_MS) || 120_000;
+// v1.0.5: default lowered from 120_000 -> 60_000 to shrink the abandoned-
+// promise window when withTimeout fires (pdfjs has no cancellation API, so
+// the losing promise keeps burning CPU until it finishes naturally). 60 s
+// is still deep in the "something is wrong" tail per the 240 DPI @ q88
+// notes above (3-30 s per page in the wild). Override via env var if a
+// legitimate slow page trips it. Full architectural fix (worker_threads
+// with actual cancellation) tracked as v1.0.7-candidate in BACKLOG.md.
+const RENDER_PAGE_TIMEOUT_MS = Number(process.env.RAG_RENDER_PAGE_TIMEOUT_MS) || 60_000;
 const RENDER_GETPAGE_TIMEOUT_MS = Number(process.env.RAG_RENDER_GETPAGE_TIMEOUT_MS) || 30_000;
 const RENDER_LOAD_TIMEOUT_MS = Number(process.env.RAG_RENDER_LOAD_TIMEOUT_MS) || 60_000;
 const RENDER_JOB_TIMEOUT_MS = Number(process.env.RAG_RENDER_JOB_TIMEOUT_MS) || 1_800_000;
@@ -385,7 +392,15 @@ async function renderInBackground(document_id: string, buffer: Buffer): Promise<
         `page.render(${n}) for ${document_id}`,
       );
 
+      // v1.0.5: bracket the synchronous WebP encoder with setImmediate
+      // yields. @napi-rs/canvas encodes in-thread; for a 2400x3200 px
+      // page that is 100-400 ms of pure event-loop block on top of
+      // whatever pdfjs just did. The yields give the health-check poll
+      // and any pending heartbeat a chance to land before/after the
+      // encode so the client-side reconnect threshold does not trip.
+      await new Promise<void>((r) => setImmediate(r));
       const buf = canvas.toBuffer("image/webp", webpQuality);
+      await new Promise<void>((r) => setImmediate(r));
       const outPath = join(outDir, pageFileName(n, "webp"));
       writeFileSync(outPath, buf);
 

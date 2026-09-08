@@ -15,6 +15,7 @@ import { createServer } from "node:http";
 import { rawDb } from "./storage";
 import { backfillMissingLocations } from "./locate";
 import { bootState, envSnapshot, logRotate, withPhase } from "./boot";
+import { logInstallLocationAtBoot } from "./install-location";
 
 const app = express();
 const httpServer = createServer(app);
@@ -173,6 +174,14 @@ app.use((req, res, next) => {
   // opens have already run at this point via storage.ts side effects, but
   // this line is invaluable for correlating remote reports). Cheap.
   log(envSnapshot(), "boot");
+
+  // v1.0.5: one-shot check whether the app is running from OneDrive /
+  // Dropbox / other cloud-sync folder or a UNC network path. A field
+  // report of a DOCX upload silently failing with browser "Failed to
+  // fetch" traced to a corporate OneDrive folder holding sync-time file
+  // locks. Warn once at boot; the /api/health endpoint surfaces the same
+  // signal to the client's InstallLocationBanner.
+  logInstallLocationAtBoot();
 
   // v0.9.34: Periodic log rotation while the app is running long-uptime
   // sessions. Rotates server.log -> server.log.1 when the file exceeds 10 MB,

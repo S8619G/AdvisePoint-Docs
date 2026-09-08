@@ -534,6 +534,12 @@ export function BackupPanel() {
                   className="h-8 font-mono text-xs"
                   data-testid="input-backup-folder"
                 />
+                {/* v1.0.5: informational tip. Not actively enforced -- users may
+                    legitimately back up to a sync folder if they know what they
+                    are doing. */}
+                <p className="text-xs text-muted-foreground">
+                  Tip: keep your backup folder outside OneDrive, Dropbox, and other cloud-sync locations — file locks during sync can corrupt backups mid-write.
+                </p>
               </div>
             </div>
 

@@ -27,7 +27,14 @@ import {
 const HEALTH_URL = "/api/health";
 const POLL_INTERVAL_MS = 2000;
 // Consecutive health failures required to escalate poller state.
-const RECONNECT_THRESHOLD = 1; // first failed poll => "reconnecting" banner
+// v1.0.5: raised from 1 -> 3 to give pdfjs single-threaded rendering room
+// to breathe. With the 2 s poll interval the amber "reconnecting" banner
+// now appears after ~6 s of sustained failure (was ~2 s). Keeps
+// DOWN_THRESHOLD = 7 so a genuinely crashed server still surfaces the
+// full modal after ~14 s. Root exposure is inside single long
+// pdfjs.page.render() calls -- see the v1.0.7-candidate worker_threads
+// refactor note in server/pages.ts for the full architectural fix.
+const RECONNECT_THRESHOLD = 3; // ~6 s of sustained failure => "reconnecting" banner
 const DOWN_THRESHOLD = 7;      // ~14s of sustained failure => full modal
 
 async function pingHealth(): Promise<boolean> {

@@ -13,6 +13,7 @@ import { FileUp, Library as LibraryIcon, Search, Settings } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { APP_VERSION } from "./version";
 import { UpdateBanner } from "@/components/UpdateBanner";
+import { InstallLocationBanner } from "@/components/InstallLocationBanner";
 import { BackendDownOverlay } from "@/components/BackendDownOverlay";
 import { RenderStatusIndicator } from "@/components/RenderStatusIndicator";
 import { libraryTabStore } from "@/lib/libraryTabStore";
@@ -136,6 +137,9 @@ function App() {
         <Router hook={useHashLocation}>
           <div className="min-h-screen bg-background text-foreground">
             <TopNav />
+            {/* v1.0.5: cloud-sync / UNC folder warning. Sits above the update
+                banner so it stays visible even when an update is available. */}
+            <InstallLocationBanner />
             <UpdateBanner />
             <main className="mx-auto max-w-[1400px] px-6 py-8">
               <AppRouter />
