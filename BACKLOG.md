@@ -711,6 +711,83 @@ and startup time. Ship a real ARM64 build for v1.0.4.
   worth capturing in `concepts/gotchas` once we've done the first
   round-trip on real hardware.
 
+## Packager baseline refresh — rebase to v1.0.3.1 (v1.1.0 — PLANNED)
+
+**Filed:** 2026-09-08
+**Target release:** v1.1.0 (bundle with ARM64 packager work; both edit
+`scripts/package-windows.mjs`)
+**Status:** planned. Cleanup, not user-facing.
+**Ask:** The packager currently starts from
+`AdvisePoint-Docs-baseline-v1.0.0.zip` and carries version-compatibility
+logic to bridge older launcher lineages (v0.9.29 origin → v0.9.34
+additive framing → v1.0.0 rebrand). Refresh the baseline to v1.0.3.1
+so the packager code can drop that history without losing safety.
+
+### What changes
+
+1. **Rebuild the baseline zip.** Take the current shipped
+   `AdvisePoint-Docs.zip` (v1.0.3.1) and prepare it as the new template:
+   - Wipe `dist/index.cjs` (packager overwrites this every release; a
+     blank placeholder keeps the baseline generic).
+   - Keep everything else (node/, node_modules/, packaging support
+     files, launcher).
+   - Rename to `AdvisePoint-Docs-baseline-v1.0.3.1.zip`, place in the
+     workspace root next to the current baseline for a transition period.
+
+2. **Update `scripts/package-windows.mjs`:**
+   - Point default `--baseline` at the new zip filename.
+   - Set `EXPECTED_LAUNCHER_SHA256` to the v1.0.0 launcher's current
+     hash (`7ac72e45fdaf2ad2ca366ecbd651f6f13e1854b73f78017720914f551fa75c98`).
+     Since the baseline now already contains the current launcher,
+     `NEW_LAUNCHER_SHA256` can be set to `null` (nothing to copy over).
+   - Delete the historical comment block explaining the v0.9.29 →
+     v0.9.34 → v1.0.0 evolution — replace with a compact
+     "baseline current as of v1.0.3.1" note.
+
+3. **Delete the old baseline zip** from the workspace once the first
+   release from the new baseline ships cleanly.
+
+### Why bundle with the ARM64 work
+
+ARM64 support requires the packager to either:
+- Accept an `--arch` flag and download the ARM64 Node runtime at
+  package time (drops the Node binary from the baseline), OR
+- Ship two separate baselines (one per arch).
+
+Either way, `scripts/package-windows.mjs` gets substantially rewritten.
+Refreshing the baseline in the same PR is efficient because we're
+touching the same code and the same testing surface.
+
+### What we're NOT changing
+
+- **The rule that launcher changes require a hash pin.** The mechanism
+  (`EXPECTED_LAUNCHER_SHA256` + `NEW_LAUNCHER_SHA256`) stays; it just
+  starts from a newer reference point.
+- **The `RAG_DB_PATH` env var name.** Still needed for backward
+  compatibility with any user who has an older launcher shell around a
+  newer dist bundle (rare, but possible in the field).
+- **Any user-visible behavior.** This is a packaging-internals change;
+  the output zip is byte-equivalent to what we'd ship without the
+  refresh.
+
+### Testing checklist
+
+- Package a release from the new baseline; confirm the zip contents
+  match a release packaged from the old baseline (diff `unzip -l`
+  output, verify launcher SHA-256 unchanged).
+- Confirm the launch smoke test still passes.
+- Confirm in-app updater accepts the new zip (asset filename
+  unchanged: `AdvisePoint-Docs.zip`).
+- Verify a v1.0.3.1 install can be upgraded in place by a release
+  built from the new baseline (no data loss, no launcher mismatch
+  errors).
+
+### Effort estimate
+
+~1–2 hours if done standalone, ~30 min extra on top of the ARM64
+packager rewrite (mostly bounded by careful diff review of the
+resulting zip vs. a same-version build from the old baseline).
+
 ## Page viewer — sharper zoom from Fit mode — SHIPPED
 
 **Filed:** 2026-09-07
