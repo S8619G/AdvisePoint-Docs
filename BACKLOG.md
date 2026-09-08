@@ -540,6 +540,41 @@ favicon asset changes, so existing installs pick up the new icon after
 an in-place update. The version tag doesn't have to match the app
 version — it just has to change.
 
+## Extended build smoke test — exercise Backup export endpoint (post-v1.0.3.1 — PLANNED)
+
+**Filed:** 2026-09-08
+**Target release:** v1.0.4 or opportunistic
+**Status:** planned. Follow-on to the v1.0.3.1 launch smoke test.
+**Ask:** The v1.0.3.1 build smoke test spawns the built server and confirms
+it binds to a port. That catches the class of bug that hit v1.0.3 (a new
+server dep missing from the esbuild allowlist crashes at module-load
+time with MODULE_NOT_FOUND). It does NOT catch a runtime-loaded-but-broken
+dep — e.g. `archiver` bundled successfully but throwing when `create()` is
+called, or a native module that loads but crashes on first query.
+
+**Deliverable:** Extend the smoke test in `script/build.ts` so that after
+confirming the server bound to a port, it also:
+
+1. Hits `POST /api/backup/export` on the ephemeral port and confirms a
+   valid zip stream is returned (readable ZIP magic bytes `PK\x03\x04`,
+   non-zero content-length).
+2. Hits `GET /api/backup/settings` and confirms the JSON round-trips.
+3. Hits `GET /api/documents` or another read-only endpoint that exercises
+   `better-sqlite3` to prove the native module loaded correctly.
+
+Each check has a short timeout; any failure aborts the build with the
+endpoint's response body logged for post-mortem. Adds ~3–5s to build time,
+worth it as a hard release gate.
+
+**Notes:**
+- Use `node --experimental-fetch` (built in on Node 20) so no new dep is
+  needed.
+- The smoke server writes to a fresh temp dir with `RAG_NO_SEED=1`, so
+  documents will be empty — the /api/documents check should assert
+  status 200 with an empty array, not that a specific document exists.
+- Keep the smoke test skippable via `SKIP_SMOKE=1` env var for debugging
+  edge cases in CI.
+
 ## Windows on ARM — full ARM64 support (v1.0.4 — PLANNED)
 
 **Filed:** 2026-09-08
