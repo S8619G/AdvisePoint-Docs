@@ -575,6 +575,257 @@ worth it as a hard release gate.
 - Keep the smoke test skippable via `SKIP_SMOKE=1` env var for debugging
   edge cases in CI.
 
+## Renderer — per-page timeout, abort, and queue continuation (v1.0.4 — PLANNED)
+
+**Filed:** 2026-09-08
+**Target release:** v1.0.4
+**Status:** planned. Reliability fix. Server-side, no client changes
+required (existing PageViewer already handles `status: "error"`).
+
+### Problem
+
+The page renderer has no timeout on any individual pdfjs operation.
+When a single page hangs during render — malformed PDF stream, bad
+embedded font, JPX decoder livelock, corrupted content stream, etc.
+— the entire render pipeline blocks forever on that page and every
+subsequent document in the queue is starved.
+
+Current failure mode:
+
+- `_renderQueue` in `server/pages.ts:124` runs at concurrency 1.
+- `page.render({...}).promise` at line 261 has no timeout wrapper.
+- `doc.getPage(n)` at line 251 has no timeout wrapper.
+- If pdfjs spins inside its own pipeline (not throwing), the
+  outer `.catch()` at line 133 never fires and the job never ends.
+- Every subsequent doc sits in the queue as `status: "pending"`
+  indefinitely.
+
+User-visible symptom (from a v1.0.3.1 field report):
+
+> "After several minutes, the renderer is still processing page one
+> and does not seem to be able to finish it."
+
+(Note: that report turned out to be the DOCX non-render bug — see
+the two entries below — but the underlying concern is real for actual
+render hangs on PDFs.)
+
+### Fix
+
+Wrap every pdfjs call that can block in a timeout race, treat the
+timeout as a soft page failure, and let the outer job survive so the
+queue continues to the next document.
+
+#### Timeouts
+
+Three distinct timeouts, all configurable via env var with sane
+defaults:
+
+| Env var | Default | Applies to |
+| --- | --- | --- |
+| `RAG_RENDER_PAGE_TIMEOUT_MS` | `120_000` (2 min) | Per-page render (`page.render(...).promise`) |
+| `RAG_RENDER_GETPAGE_TIMEOUT_MS` | `30_000` (30 sec) | `doc.getPage(n)` |
+| `RAG_RENDER_LOAD_TIMEOUT_MS` | `60_000` (1 min) | `pdfjs.getDocument(...).promise` (initial load) |
+
+Rationale for 2-minute per-page default: v0.9.21's 240 DPI × 3.33x
+scale WebP q88 render is roughly 1–5 seconds per page on modest
+hardware. A 2-minute ceiling gives headroom for a legitimately-slow
+page (dense scanned image, complex vector art) while catching
+hard hangs in a reasonable window. Users can raise it via env var
+if they routinely process very large slides.
+
+#### Implementation — `withTimeout` helper
+
+Add a small helper at the top of `server/pages.ts`:
+
+```ts
+class RenderTimeoutError extends Error {
+  constructor(op: string, ms: number) {
+    super(`${op} exceeded ${ms}ms`);
+    this.name = "RenderTimeoutError";
+  }
+}
+
+function withTimeout<T>(op: string, ms: number, promise: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | null = null;
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new RenderTimeoutError(op, ms)), ms);
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+```
+
+#### Wrap the three call sites
+
+In `renderInBackground()`:
+
+1. `pdfjs.getDocument(...).promise` → `withTimeout("pdf load", loadMs, ...)`
+2. `doc.getPage(n)` → `withTimeout("getPage " + n, getPageMs, ...)`
+3. `page.render({...}).promise` → `withTimeout("render page " + n, pageMs, ...)`
+
+#### Per-page error handling
+
+The existing loop already has a per-page `try/finally` for cleanup.
+Wrap it in `try/catch` so a single-page failure doesn't abort the
+whole doc:
+
+```ts
+for (let n = 1; n <= total; n++) {
+  let page: any | null = null;
+  try {
+    page = await withTimeout(`getPage ${n}`, getPageMs, doc.getPage(n));
+    // ... existing render logic ...
+    await withTimeout(`render page ${n}`, pageMs, page.render({...}).promise);
+    // ... existing writeFileSync + storage.upsertPage ...
+    rendered++;
+  } catch (pageErr) {
+    // Log but don't kill the whole doc. Individual page failure is
+    // recoverable; other pages may still render fine.
+    console.error(`[pages] page ${n} of ${document_id} failed:`, pageErr);
+    // Track failed pages so we can surface them in status
+    failedPages.push({ page_number: n, error: String(pageErr.message ?? pageErr) });
+  } finally {
+    try { page?.cleanup?.(); } catch { /* ignore */ }
+  }
+  // ... existing progress update + setImmediate yield ...
+}
+```
+
+#### Whole-document abort threshold
+
+If `failedPages.length` exceeds a fraction of `total` (say, > 25%),
+treat the document as broken and mark it `status: "error"` with the
+first failure as the primary cause. Otherwise mark it `"ready"` with
+a `partial: true` flag and let the user see the pages that did work.
+
+```ts
+const failureRate = failedPages.length / total;
+if (failureRate > 0.25) {
+  storage.upsertRenderStatus({
+    document_id, status: "error", rendered, total,
+    error: `${failedPages.length} of ${total} pages failed. First: ${failedPages[0].error}`,
+    updated_at: new Date().toISOString(),
+  });
+} else {
+  storage.upsertRenderStatus({
+    document_id, status: "ready", rendered, total,
+    error: failedPages.length > 0
+      ? `${failedPages.length} pages failed to render (partial)`
+      : null,
+    updated_at: new Date().toISOString(),
+  });
+}
+```
+
+#### Queue-level: abort the current job if it exceeds an absolute wall clock
+
+Defense-in-depth: even with per-page timeouts, a doc with 10,000
+pages could occupy the queue for hours. Add a whole-job wall clock:
+
+| Env var | Default | Applies to |
+| --- | --- | --- |
+| `RAG_RENDER_JOB_TIMEOUT_MS` | `1_800_000` (30 min) | Whole-document render |
+
+If the outer `renderInBackground()` promise doesn't resolve within
+this window, `_drainRenderQueue` should abandon it, mark the doc
+`status: "error"` with `"job exceeded 30-minute render budget"`, and
+advance to the next queue entry.
+
+Note: this requires structuring the race at the queue-drainer level,
+not inside `renderInBackground`, since a truly-hung inner promise
+can't be cancelled from within its own scope. pdfjs doesn't offer a
+cancellation API for in-flight `render()` calls, so "abandon" here
+means stop awaiting the promise and let the pdfjs worker be GC'd
+with the doc reference. There is a small memory-leak risk if pdfjs
+is genuinely wedged in native code; document this in the code
+comment. Acceptable tradeoff versus a permanently-frozen queue.
+
+### User notification
+
+Existing PageViewer already handles `status: "error"` (see
+`client/src/components/PageViewer.tsx:591-593`), so no client work
+is required for the error state itself. But for multi-document
+uploads, we need something better than "go check each doc
+detail page."
+
+**Recommendation:** add a toast notification from the Upload page
+when a document in the batch enters `status: "error"` after
+rendering starts. Poll `/api/documents/:id/pages/status` for each
+recently-uploaded doc for ~5 minutes post-upload (already partially
+done by the library card poll?) and fire a toast on state change to
+`error` with the doc title and first-failure reason.
+
+Alternately, defer this to the Header render-status indicator
+(separate v1.0.4 entry) — that indicator can turn red or show a
+badge count when any doc in the recent queue has failed. Cleaner.
+
+### Edge cases
+
+- **Timeout race leaks pdfjs page reference.** The `page?.cleanup?.()`
+  in the `finally` block still runs even if we timed out awaiting
+  the render promise. pdfjs's cleanup is idempotent and safe on a
+  partially-rendered page.
+- **Whole-doc abandon leaks the pdfjs Document reference.** The
+  `doc.cleanup()` and `doc.destroy()` at the end of
+  `renderInBackground` won't run because the abandon happens above.
+  Acceptable; the doc object becomes GC-eligible once the job
+  reference drops.
+- **Env-var misconfiguration.** If a user sets a timeout to `0` or
+  negative, clamp to a sensible minimum (say, 1000 ms) with a
+  console warning. Setting timeouts too low would make legitimately
+  slow pages fail spuriously.
+- **Concurrency changes.** If we ever raise queue concurrency
+  above 1 (currently pinned to 1 because pdfjs pins CPU), the
+  timeout logic still works but the toast "stuck on document X"
+  wording needs revisiting.
+- **Retry on failure.** Out of scope for this entry. If a user wants
+  to retry a failed doc, they re-upload it. Future enhancement: an
+  admin button to re-queue.
+
+### Testing
+
+- Unit-test `withTimeout` — resolves normally, rejects on timeout,
+  cleans up the timer either way.
+- Integration: build a mock pdfjs page that returns a never-
+  resolving promise; confirm the per-page timeout fires and the
+  overall doc completes with `status: "error"` and the correct
+  message.
+- Integration: mock one hung page in a 20-page doc; confirm 19
+  pages render, doc ends `status: "ready"` with `error: "1 pages
+  failed to render (partial)"` and pages 1–19 (skipping the hung
+  one) are viewable.
+- Integration: mock a hung page in doc 1 of a 3-doc batch; confirm
+  doc 1 fails, doc 2 and doc 3 render normally.
+- Manual: find a real hang-inducing PDF (if we have one in seed
+  data or the field reports) and confirm behavior end-to-end.
+
+### Effort estimate
+
+~3 hours:
+
+- ~30 min: `withTimeout` helper + env var wiring
+- ~1h: per-page try/catch + failure bookkeeping + partial status
+- ~1h: queue-level abandon logic
+- ~30 min: testing + edge cases
+
+User notification (~1h) additional if we go with the standalone
+toast approach. Free if we defer to the Header render-status
+indicator entry.
+
+### Provenance
+
+User request 2026-09-08: "if the renderer hangs, it has the ability
+to abort and notify the user. Say if a document is 100 pages and
+the renderer progresses through each page, it takes time but each
+page is moving along. However, if a page stalls at render, it should
+time out after several minutes so it does not hang up forever...
+reject the one document and move to the next one and notify the
+user." Confirmed by direct code inspection: no timeout wrappers on
+any pdfjs call in `server/pages.ts` today.
+
 ## PageViewer — false "still rendering" spinner on non-PDF documents (v1.0.4 — PLANNED)
 
 **Filed:** 2026-09-08
