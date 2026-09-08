@@ -443,20 +443,64 @@ export function DocxViewerDialog({
       documentTitle || documentFileName || "Document",
     );
 
-    // Compose a well-formed print document. @page + section page-break
-    // rules mirror what docx-preview emits so the browser paginates
-    // sensibly. Includes our synthetic-page class in the page-break
-    // selector so v1.0.6.1's synthesized breaks also translate to
-    // print-time page breaks.
+    // v1.0.6.1 hotfix-on-a-hotfix: docx-preview's styleRef.innerHTML is
+    // NOT plain CSS text -- it's a sequence of real `<style>...</style>`
+    // elements. Wrapping it inside another `<style>` (as the initial
+    // v1.0.6.1 pass did) caused the first inner `</style>` to close our
+    // outer `<style>` early, so every subsequent rule (`@page`,
+    // page-break rules) plus `</style></head><body>` leaked out as body
+    // text -- showing raw CSS like `@page { margin: 12mm; }` at the top
+    // of the printed page. Emit the docx-preview stylesheet block
+    // unmodified in <head>, and put our own overrides in a *separate*
+    // <style> block after it so the cascade still favors our rules.
+    //
+    // The print-only overrides also flatten docx-preview's on-screen
+    // "paper on a gray tray" chrome: it wraps each section in a white
+    // page with box-shadow and centers it on a gray background, which
+    // in print leaks a shadow strip along the top/left of the physical
+    // page and shifts content off-center. We reset background,
+    // shadows, and outer padding at print time so each section prints
+    // edge-to-edge and the browser's own `@page` margin owns the
+    // whitespace budget.
+    // Note on margins: we set `@page { margin: 0 }` because each rendered
+    // `<section>` already carries the DOCX's own page margins from
+    // `w:pgMar` as inline padding. If we left the default browser page
+    // margin in place, we'd stack the browser's margin ON TOP of the
+    // doc's own margin and end up with an oversize inset. Section
+    // padding stays untouched -- that IS the doc's page margin.
+    //
+    // We DO clear the wrapper chrome (background color, box-shadow,
+    // outer margin/padding) that docx-preview uses to draw the
+    // "paper on a gray tray" preview affordance, since in print those
+    // decorations leak as a shadow strip along the top/left of the
+    // physical page and shift content off-center.
+    const printOverrides =
+      `@page { margin: 0; }\n` +
+      `html, body { margin: 0; padding: 0; background: #fff; }\n` +
+      `.docx-wrapper {\n` +
+      `  background: #fff !important;\n` +
+      `  padding: 0 !important;\n` +
+      `  margin: 0 !important;\n` +
+      `  display: block !important;\n` +
+      `}\n` +
+      `section.docx, section.${SYNTHETIC_PAGE_CLASS} {\n` +
+      `  box-shadow: none !important;\n` +
+      `  margin: 0 !important;\n` +
+      `  background: #fff !important;\n` +
+      `  border: 0 !important;\n` +
+      `  page-break-after: always;\n` +
+      `}\n` +
+      `section.docx:last-of-type, ` +
+      `section.${SYNTHETIC_PAGE_CLASS}:last-of-type {\n` +
+      `  page-break-after: auto;\n` +
+      `}\n`;
+
     const srcdoc =
       `<!doctype html><html><head><meta charset="utf-8">` +
       `<title>${safeTitle}</title>` +
-      `<style>${styleHtml}\n` +
-      `@page { margin: 12mm; }\n` +
-      `html, body { margin: 0; background: #fff; }\n` +
-      `section.docx, section.${SYNTHETIC_PAGE_CLASS} { page-break-after: always; }\n` +
-      `section.docx:last-of-type, section.${SYNTHETIC_PAGE_CLASS}:last-of-type { page-break-after: auto; }\n` +
-      `</style></head><body>${renderHtml}</body></html>`;
+      styleHtml +
+      `<style>${printOverrides}</style>` +
+      `</head><body>${renderHtml}</body></html>`;
 
     // Remove any stale iframe from a previous print click.
     if (printFrameRef.current) {
