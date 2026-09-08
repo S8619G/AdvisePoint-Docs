@@ -7,6 +7,14 @@ import { storage } from "./storage";
 import { extractTextFromFile } from "./extract";
 import { deriveLocation } from "./locate";
 import { scheduleRender, purgePagesForDoc, pageFilePath, getRenderQueueSnapshot } from "./pages";
+import {
+  saveOriginalIfRetainable,
+  removeOriginal,
+  originalExists,
+  originalFilePath,
+  originalSize,
+  retainableExt,
+} from "./originals";
 import { existsSync, createReadStream, statSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join, resolve } from "node:path";
@@ -453,6 +461,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.delete("/api/documents/:id", (req, res) => {
     // Purge sidecar page images first so we never leave orphans on disk if the DB row deletes but the fs op throws.
     try { purgePagesForDoc(req.params.id); } catch (err) { console.error("[delete] purge pages failed:", err); }
+    // v1.0.6: also remove any retained original file. Reads the extension
+    // off the row before the DELETE so we know which file on disk to
+    // remove; a no-op for docs without a retained original.
+    try {
+      const doc = storage.getDocument(req.params.id);
+      removeOriginal(req.params.id, (doc as any)?.original_ext ?? null);
+    } catch (err) {
+      console.error("[delete] removeOriginal failed:", err);
+    }
     storage.deleteDocument(req.params.id);
     res.json({ ok: true });
   });
@@ -623,14 +640,84 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       // v1.0.5: TXT is plain text -- flag it so the client wraps in <pre>
       // instead of running it through a markdown renderer that would
       // collapse whitespace.
+      // v1.0.6: has_original tells the client whether
+      // /api/documents/:id/original will return the source bytes for a
+      // rich viewer (docx-preview). False for pre-v1.0.6 uploads and for
+      // TXT/MD, which drives the "legacy upload -- re-upload for viewing"
+      // banner.
+      const originalExt = ((doc as any).original_ext ?? null) as string | null;
+      const hasOriginal = originalExists(doc.id, originalExt);
       res.json({
         format,
         markdown,
         chunk_count: ordered.length,
         char_count: markdown.length,
+        has_original: hasOriginal,
+        original_ext: originalExt,
+        original_bytes: hasOriginal ? originalSize(doc.id, originalExt) : null,
       });
     } catch (err) {
       res.status(500).json({ message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // v1.0.6: stream the retained original source file for a document.
+  //
+  // Returns 404 in three distinct "we don't have it" cases so the client
+  // can distinguish them:
+  //   * document not found: id doesn't exist at all.
+  //   * document has no retained original: pre-v1.0.6 upload OR an
+  //     extension we don't retain (TXT / MD / PDF). Client shows the
+  //     "legacy upload -- re-upload for viewing" banner.
+  //   * retained original file went missing on disk (e.g. antivirus
+  //     quarantined it or a partial restore). Same 404, different
+  //     `reason` so future support diagnostics can distinguish.
+  //
+  // Content-Type is derived from the retained extension. Currently only
+  // DOCX; the map is extended as more source types get retained.
+  app.get("/api/documents/:id/original", (req, res) => {
+    const doc = storage.getDocument(req.params.id);
+    if (!doc) {
+      return res.status(404).json({ message: "document not found", reason: "no_document" });
+    }
+    const ext = ((doc as any).original_ext ?? null) as string | null;
+    if (!ext) {
+      return res.status(404).json({
+        message: "no retained original for this document",
+        reason: "no_original",
+      });
+    }
+    let filePath: string;
+    try {
+      filePath = originalFilePath(doc.id, ext);
+    } catch (err) {
+      return res.status(500).json({ message: String(err) });
+    }
+    if (!existsSync(filePath)) {
+      return res.status(404).json({
+        message: "retained original missing on disk",
+        reason: "original_missing",
+      });
+    }
+    const MIME_BY_EXT: Record<string, string> = {
+      docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      pdf: "application/pdf",
+    };
+    try {
+      const stat = statSync(filePath);
+      res.setHeader("Content-Type", MIME_BY_EXT[ext] ?? "application/octet-stream");
+      res.setHeader("Content-Length", String(stat.size));
+      // Immutable once written: doc id + ext + on-disk bytes never change
+      // in place, so aggressive caching keeps the viewer's re-open cheap.
+      res.setHeader("Cache-Control", "private, max-age=3600, immutable");
+      // Prefer download-name that matches the original file so "Save As"
+      // in the browser doesn't produce "<uuid>.docx".
+      const safeName = (doc.file_name ?? `document.${ext}`).replace(/["\\]/g, "_");
+      res.setHeader("Content-Disposition", `inline; filename="${safeName}"`);
+      createReadStream(filePath).pipe(res);
+    } catch (err) {
+      console.error(`[originals] stream failed for ${req.params.id}:`, err);
+      if (!res.headersSent) res.status(500).json({ message: "read failed" });
     }
   });
 
@@ -734,6 +821,31 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           scheduleRender(result.document.id, req.file.buffer);
         } catch (err) {
           console.error("[upload] scheduleRender failed:", err);
+        }
+      }
+
+      // v1.0.6: retain original source bytes for DOCX so the client viewer
+      // can render them with docx-preview (real fonts / tables / page
+      // breaks). No-op for extensions outside the retained set -- PDFs
+      // already have per-page WebP renders and TXT/MD round-trip through
+      // the chunk store. Stamped onto documents.original_ext after the
+      // file is safely on disk so a partial write never leaves the DB
+      // pointing at a missing file.
+      if (result?.document?.id) {
+        try {
+          const savedExt = saveOriginalIfRetainable(
+            result.document.id,
+            req.file.originalname,
+            req.file.buffer,
+          );
+          if (savedExt) {
+            storage.updateDocumentMeta(result.document.id, { original_ext: savedExt });
+          }
+        } catch (err) {
+          // Persistence failure here means the viewer will show the "legacy
+          // upload -- re-upload for viewing" state, not a broken ingest.
+          // Log loudly, keep the row.
+          console.error("[upload] saveOriginalIfRetainable failed:", err);
         }
       }
 

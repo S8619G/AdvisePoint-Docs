@@ -158,6 +158,8 @@ CREATE TABLE IF NOT EXISTS documents (
   source_system TEXT,
   file_name TEXT,
   file_hash_sha256 TEXT,
+  -- v1.0.6: see shared/schema.ts documents.original_ext for the full rationale.
+  original_ext TEXT,
   ingested_at TEXT NOT NULL,
   pipeline_version TEXT NOT NULL DEFAULT 'advisepoint-docs-1.0.0',
   tags_json TEXT NOT NULL DEFAULT '[]',
@@ -305,6 +307,10 @@ const BUILTIN_DOCUMENT_TYPE_LABELS: Record<string, string> = {
   const have = new Set(cols.map((c) => c.name));
   const wanted: { col: string; ddl: string }[] = [
     { col: "title_color", ddl: "ALTER TABLE documents ADD COLUMN title_color TEXT" },
+    // v1.0.6: retained-original-file marker. Pre-v1.0.6 rows stay NULL,
+    // which is exactly the signal the client uses to surface the "legacy
+    // upload -- re-upload to view original formatting" banner.
+    { col: "original_ext", ddl: "ALTER TABLE documents ADD COLUMN original_ext TEXT" },
   ];
   for (const w of wanted) {
     if (!have.has(w.col)) {

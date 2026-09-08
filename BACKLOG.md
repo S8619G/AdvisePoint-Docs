@@ -1764,7 +1764,7 @@ additive, zero interaction with the other three items).
 failed with browser-side "Failed to fetch" — no `POST /api/upload` ever
 reached the server. Root cause was that the user was running the app
 from inside a corporate OneDrive-synced folder
-(`C:\Users\...\OneDrive - Kyocera Document Solutions America Inc\...\AdvisePoint Docs\`).
+(`C:\Users\...\OneDrive - Contoso\...\AdvisePoint Docs\`).
 OneDrive can mark files as online-only placeholders, apply tenant DLP
 rules that block uploads to loopback, or hold file locks during sync —
 any of which produces browser `Failed to fetch` errors with no

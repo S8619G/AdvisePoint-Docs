@@ -39,6 +39,7 @@ const archiver = archiverNs as unknown as (
 ) => archiverNs.Archiver;
 
 import { DB_FILE_PATH, getPagesDirForBackup, getDataDirForBackup, rawDb } from "./storage";
+import { getOriginalsDir } from "./originals";
 import { APP_VERSION } from "../client/src/version";
 
 // -------- Types --------
@@ -245,6 +246,13 @@ export async function writeBackupTo(
   if (existsSync(pagesDir)) {
     archive.directory(pagesDir, "pages");
   }
+  // v1.0.6: include retained DOCX (and future) originals so a restore
+  // brings back not just the extracted text but also the source files
+  // that power the client-side docx-preview viewer.
+  const originalsDir = getOriginalsDir();
+  if (existsSync(originalsDir)) {
+    archive.directory(originalsDir, "originals");
+  }
   archive.append(JSON.stringify(manifest, null, 2), { name: "manifest.json" });
   if (hasLs) {
     archive.append(opts.localStorageJson as string, { name: "localStorage.json" });
@@ -276,6 +284,9 @@ interface StagedImport {
   dir: string;
   dbPath: string;
   pagesDir: string;
+  // v1.0.6: retained originals staged directory. Empty string when the
+  // backup was taken by a pre-v1.0.6 build.
+  originalsDir: string;
   manifest: BackupManifest | null;
   localStoragePath: string | null;
 }
@@ -309,6 +320,8 @@ export async function stageImport(zipPath: string): Promise<StagedImport> {
 
   const dbPath = join(dir, "db", "data.db");
   const pagesDir = join(dir, "pages");
+  // v1.0.6: retained-originals directory; absent in pre-v1.0.6 backups.
+  const originalsDir = join(dir, "originals");
   const manifestPath = join(dir, "manifest.json");
   const lsPath = join(dir, "localStorage.json");
 
@@ -324,6 +337,7 @@ export async function stageImport(zipPath: string): Promise<StagedImport> {
     dir,
     dbPath: existsSync(dbPath) ? dbPath : "",
     pagesDir: existsSync(pagesDir) ? pagesDir : "",
+    originalsDir: existsSync(originalsDir) ? originalsDir : "",
     manifest,
     localStoragePath: existsSync(lsPath) ? lsPath : null,
   };
@@ -369,11 +383,22 @@ export function importWipeReplace(staged: StagedImport): { bak_dir: string } {
   if (existsSync(currentPages)) {
     renameSync(currentPages, join(bakDir, "pages"));
   }
+  // v1.0.6: preserve current originals alongside DB + pages so a restore
+  // is reversible.
+  const currentOriginals = getOriginalsDir();
+  if (existsSync(currentOriginals)) {
+    renameSync(currentOriginals, join(bakDir, "originals"));
+  }
 
   // Move staged content into place.
   copyFileSync(staged.dbPath, currentDb);
   if (staged.pagesDir) {
     copyDirRecursive(staged.pagesDir, currentPages);
+  }
+  // v1.0.6: restore originals if present in the backup. Pre-v1.0.6
+  // backups leave staged.originalsDir empty and this becomes a no-op.
+  if (staged.originalsDir) {
+    copyDirRecursive(staged.originalsDir, currentOriginals);
   }
 
   return { bak_dir: bakDir };
@@ -486,6 +511,27 @@ export function importMerge(staged: StagedImport): { documents_imported: number;
   }
 
   // Copy page files. For remapped docs, rename their parent directory.
+  // v1.0.6: also copy retained-original files, keying by document id and
+  // applying the same idRemap so a merged import doesn't clobber an
+  // existing doc's original with a colliding-uuid source file.
+  if (staged.originalsDir && existsSync(staged.originalsDir)) {
+    const liveOriginals = getOriginalsDir();
+    ensureDir(liveOriginals);
+    for (const entry of readdirSync(staged.originalsDir, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      const m = /^([^.]+)\.([A-Za-z0-9]+)$/.exec(entry.name);
+      if (!m) continue;
+      const srcDocId = m[1];
+      const ext = m[2];
+      const dstDocId = idRemap.get(srcDocId) ?? srcDocId;
+      const s = join(staged.originalsDir, entry.name);
+      const d = join(liveOriginals, `${dstDocId}.${ext}`);
+      try {
+        copyFileSync(s, d);
+      } catch { /* skip individual failures */ }
+    }
+  }
+
   let pages_files_copied = 0;
   if (staged.pagesDir && existsSync(staged.pagesDir)) {
     const livePages = getPagesDirForBackup();

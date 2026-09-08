@@ -77,7 +77,7 @@ const RULES: Rule[] = [
 
 // Mask user-identifying segments in a path so support pastes don't leak
 // a tenant or username. Turn:
-//   C:\Users\a04956\OneDrive - Kyocera Document Solutions America Inc\...\AdvisePoint Docs
+//   C:\Users\a04956\OneDrive - Contoso\...\AdvisePoint Docs
 // into:
 //   C:\Users\<user>\OneDrive - <tenant>\...\AdvisePoint Docs
 function maskPath(raw: string): string {

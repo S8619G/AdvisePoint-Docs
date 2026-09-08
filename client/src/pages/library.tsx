@@ -72,6 +72,12 @@ interface Doc {
   // v1.0.5: original uploaded file name, needed so PageViewerDialog can
   // route DOCX / TXT / MD to the content viewer instead of the PDF viewer.
   file_name?: string | null;
+  // v1.0.6: when the app has retained the raw source file on disk, this
+  // holds the lowercase extension ("docx"). NULL for pre-v1.0.6 uploads
+  // and for extensions we don't retain (TXT/MD/PDF). The library card
+  // reads this to badge legacy DOCX rows with a "Re-upload to view"
+  // affordance so users know why the rich viewer isn't available.
+  original_ext?: string | null;
 }
 
 export default function Library() {
@@ -505,6 +511,22 @@ function DocCard({
                   >
                     {doc.lifecycle_status}
                   </Badge>
+                  {/* v1.0.6: legacy DOCX badge. A DOCX doc without an
+                      original_ext was ingested before v1.0.6 started
+                      retaining source files, so the new DocxViewerDialog
+                      can't render it richly. The amber pill nudges
+                      users toward re-uploading the file so the rich
+                      viewer becomes available. */}
+                  {(doc.file_name ?? "").toLowerCase().endsWith(".docx") &&
+                    !doc.original_ext && (
+                      <Badge
+                        variant="outline"
+                        className={`${expanded ? "text-[10px]" : "text-[9px] px-1.5 py-0 leading-[14px]"} border-amber-400 text-amber-700 bg-amber-50`}
+                        title="This DOCX was uploaded before v1.0.6. Re-upload to view the original formatting."
+                      >
+                        Legacy — re-upload for viewing
+                      </Badge>
+                    )}
                 </div>
                 {/* v0.9.30: title accent color. `doc.title_color` is a
                     #RRGGBB hex or null; when null we leave the color

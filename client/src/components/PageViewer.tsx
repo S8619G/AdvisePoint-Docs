@@ -44,6 +44,9 @@ import { useZoomPan, MIN_ZOOM, MAX_ZOOM, READABLE_ZOOM } from "@/hooks/use-zoom-
 import { Highlight } from "@/lib/highlight";
 import { apiRequest } from "@/lib/queryClient";
 import { useViewerPrefs } from "@/lib/viewer-prefs";
+// v1.0.6: DOCX docs get a dedicated rich viewer (docx-preview + jszip)
+// with print/zoom/page controls at parity with the PDF viewer.
+import { DocxViewerDialog } from "./DocxViewer";
 
 type PageInfo = {
   page_number: number;
@@ -92,14 +95,23 @@ interface Props {
 // Route them to a text-content viewer that reassembles from the chunks
 // table via /api/documents/:id/content. Everything else stays on the PDF
 // page viewer that has been there since v0.9.7.
+//
+// v1.0.6: DOCX splits off from that content viewer. When the file is a
+// .docx we hand off to DocxViewerDialog, which uses docx-preview to
+// render the original bytes retained at
+// /api/documents/:id/original (falling back to the v1.0.5 text viewer
+// only for pre-v1.0.6 uploads or renderer errors, which it handles
+// internally). TXT/MD stay on the v1.0.5 text viewer.
 export function PageViewerDialog(props: Props) {
   const fileName = (props.documentFileName ?? "").toLowerCase();
-  const isNonPdf =
-    fileName.endsWith(".docx") ||
+  if (fileName.endsWith(".docx")) {
+    return <DocxViewerDialog {...props} />;
+  }
+  const isNonPdfText =
     fileName.endsWith(".txt") ||
     fileName.endsWith(".md") ||
     fileName.endsWith(".markdown");
-  if (isNonPdf) {
+  if (isNonPdfText) {
     return <DocumentContentViewerDialog {...props} />;
   }
   return <PdfPageViewerDialog {...props} />;

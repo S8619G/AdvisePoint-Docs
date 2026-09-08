@@ -117,6 +117,15 @@ export const documents = sqliteTable("documents", {
   // to CHECK-constrain hex format at the DB layer.
   title_color: text("title_color"),
 
+  // v1.0.6: when a document's original source file is retained on disk under
+  // <dataDir>/originals/<id>.<ext>, this holds the lowercase extension
+  // ("docx", "pdf"). NULL for pre-v1.0.6 uploads that were ingested before
+  // the app started keeping originals, and for text/markdown uploads where
+  // the extracted chunks fully round-trip the content. Drives the DOCX
+  // viewer's PdfPageViewerDialog/DocxViewerDialog routing, and the
+  // "Re-upload for viewing" banner on legacy docs.
+  original_ext: text("original_ext"),
+
   // stats
   total_chunks: integer("total_chunks").notNull().default(0),
   total_tokens: integer("total_tokens").notNull().default(0),
