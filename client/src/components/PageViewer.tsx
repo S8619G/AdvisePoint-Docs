@@ -682,7 +682,32 @@ ${imgsHtml}
                       data-testid={`img-page-${pageNumber}`}
                     />
                   </>
+                ) : status?.status === "missing" ? (
+                  // v1.0.4: non-PDF documents (DOCX/TXT/MD) never enter the
+                  // render pipeline, so `currentPageRendered` is permanently
+                  // false. Show a friendly explanation instead of a forever-
+                  // spinning "Page N is still rendering" fallback.
+                  <div className="mt-16 text-center text-sm text-muted-foreground max-w-md">
+                    <div>No page images are available for this document.</div>
+                    <div className="mt-1 text-xs">
+                      Use search to find content within it.
+                    </div>
+                  </div>
+                ) : status?.status === "error" ? (
+                  // v1.0.4: surface render errors here instead of falling
+                  // back to a spinner. Header already shows the short error
+                  // string; body pane echoes it with more room.
+                  <div className="mt-16 text-center text-sm text-destructive max-w-md px-6">
+                    <div className="font-medium">Render failed for this document.</div>
+                    {status.error && (
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        {status.error}
+                      </div>
+                    )}
+                  </div>
                 ) : (
+                  // Still rendering (status === "pending" | "rendering" or
+                  // unknown) - keep the original spinner behavior.
                   <div className="mt-16 text-center text-sm text-muted-foreground max-w-md">
                     <Loader2 className="h-5 w-5 animate-spin mx-auto mb-3" />
                     <div>Page {pageNumber} is still rendering.</div>

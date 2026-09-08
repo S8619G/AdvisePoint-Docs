@@ -6,7 +6,7 @@ import multer from "multer";
 import { storage } from "./storage";
 import { extractTextFromFile } from "./extract";
 import { deriveLocation } from "./locate";
-import { scheduleRender, purgePagesForDoc, pageFilePath } from "./pages";
+import { scheduleRender, purgePagesForDoc, pageFilePath, getRenderQueueSnapshot } from "./pages";
 import { existsSync, createReadStream, statSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join, resolve } from "node:path";
@@ -20,6 +20,7 @@ import {
   cleanupStaged,
   importWipeReplace,
   importMerge,
+  currentBackupRawSize,
   type BackupManifest,
 } from "./backup";
 import {
@@ -107,6 +108,71 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  // v1.0.4: real-time render-queue status for the header render-status
+  // indicator. Reads module state from pages.ts (no DB hit for the queue
+  // snapshot itself) plus per-doc metadata from the documents table for
+  // the currently-rendering doc and any recently-failed docs. Polled
+  // every 2 s while active, every 10 s while idle.
+  app.get("/api/render/status", (_req, res) => {
+    try {
+      const snap = getRenderQueueSnapshot();
+
+      // Current doc detail. When a doc is actively rendering the queue
+      // snapshot names it; we look up its title and progress from the DB.
+      let current_document: {
+        id: string;
+        title: string;
+        file_name: string;
+        pages_done: number;
+        pages_total: number;
+      } | null = null;
+      if (snap.running && snap.current_document_id) {
+        const doc = storage.getDocument(snap.current_document_id);
+        const rs = storage.getRenderStatus(snap.current_document_id);
+        if (doc) {
+          current_document = {
+            id: doc.id,
+            title: (doc.title ?? "") || (doc.file_name ?? "(untitled)"),
+            file_name: doc.file_name ?? "(unknown)",
+            pages_done: rs?.rendered ?? 0,
+            pages_total: rs?.total ?? 0,
+          };
+        }
+      }
+
+      // v1.0.4: recent failures for the failure-state tooltip. Scans all
+      // render_status rows for status="error" and enriches each with the
+      // doc title/filename. `documents` table is bounded (a portable app,
+      // not a server workload) so a full scan is fine here; the UI polls
+      // this at most every 2 s.
+      const recent_failures = storage.listDocuments()
+        .map((d) => {
+          const rs = storage.getRenderStatus(d.id);
+          if (!rs || rs.status !== "error") return null;
+          return {
+            document_id: d.id,
+            title: (d.title ?? "") || (d.file_name ?? "(untitled)"),
+            file_name: d.file_name ?? "(unknown)",
+            error: rs.error ?? "unknown error",
+            failed_at: rs.updated_at,
+            first_failed_page: rs.first_failed_page ?? null,
+          };
+        })
+        .filter((x): x is NonNullable<typeof x> => x !== null)
+        // Newest failure first.
+        .sort((a, b) => (a.failed_at < b.failed_at ? 1 : -1));
+
+      res.json({
+        active: snap.running,
+        current_document,
+        queue_depth: snap.queue_depth,
+        recent_failures,
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
     }
   });
 
@@ -1137,8 +1203,37 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   // GET/POST /api/backup/settings  -- read or update scheduled-backup config.
+  //
+  // v1.0.4: the settings response now includes the current on-disk size
+  // that a fresh backup would archive (raw DB + rendered pages) plus an
+  // estimated compressed size (raw * 1.02, so the caller shows a slight
+  // upper bound rather than an under-count). The BackupPanel renders a
+  // muted line under the retention row so the user can spot when their
+  // library has grown into GB territory before a scheduled ZIP fires.
   app.get("/api/backup/settings", (_req, res) => {
-    res.json({ ok: true, settings: readBackupSettings() });
+    const s = readBackupSettings();
+    let sizeExtras: {
+      current_backup_size_bytes: number;
+      current_backup_size_estimate_bytes: number;
+    } = {
+      current_backup_size_bytes: 0,
+      current_backup_size_estimate_bytes: 0,
+    };
+    try {
+      const raw = currentBackupRawSize();
+      const total = raw.db_bytes + raw.pages_bytes;
+      // The ZIP itself is smaller than raw, but we surface an ESTIMATED
+      // final backup size that adds a tiny 2% margin so users see a
+      // conservative upper bound of the disk space each ZIP will take.
+      sizeExtras = {
+        current_backup_size_bytes: total,
+        current_backup_size_estimate_bytes: Math.ceil(total * 1.02),
+      };
+    } catch {
+      // Never let a stat failure break the settings page; fall through
+      // with zeros so the muted line just shows "unknown".
+    }
+    res.json({ ok: true, settings: { ...s, ...sizeExtras } });
   });
   app.post("/api/backup/settings", (req, res) => {
     try {

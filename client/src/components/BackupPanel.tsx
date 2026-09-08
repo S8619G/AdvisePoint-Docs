@@ -70,6 +70,11 @@ interface BackupSettings {
   last_run_error: string | null;
   last_backup_filename: string | null;
   next_run_at: string | null;
+  // v1.0.4: current on-disk size of the DB + rendered pages (raw), and an
+  // estimated size of the ZIP the next backup would produce (raw + 2%).
+  // Server returns 0/0 when the sizes can't be stat'ed.
+  current_backup_size_bytes?: number;
+  current_backup_size_estimate_bytes?: number;
 }
 
 const DEFAULT_SETTINGS: BackupSettings = {
@@ -84,7 +89,22 @@ const DEFAULT_SETTINGS: BackupSettings = {
   last_run_error: null,
   last_backup_filename: null,
   next_run_at: null,
+  current_backup_size_bytes: 0,
+  current_backup_size_estimate_bytes: 0,
 };
+
+// v1.0.4: human-readable size for the backup-size disclosure. Rounds to
+// KB / MB / GB with one decimal. Returns "unknown" when the server sent 0.
+function fmtBytes(bytes: number | undefined): string {
+  if (!bytes || bytes <= 0) return "unknown";
+  const KB = 1024;
+  const MB = KB * 1024;
+  const GB = MB * 1024;
+  if (bytes >= GB) return `${(bytes / GB).toFixed(2)} GB`;
+  if (bytes >= MB) return `${(bytes / MB).toFixed(1)} MB`;
+  if (bytes >= KB) return `${(bytes / KB).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
 
 function fmtRel(iso: string | null): string {
   if (!iso) return "never";
@@ -486,6 +506,20 @@ export function BackupPanel() {
                   className="h-8 text-xs"
                   data-testid="input-backup-retention"
                 />
+                {/* v1.0.4: current backup size disclosure. Muted so it
+                    reads as informational rather than an action. Shows
+                    the estimated ZIP size (raw + 2%) and the raw content
+                    size in parentheses so users can plan folder capacity
+                    before turning on daily/weekly retention. */}
+                <p
+                  className="text-[11px] text-muted-foreground"
+                  data-testid="text-backup-size"
+                >
+                  Current backup size: ~{fmtBytes(settings.current_backup_size_estimate_bytes)}
+                  {(settings.current_backup_size_bytes ?? 0) > 0 && (
+                    <> ({fmtBytes(settings.current_backup_size_bytes)} on disk)</>
+                  )}
+                </p>
               </div>
               <div className="space-y-1.5 sm:col-span-2">
                 <Label htmlFor="backup-folder" className="text-xs">

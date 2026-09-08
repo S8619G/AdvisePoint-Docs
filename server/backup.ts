@@ -119,7 +119,9 @@ function ensureDir(dir: string): void {
   mkdirSync(dir, { recursive: true });
 }
 
-function directorySize(dir: string): { bytes: number; files: number } {
+// v1.0.4: exported so the settings endpoint can size the current backup
+// contents without duplicating the walk logic.
+export function directorySize(dir: string): { bytes: number; files: number } {
   let bytes = 0;
   let files = 0;
   if (!existsSync(dir)) return { bytes, files };
@@ -137,6 +139,31 @@ function directorySize(dir: string): { bytes: number; files: number } {
   };
   walk(dir);
   return { bytes, files };
+}
+
+// v1.0.4: return the on-disk size of the raw content a backup would
+// include (DB file + rendered pages tree). The final ZIP is smaller than
+// this after compression; the caller layers on a small estimate factor.
+// Kept intentionally simple - it does NOT VACUUM the DB or copy files;
+// it just stats what's already on disk, so it's cheap to call from a
+// settings page render.
+export function currentBackupRawSize(): {
+  db_bytes: number;
+  pages_bytes: number;
+  pages_file_count: number;
+} {
+  let db_bytes = 0;
+  try {
+    if (existsSync(DB_FILE_PATH)) {
+      db_bytes = statSync(DB_FILE_PATH).size;
+    }
+  } catch { /* ignore */ }
+  const pagesInfo = directorySize(getPagesDirForBackup());
+  return {
+    db_bytes,
+    pages_bytes: pagesInfo.bytes,
+    pages_file_count: pagesInfo.files,
+  };
 }
 
 // -------- EXPORT --------

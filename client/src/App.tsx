@@ -14,6 +14,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { APP_VERSION } from "./version";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { BackendDownOverlay } from "@/components/BackendDownOverlay";
+import { RenderStatusIndicator } from "@/components/RenderStatusIndicator";
 import { libraryTabStore } from "@/lib/libraryTabStore";
 import { useTabState } from "@/lib/tabStore";
 
@@ -78,6 +79,10 @@ function TopNav() {
           })}
         </nav>
         <div className="ml-auto flex items-center gap-3 font-mono text-[11px] text-muted-foreground">
+          {/* v1.0.4: render-status indicator - invisible when idle, spinner
+              while rendering, red glyph when any recent doc failed to
+              render. Placed just before the stats counter per the backlog. */}
+          <RenderStatusIndicator />
           <span data-testid="text-stat-docs">
             <span className="text-foreground">{stats?.documents ?? 0}</span> docs
           </span>

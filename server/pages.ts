@@ -25,6 +25,54 @@ import { join, dirname } from "node:path";
 import { storage } from "./storage";
 import type { DocumentPage } from "./storage";
 
+// v1.0.4: per-page and whole-job render timeouts. All configurable via env
+// vars so field techs can tune them without shipping a new build. Defaults
+// come from real-world observations:
+//   - 2 min/page: 240 DPI @ q88 renders of dense manual pages take 3-8 s
+//     on modern hardware, up to ~30 s on older laptops. 2 min is deep in
+//     the "something is genuinely wrong" tail.
+//   - 30 s for doc.getPage(n): usually microseconds. Anything over 30 s
+//     means pdfjs is wedged parsing a malformed xref or CFF font.
+//   - 60 s for pdfjs.getDocument().promise: the whole PDF must at least
+//     parse its header, xref, and encryption metadata within a minute.
+//   - 30 min whole-job wall clock: a 1000-page manual @ 5 s/page is ~80
+//     min, so this is a safety net for pathological docs, not a normal cap.
+//     If a legitimate huge manual needs more, raise the env var.
+const RENDER_PAGE_TIMEOUT_MS = Number(process.env.RAG_RENDER_PAGE_TIMEOUT_MS) || 120_000;
+const RENDER_GETPAGE_TIMEOUT_MS = Number(process.env.RAG_RENDER_GETPAGE_TIMEOUT_MS) || 30_000;
+const RENDER_LOAD_TIMEOUT_MS = Number(process.env.RAG_RENDER_LOAD_TIMEOUT_MS) || 60_000;
+const RENDER_JOB_TIMEOUT_MS = Number(process.env.RAG_RENDER_JOB_TIMEOUT_MS) || 1_800_000;
+
+class RenderTimeoutError extends Error {
+  constructor(op: string, ms: number) {
+    super(`${op} timed out after ${ms}ms`);
+    this.name = "RenderTimeoutError";
+  }
+}
+
+// v1.0.4: race any pdfjs promise against a timer. On timeout throws a
+// RenderTimeoutError; the underlying pdfjs work may keep running in the
+// background (pdfjs has no cancellation API) but we stop awaiting it and
+// move on. The `finally` block on the loser side still gets a chance to
+// clean up when it eventually settles because we hold a reference.
+async function withTimeout<T>(
+  p: Promise<T>,
+  ms: number,
+  op: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new RenderTimeoutError(op, ms)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 // Import pdfjs (legacy Node build) lazily so a broken install doesn't kill server
 // startup. Cached after first load. The cached module MUST be reused across calls
 // because pdfjs stashes some state at module scope.
@@ -123,12 +171,16 @@ export function pageFilePath(document_id: string, page_number: number): string {
 type RenderJob = { document_id: string; buffer: Buffer };
 const _renderQueue: RenderJob[] = [];
 let _renderRunning = false;
+// v1.0.4: track the currently-running doc id so the header indicator can
+// name it. Cleared in the drain function's .finally() block.
+let _currentJobId: string | null = null;
 
 function _drainRenderQueue(): void {
   if (_renderRunning) return;
   const job = _renderQueue.shift();
   if (!job) return;
   _renderRunning = true;
+  _currentJobId = job.document_id;
   renderInBackground(job.document_id, job.buffer)
     .catch((err) => {
       console.error(`[pages] render failed for ${job.document_id}:`, err);
@@ -145,10 +197,32 @@ function _drainRenderQueue(): void {
     })
     .finally(() => {
       _renderRunning = false;
+      _currentJobId = null;
       // Yield before starting the next job so the event loop gets a tick
       // to answer queued requests (health checks, chunk queries, etc.).
       setImmediate(_drainRenderQueue);
     });
+}
+
+// v1.0.4: read-only snapshot of the render queue for the header indicator.
+// Cheap - just returns primitives from module state, no DB access. Callers
+// combine this with storage.getRenderStatus() to build the full picture.
+export function getRenderQueueSnapshot(): {
+  running: boolean;
+  current_document_id: string | null;
+  queue_depth: number;
+  queued_document_ids: string[];
+} {
+  return {
+    running: _renderRunning,
+    current_document_id: _renderRunning && _renderQueue.length >= 0
+      // The currently-rendering doc has already been shifted OUT of the
+      // queue by _drainRenderQueue(). We stash it in _currentJobId below.
+      ? _currentJobId
+      : null,
+    queue_depth: _renderQueue.length,
+    queued_document_ids: _renderQueue.map((j) => j.document_id),
+  };
 }
 
 // Public API — returns immediately, work happens on the event loop.
@@ -177,6 +251,13 @@ export function scheduleRender(document_id: string, buffer: Buffer): void {
 }
 
 async function renderInBackground(document_id: string, buffer: Buffer): Promise<void> {
+  // v1.0.4: enforce a whole-job wall clock so a single pathological document
+  // can never permanently starve the queue. Tracked with a Date-based check
+  // per page rather than a Promise.race on the outer function, so the
+  // *rest* of the doc can also short-circuit cleanly.
+  const jobStartedAt = Date.now();
+  const jobExpiresAt = jobStartedAt + RENDER_JOB_TIMEOUT_MS;
+
   const pdfjs = await loadPdfjs();
   const { createCanvas } = loadCanvas();
 
@@ -221,7 +302,15 @@ async function renderInBackground(document_id: string, buffer: Buffer): Promise<
     standardFontDataUrl,
     wasmUrl,                  // v0.9.29: OpenJPEG/QCMS wasm for JP2/JPX images
   });
-  const doc = await loadingTask.promise;
+  // v1.0.4: bound the initial PDF load. A malformed xref or encrypted-
+  // with-unsupported-cipher doc used to sit here forever. Widen back to
+  // `any` because pdfjs's legacy build lacks proper types and the rest
+  // of this file already treats doc/page as any.
+  const doc: any = await withTimeout(
+    loadingTask.promise,
+    RENDER_LOAD_TIMEOUT_MS,
+    `pdfjs.getDocument() for ${document_id}`,
+  );
   const total = doc.numPages;
 
   const outDir = join(resolvePagesDir(), document_id);
@@ -244,11 +333,39 @@ async function renderInBackground(document_id: string, buffer: Buffer): Promise<
   const scale = 240 / 72;
   const webpQuality = 88;
 
+  // v1.0.4: track failures per page so we can (a) skip forward instead of
+  // aborting the whole doc, and (b) mark the doc's final status based on
+  // how much actually rendered. `firstFailure` gives the header render-
+  // status indicator a short human-readable reason for the failure list.
+  const failedPages: number[] = [];
+  let firstFailure: { page: number; error: string } | null = null;
+
   let rendered = 0;
   for (let n = 1; n <= total; n++) {
+    // v1.0.4: whole-job wall clock. If we've been at this for more than
+    // RENDER_JOB_TIMEOUT_MS, abandon the doc entirely so the queue can
+    // move to the next one. All remaining pages are marked failed for
+    // reporting.
+    if (Date.now() >= jobExpiresAt) {
+      for (let m = n; m <= total; m++) failedPages.push(m);
+      if (!firstFailure) {
+        firstFailure = {
+          page: n,
+          error: `whole-document render exceeded ${RENDER_JOB_TIMEOUT_MS}ms`,
+        };
+      }
+      break;
+    }
+
     let page: any | null = null;
     try {
-      page = await doc.getPage(n);
+      // v1.0.4: pdfjs getPage() usually returns instantly but can wedge on
+      // malformed page objects. Bound it explicitly.
+      page = await withTimeout(
+        doc.getPage(n),
+        RENDER_GETPAGE_TIMEOUT_MS,
+        `doc.getPage(${n}) for ${document_id}`,
+      );
       const viewport = page.getViewport({ scale });
       const width = Math.ceil(viewport.width);
       const height = Math.ceil(viewport.height);
@@ -258,7 +375,15 @@ async function renderInBackground(document_id: string, buffer: Buffer): Promise<
       // want to see as white on screen, so paint a white background first.
       ctx.fillStyle = "white";
       ctx.fillRect(0, 0, width, height);
-      await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+
+      // v1.0.4: bound the actual render step. This is where hangs
+      // realistically happen — an infinite loop inside an XObject or a
+      // stuck OpenJPEG decode.
+      await withTimeout(
+        page.render({ canvasContext: ctx, viewport, canvas }).promise,
+        RENDER_PAGE_TIMEOUT_MS,
+        `page.render(${n}) for ${document_id}`,
+      );
 
       const buf = canvas.toBuffer("image/webp", webpQuality);
       const outPath = join(outDir, pageFileName(n, "webp"));
@@ -276,19 +401,36 @@ async function renderInBackground(document_id: string, buffer: Buffer): Promise<
       rendered++;
 
       // Update progress every 10 pages (or on the last one) to avoid write
-      // amplification for very long manuals.
+      // amplification for very long manuals. v1.0.4: the final "ready"
+      // decision moved out of the loop so partial-failure math has all the
+      // data it needs.
       if (n % 10 === 0 || n === total) {
         storage.upsertRenderStatus({
           document_id,
-          status: n === total ? "ready" : "rendering",
+          status: "rendering",
           rendered,
           total,
-          error: null,
+          error: failedPages.length > 0
+            ? `${failedPages.length} of ${total} pages failed so far`
+            : null,
           updated_at: new Date().toISOString(),
+          failed_pages: failedPages.length > 0 ? JSON.stringify(failedPages) : null,
+          first_failed_page: firstFailure?.page ?? null,
         });
       }
+    } catch (err) {
+      // v1.0.4: log and skip forward instead of aborting the whole doc.
+      // The catch is intentionally broad because we can't recover any
+      // pdfjs error state anyway; the failure is per-page.
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[pages] page ${n} of ${document_id} failed:`, message);
+      failedPages.push(n);
+      if (!firstFailure) {
+        firstFailure = { page: n, error: message };
+      }
     } finally {
-      // pdfjs pages hold onto worker memory until cleaned up.
+      // pdfjs pages hold onto worker memory until cleaned up. Idempotent
+      // and safe on a partially-rendered page.
       try { page?.cleanup?.(); } catch { /* ignore */ }
     }
 
@@ -299,7 +441,30 @@ async function renderInBackground(document_id: string, buffer: Buffer): Promise<
     await new Promise<void>((r) => setImmediate(r));
   }
 
-  // Best-effort clean shutdown.
+  // v1.0.4: final status decision. > 25% pages failed → status=error, so
+  // the header indicator flags this doc. Otherwise mark ready with a
+  // partial-failure note if some pages did fail.
+  const failureRate = total > 0 ? failedPages.length / total : 0;
+  const finalStatus: "ready" | "error" = failureRate > 0.25 ? "error" : "ready";
+  const finalError = failedPages.length === 0
+    ? null
+    : finalStatus === "error"
+      ? `${failedPages.length} of ${total} pages failed to render. First failure on page ${firstFailure?.page}: ${firstFailure?.error}`
+      : `${failedPages.length} of ${total} pages failed to render (partial). First failure on page ${firstFailure?.page}: ${firstFailure?.error}`;
+  storage.upsertRenderStatus({
+    document_id,
+    status: finalStatus,
+    rendered,
+    total,
+    error: finalError,
+    updated_at: new Date().toISOString(),
+    failed_pages: failedPages.length > 0 ? JSON.stringify(failedPages) : null,
+    first_failed_page: firstFailure?.page ?? null,
+  });
+
+  // Best-effort clean shutdown. Won't run if doc.getDocument() timed out
+  // above (we never got `doc` to close), but the outer .catch() in the
+  // drain function handles reporting for that case.
   try { await doc.cleanup?.(); } catch { /* ignore */ }
   try { await doc.destroy?.(); } catch { /* ignore */ }
 }

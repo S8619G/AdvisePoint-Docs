@@ -218,13 +218,19 @@ CREATE INDEX IF NOT EXISTS idx_pages_doc ON document_pages(document_id);
 
 -- Render-job status. One row per doc; upserted as the background renderer
 -- makes progress. status ∈ {pending, rendering, ready, error, missing}.
+--
+-- v1.0.4 added failed_pages (JSON array of page numbers that failed) and
+-- first_failed_page for the header render-status indicator's failure list.
+-- Old rows without these columns are patched via ALTER TABLE below.
 CREATE TABLE IF NOT EXISTS document_render_status (
   document_id TEXT PRIMARY KEY,
   status TEXT NOT NULL,
   rendered INTEGER NOT NULL DEFAULT 0,
   total INTEGER NOT NULL DEFAULT 0,
   error TEXT,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  failed_pages TEXT,
+  first_failed_page INTEGER
 );
 
 -- v0.9.33: user-managed document type registry. Documents continue storing
@@ -323,6 +329,29 @@ const BUILTIN_DOCUMENT_TYPE_LABELS: Record<string, string> = {
       console.error("[storage] failed to add document_types.color:", err);
     }
   }
+
+  // v1.0.4: structured failure detail on document_render_status so the header
+  // indicator can list failed docs by name with a specific reason. Two new
+  // columns; safe to run against v0.9.x databases where render_status only
+  // has the original six columns.
+  const rsCols = sqlite.prepare("PRAGMA table_info(document_render_status)").all() as { name: string }[];
+  const rsHave = new Set(rsCols.map((c) => c.name));
+  if (!rsHave.has("failed_pages")) {
+    try {
+      sqlite.exec("ALTER TABLE document_render_status ADD COLUMN failed_pages TEXT");
+      console.log("[storage] added column document_render_status.failed_pages");
+    } catch (err) {
+      console.error("[storage] failed to add document_render_status.failed_pages:", err);
+    }
+  }
+  if (!rsHave.has("first_failed_page")) {
+    try {
+      sqlite.exec("ALTER TABLE document_render_status ADD COLUMN first_failed_page INTEGER");
+      console.log("[storage] added column document_render_status.first_failed_page");
+    } catch (err) {
+      console.error("[storage] failed to add document_render_status.first_failed_page:", err);
+    }
+  }
 })();
 
 // If we just seeded page images, rewrite `image_path` in document_pages so
@@ -372,6 +401,12 @@ export interface RenderStatus {
   total: number;
   error: string | null;
   updated_at: string;
+  // v1.0.4: structured failure detail so the header indicator can list
+  // failed docs by name with a specific reason. `failed_pages` is a
+  // JSON-encoded number[] (or null). Reads that pre-date v1.0.4 return
+  // null for both fields.
+  failed_pages?: string | null;
+  first_failed_page?: number | null;
 }
 
 export type DocumentTypeSortMode = "importance" | "alphabetical";
@@ -527,16 +562,28 @@ export class SqliteStorage implements IStorage {
     sqlite.prepare("DELETE FROM document_render_status WHERE document_id = ?").run(document_id);
   }
   upsertRenderStatus(row: RenderStatus): void {
+    // v1.0.4: coerce optional structured-failure fields to null when the
+    // caller didn't provide them, so the prepared statement's named-param
+    // binder doesn't blow up on undefined.
+    const bindable = {
+      ...row,
+      failed_pages: row.failed_pages ?? null,
+      first_failed_page: row.first_failed_page ?? null,
+    };
     sqlite.prepare(`
-      INSERT INTO document_render_status (document_id, status, rendered, total, error, updated_at)
-      VALUES (@document_id, @status, @rendered, @total, @error, @updated_at)
+      INSERT INTO document_render_status
+        (document_id, status, rendered, total, error, updated_at, failed_pages, first_failed_page)
+      VALUES
+        (@document_id, @status, @rendered, @total, @error, @updated_at, @failed_pages, @first_failed_page)
       ON CONFLICT(document_id) DO UPDATE SET
         status=excluded.status,
         rendered=excluded.rendered,
         total=excluded.total,
         error=excluded.error,
-        updated_at=excluded.updated_at
-    `).run(row);
+        updated_at=excluded.updated_at,
+        failed_pages=excluded.failed_pages,
+        first_failed_page=excluded.first_failed_page
+    `).run(bindable);
   }
   getRenderStatus(document_id: string): RenderStatus | undefined {
     return sqlite.prepare(
