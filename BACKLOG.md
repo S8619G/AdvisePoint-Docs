@@ -38,7 +38,7 @@ item is added, reordered, removed, or promoted to SHIPPED.
 
 ## v1.0.5 — release scope summary
 
-**Deferred from v1.0.4 on 2026-09-08.** Four items now, no ordering
+**Deferred from v1.0.4 on 2026-09-08.** Five items now, no ordering
 commitment yet. Update whenever scope shifts.
 
 **Headline feature**
@@ -49,17 +49,19 @@ commitment yet. Update whenever scope shifts.
 
 2. [DOCX viewer — render extracted content in the PageViewer dialog](#docx-viewer--render-extracted-content-in-the-pageviewer-dialog-v105--planned) — real in-app viewer for DOCX/TXT/MD, reusing the mammoth-extracted HTML. Builds on the PageViewer fix already shipped in v1.0.4.
 3. [Install-location guidance and cloud-sync detection](#install-location-guidance-and-cloud-sync-detection-v105--planned) — README section, boot-time path detection, dismissible header banner, and a muted note under the backup-folder input in Settings. Added 2026-09-08 after a KEY-OP-TRAINING.docx upload silently failed with browser-side "Failed to fetch" when the app was running from inside a OneDrive-synced folder.
+4. [Render event-loop starvation — move PDF render off the main thread](#render-event-loop-starvation--move-pdf-render-off-the-main-thread-v105--planned) — pdfjs currently renders inline on the main event loop (`disableWorker: true`) so a heavy or timed-out background render can starve `/api/health` + `/api/heartbeat` long enough to trip the client's "reconnecting" banner (or the full backend-down modal at ~14s). Added 2026-09-08 after a v1.0.4 field report of the app tab suddenly losing connection to the server while otherwise idle. NOT a v1.0.4 regression — the `disableWorker: true` mode has been in place since v0.9.30 — but v1.0.4's new render-queue continuation on failure makes the exposure worse.
 
 **Cosmetic / polish**
 
-4. [node.exe Task Manager visibility — Version Resource + icon embed](#nodeexe-task-manager-visibility--version-resource--icon-embed-v105--planned) — rcedit rewrites node.exe's ProductName/FileDescription/icon so Task Manager shows "AdvisePoint Docs" instead of "Node.js JavaScript Runtime." Keeps filename `node.exe` to avoid launcher churn.
+5. [node.exe Task Manager visibility — Version Resource + icon embed](#nodeexe-task-manager-visibility--version-resource--icon-embed-v105--planned) — rcedit rewrites node.exe's ProductName/FileDescription/icon so Task Manager shows "AdvisePoint Docs" instead of "Node.js JavaScript Runtime." Keeps filename `node.exe` to avoid launcher churn.
 
 ### Suggested implementation order
 
-1. **Install-location guidance** first — pure additive, zero interaction with the other three, and ships user-visible value even if the release slips on the other items.
-2. **node.exe rebrand** — one-shot packaging change, isolates well from DOCX/ARM.
-3. **DOCX viewer** — self-contained feature, no ARM64 interaction.
-4. **Windows on ARM** — largest scope, land it last so it doesn't collide with other work in progress.
+1. **Install-location guidance** first — pure additive, zero interaction with the other four, and ships user-visible value even if the release slips on the other items.
+2. **Render event-loop starvation fix** — pure reliability fix, isolated to `server/pages.ts` + a new render worker. Ship early so field testing has maximum time to surface any worker/IPC edge cases.
+3. **node.exe rebrand** — one-shot packaging change, isolates well from DOCX/ARM.
+4. **DOCX viewer** — self-contained feature, no ARM64 interaction.
+5. **Windows on ARM** — largest scope, land it last so it doesn't collide with other work in progress.
 
 Alternate ordering: if v1.0.4 field validation of the renderer
 timeout surfaces any issue, hotfix that first before starting
@@ -1535,6 +1537,161 @@ LibraryScanPanel and DiagnosticsPanel.
 
 ~1–2 hours: ~20 lines server + ~15 lines client + one round of
 visual QA on the Settings panel.
+
+## Render event-loop starvation — move PDF render off the main thread (v1.0.5 — PLANNED)
+
+**Filed:** 2026-09-08
+**Target release:** v1.0.5
+**Status:** planned. Second implementation priority in v1.0.5
+(pure reliability fix, ships user-visible stability improvement).
+
+**Ask:** After the v1.0.4 upgrade, a field report of the app tab
+suddenly losing connection to the server while the tab was otherwise
+idle, then trying to reconnect but failing. Investigation traced this
+to pdfjs rendering blocking Node's single-threaded event loop.
+
+### Diagnosis
+
+**Not a v1.0.4 regression per se.** The idle-shutdown timer
+(`server/index.ts` lines 115–135) and client heartbeat interval
+(`client/src/lib/heartbeat.ts`) are byte-identical between v0.9.35 and
+v1.0.4 (verified via `git diff v0.9.35 -- server/index.ts
+client/src/lib/heartbeat.ts` returning empty). The 10-minute idle
+shutdown from v0.9.28 is still in place; that is not what's firing.
+
+**Root cause:** In `server/pages.ts` line ~297 (in `renderInBackground`)
+pdfjs is initialized with `disableWorker: true`, forcing all PDF
+parsing + page rasterization onto the main Node event loop. When a
+render is in flight:
+
+- 240 DPI @ scale 3.333 rasterization of a large or complex page
+  (heavy vector art, embedded JP2/JPX images, many overlapping
+  transparency groups) can pin the event loop for multiple seconds
+  per page.
+- `/api/health` (client polls every 2s, aborts at 3.5s) and
+  `/api/heartbeat` (client pings every 5s) are Express handlers on
+  that same event loop.
+- The client-side `BackendDownOverlay` flips to the amber
+  "reconnecting" banner after **1 failed poll** (see `RECONNECT_THRESHOLD
+  = 1` in `BackendDownOverlay.tsx`). A single event-loop stall >3.5s
+  is enough to trip it.
+- After 7 consecutive failures (`DOWN_THRESHOLD`, ~14 s of sustained
+  starvation) the full-screen modal appears, telling the user to
+  relaunch — even though the server is fine and just blocked.
+
+**Why v1.0.4 makes it worse (but did not introduce it):**
+
+1. v1.0.4's new `withTimeout` racing (see `server/pages.ts`) makes the
+   *worker* stop awaiting a stuck pdfjs promise so the queue can move
+   on — but pdfjs has no cancellation API, so the losing promise's CPU
+   work **keeps running in the background**. A 30s `getPage` timeout or
+   120s `page.render` timeout that fires now means the client sees
+   another N seconds of event-loop pressure from the abandoned render
+   PLUS the next page starting.
+2. v1.0.4's new render-queue continuation on failure (previously a
+   render failure aborted the queue; now it skips to the next doc)
+   means large libraries reprocess/repair more docs back-to-back on
+   startup, extending the window of exposure.
+
+**Additional secondary contributors (same failure mode, different
+trigger — out of scope for this fix but noted for tracking):**
+
+- `server/rag.ts` search runs TF-IDF cosine similarity inline in the
+  request handler on the main event loop. A search over a large chunk
+  corpus can stall health for hundreds of ms. Tolerable today; will
+  become a problem as libraries grow.
+- `better-sqlite3` is synchronous by design. Every storage call is a
+  main-thread block. Individually cheap; a batch (e.g. bulk render
+  status updates) can add up.
+
+### Fix scope for v1.0.5
+
+**Primary fix — render worker.** Move pdfjs rendering into a
+dedicated `worker_threads` Worker, following the exact pattern
+already established in `server/extract.ts` (long-lived pool size 1,
+buffer transferred via `postMessage` transferList, worker script
+hand-written CJS at `server/workers/render-worker.cjs`, respawn on
+crash).
+
+- Change `disableWorker: true` reasoning: it was originally set that
+  way because pdfjs's own worker mode requires spawning a
+  `Worker`-compatible environment inside pdfjs's own runtime, which
+  is awkward in a Node context. Moving to `worker_threads` on OUR
+  side achieves the same event-loop isolation without depending on
+  pdfjs's internal worker plumbing.
+- Worker handles: pdf.getDocument, per-page render to canvas, WebP
+  encode via napi-rs. Buffer of WebP bytes transferred back to main
+  thread, which writes to disk and updates `render_status`.
+- Main thread's `renderInBackground` becomes a thin async orchestrator
+  that awaits worker messages. Heartbeat + health handlers stay
+  responsive throughout even a multi-hour render job.
+- Keep the existing `withTimeout` + `RENDER_JOB_TIMEOUT_MS` layer —
+  now enforced by terminating the worker on timeout, which DOES
+  cancel the CPU work (unlike the promise-race abandonment today).
+
+**Client-side follow-up:** the `RECONNECT_THRESHOLD = 1` in
+`BackendDownOverlay.tsx` is genuinely too aggressive for a single
+missed poll. Bump to 2 (i.e. 4 s of failure) so a one-off event-loop
+hiccup or a laptop briefly waking from sleep doesn't flash the amber
+banner. Keep `DOWN_THRESHOLD = 7` unchanged.
+
+**Non-goals for v1.0.5:**
+
+- Do not move search (`server/rag.ts`) or SQLite calls off the main
+  thread — those are secondary contributors not currently causing
+  reports, and they involve much bigger architectural change.
+- Do not remove the 10-minute idle shutdown — it's working as
+  intended and unrelated to this bug.
+- Do not lower `DOWN_THRESHOLD` — 14 s of sustained failure is
+  correct for detecting a genuinely crashed server.
+
+### Reproduction (for QA)
+
+1. Upload a large PDF known to render slowly (multi-hundred-page
+   PowerPoint export with JP2 images works). Any doc where per-page
+   render exceeds 3.5s is sufficient.
+2. Wait for the render queue to pick it up (header render-status
+   indicator will show a spinner).
+3. Watch the top of the page: on current v1.0.4 code the amber
+   "Reconnecting to the local service..." banner will flicker in
+   whenever a page's render exceeds the 3.5s health-fetch timeout.
+4. On the fixed v1.0.5 code the banner should not appear at all;
+   `/api/health` continues responding within a few ms throughout the
+   entire render.
+
+### Definition of done
+
+- [ ] `server/pages.ts` no longer calls pdfjs directly; all pdfjs
+      calls live in `server/workers/render-worker.cjs`
+- [ ] `disableWorker: true` removed from `server/pages.ts` (worker
+      isolation happens at the `worker_threads` layer instead)
+- [ ] Render worker follows the same lifecycle pattern as
+      `extract-worker.cjs`: long-lived pool size 1, buffer
+      transferred with transferList, respawn on crash, terminate on
+      job timeout
+- [ ] Job-timeout path (`RENDER_JOB_TIMEOUT_MS`) actually terminates
+      the worker CPU, not just abandons the promise
+- [ ] `RECONNECT_THRESHOLD` in `BackendDownOverlay.tsx` bumped from
+      1 to 2
+- [ ] Manual test: uploading the PowerPoint-export PDF that surfaced
+      the JP2/JPX blank-graphics fix in v0.9.29 no longer triggers
+      the amber "reconnecting" banner during render
+- [ ] Manual test: `/api/health` returns within 100 ms while a large
+      render is in progress
+- [ ] Manual test: forcing `RAG_RENDER_PAGE_TIMEOUT_MS=1` still
+      produces the expected failure entries in `/api/render/status`
+      and does NOT crash the server (worker termination path exercised)
+- [ ] Existing render-status behavior (per-page progress,
+      `first_failed_page`, `failed_pages`, header indicator) is
+      preserved unchanged from the outside
+- [ ] `rg -i kyocera` returns zero hits after this change
+
+**Rough size:** ~150 lines new render-worker CJS + ~80 lines
+refactored `pages.ts` + 1-line client threshold bump + 3 manual
+tests. One focused sprint, medium-risk (worker IPC edge cases,
+transferList semantics, packaging must include the new worker CJS in
+the zip). Test on both a large library reload (many docs queued) and
+a single pathological doc (timeout path).
 
 ## Install-location guidance and cloud-sync detection (v1.0.5 — PLANNED)
 
