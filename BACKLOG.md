@@ -678,8 +678,7 @@ that way — exactly matching the reported symptom.
 ## DOCX viewer — render extracted content in the PageViewer dialog (v1.0.4 — PLANNED)
 
 **Filed:** 2026-09-08
-**Target release:** v1.0.4 (candidate; may slip to v1.0.5 if scope
-grows)
+**Target release:** v1.0.4
 **Status:** planned. New feature. Complements the PageViewer fix
 above.
 
@@ -787,15 +786,16 @@ Content-mode viewer:
 
 ### Interaction with the PageViewer fix above
 
-These two entries are independent:
+Both ship in v1.0.4. Order of implementation:
 
-- The PageViewer fix ships the friendly "no page images" fallback so
-  the current DOCX experience is not broken.
-- The DOCX viewer replaces that fallback with an actual viewer when
-  it lands.
+1. Land the PageViewer fix first (~30 min) so any interim build has
+   a clean fallback if the DOCX viewer isn't wired up yet.
+2. Land the DOCX viewer, which replaces that fallback with the real
+   content viewer.
 
-If the DOCX viewer slips to v1.0.5, the fix above still stands on
-its own and non-PDFs stop showing the false spinner.
+The fix is intentionally self-contained so the DOCX viewer PR can
+lean on it (the mode switcher just extends the same conditional
+tree) without a merge conflict.
 
 ### Testing
 
