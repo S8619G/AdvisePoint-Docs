@@ -412,7 +412,7 @@ bumped one more size step to `text-base`, bumped weight to `font-bold`,
 and added underline-on-hover for a clearer link affordance. Dark-mode
 contrast confirmed clean during user evaluation.
 
-## Query search box — select-on-focus (v1.0.3 — STAGED)
+## Query search box — select-on-focus (v1.0.3 — SHIPPED)
 
 **Filed:** 2026-09-07
 **Target release:** v1.0.3
@@ -432,7 +432,7 @@ and ready to be typed over. The user can still click twice or drag to
 deselect and edit the prior query in place if they want to iterate
 instead of replacing.
 
-## Zip filename — version-free canonical name (v1.0.3 — PLANNED)
+## Zip filename — version-free canonical name (v1.0.3 — SHIPPED)
 
 **Filed:** 2026-09-07
 **Target release:** v1.0.3
@@ -504,7 +504,7 @@ auto-updates resume normally.
   truthful, or it lies. Not worth the maintenance cost when the app's
   About view already shows the version.
 
-## Favicon — tab icon shows document + chevron mark (v1.0.3 — STAGED)
+## Favicon — tab icon shows document + chevron mark (v1.0.3 — SHIPPED)
 
 **Filed:** 2026-09-07
 **Target release:** v1.0.3 (alongside Backup & Restore)
@@ -1290,7 +1290,7 @@ Filter/sort-candidate fields on the doc type:
 Six sortable/filterable fields is at the threshold where the current
 fixed-dropdown row starts feeling cluttered on smaller windows.
 
-## Backup & Restore (planned for v1.0.3)
+## Backup & Restore (v1.0.3 — SHIPPED)
 
 **Filed:** 2026-09-03
 **Retargeted:** 2026-09-07 (originally v1.0.0, moved to v1.0.3 after
