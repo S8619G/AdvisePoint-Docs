@@ -540,6 +540,142 @@ favicon asset changes, so existing installs pick up the new icon after
 an in-place update. The version tag doesn't have to match the app
 version — it just has to change.
 
+## Windows on ARM — full ARM64 support (v1.0.4 — PLANNED)
+
+**Filed:** 2026-09-08
+**Target release:** v1.0.4
+**Status:** planned, not yet started. Headline feature for v1.0.4.
+**Ask:** AdvisePoint Docs currently ships only an x64 Windows portable. Users
+on Windows on ARM devices (Surface Pro X / Pro 9 5G / Pro 11, Copilot+ PCs
+like the Surface Laptop 7 and various ARM-based ThinkPad/HP/Dell/Samsung
+Galaxy Book models) fall back to the x64 emulator today, which drags the
+native-module story down (better-sqlite3, pdf worker) and inflates memory
+and startup time. Ship a real ARM64 build for v1.0.4.
+
+### Deliverables
+
+1. **Two portable zips per release**, side-by-side on the GitHub release:
+   - `AdvisePoint-Docs.zip` — x64 (existing canonical name kept for the
+     in-app updater matcher).
+   - `AdvisePoint-Docs-arm64.zip` — native Windows ARM64.
+   Rationale: keeping the version-free canonical filename means v1.0.3
+   installs continue to auto-update to the x64 build normally. ARM users
+   pick the arm64 asset once, then in-app updates from arm64 → arm64
+   follow the same naming going forward.
+
+2. **Native Node runtime per architecture.** Currently the packager
+   downloads and bundles a specific Node binary (see
+   `scripts/package-windows.mjs`, `--node-version` flag, default 20.18.1).
+   Add an `--arch x64|arm64` flag; the arm64 build fetches the ARM64
+   Windows Node distribution
+   (`node-v<VERSION>-win-arm64.zip` from nodejs.org). Both zips get
+   pinned to the same Node version for release parity.
+
+3. **Native modules rebuilt for arm64.**
+   - `better-sqlite3` — prebuilt ARM64 Windows binary must be present in
+     the bundled `node_modules/better-sqlite3/build/Release/`. Verify
+     `@mapbox/node-pre-gyp` picks the right asset for `--target_arch=arm64
+     --target_platform=win32`.
+   - Any other native addons pulled in transitively (audit
+     `node_modules/**/binding.gyp` before build).
+   - Package the ARM64 native binaries alongside the ARM64 Node runtime
+     so the portable zip is self-sufficient.
+
+4. **Launcher `.bat` unchanged.** The launcher is byte-identical to the
+   v0.9.29 baseline (project rule); on ARM64 Windows it still runs `node
+   dist/index.cjs` from the local folder — no architecture branching in
+   the launcher.
+
+5. **In-app updater architecture-aware matcher.** `packaging/updater/updater.cjs`
+   currently expects one asset. Extend the matcher so:
+   - An arm64 install looks first for `AdvisePoint-Docs-arm64.zip`, then
+     falls back to `AdvisePoint-Docs-arm64-v<VERSION>.zip` (mirroring the
+     v1.0.3 canonical + legacy pattern), and never picks the x64 zip.
+   - An x64 install continues to prefer `AdvisePoint-Docs.zip` and never
+     picks the arm64 asset.
+   - Architecture detected via `process.arch` (`x64` → x64 asset, `arm64`
+     → arm64 asset). Log the detected arch at updater startup so the
+     diagnostics bundle captures which asset track a given install is
+     following.
+
+6. **`bump-version.mjs` / release-script updates.** Both zips share the
+   same version number and the same release notes; the release-creation
+   script uploads both assets under the same GitHub release. Update
+   `create_release_v1_0_X.py` template to loop over `[("AdvisePoint-Docs.zip",
+   x64_path), ("AdvisePoint-Docs-arm64.zip", arm64_path)]`.
+
+7. **About page surfaces architecture.** Display `process.arch` in
+   Settings → About next to the app version so users can confirm they
+   installed the right build. Small footprint change; matches existing
+   About panel style.
+
+8. **Cross-arch backup portability.** Backup zips created on x64 must
+   restore cleanly on arm64 and vice versa. The v1.0.3 backup manifest
+   captures `app_version` and `schema_version` — add `source_arch` so
+   restore logs can show "restored an x64 backup on an arm64 install".
+   No data-format changes expected (SQLite files are byte-portable
+   across x64/arm64 on the same endianness).
+
+### Testing checklist
+
+- Build both zips from the same source tag; verify SHAs differ (arch)
+  but versions match.
+- Install arm64 zip on a real ARM64 Windows device (Surface Pro X /
+  Copilot+ PC). Confirm:
+  - Launcher starts, Node reports `process.arch === "arm64"`.
+  - better-sqlite3 loads without a rebuild prompt.
+  - PDF ingest / worker-thread extractor runs at native speed (no
+     emulation warnings in Event Viewer).
+  - In-app updater from arm64 v1.0.4 to a future arm64 v1.0.5 picks the
+     arm64 asset.
+- Install x64 zip on the same ARM64 device (regression check that
+  emulation path still works for users who grab the wrong asset).
+  Confirm updater on that install picks the x64 asset, not the arm64.
+- Backup on x64 install, restore on arm64 install, and vice versa —
+  Merge and Wipe & Replace both.
+- Diagnostics bundle from arm64 install includes `process.arch` in
+  `bundle-info.txt`.
+
+### Effort estimate
+
+**~1–2 days:**
+
+- ~half day: packager `--arch` flag + Node download logic + native-module
+  audit.
+- ~half day: updater matcher extension + `process.arch` logging + About
+  panel touch.
+- ~half day: release-script two-asset upload + release notes template
+  refresh.
+- ~half day: cross-arch testing on a real device (Surface Pro X / Copilot+
+  PC required; not testable from a Linux dev environment).
+
+### Open questions / decisions to resolve before implementation
+
+1. **Node version alignment.** Current x64 build pins to Node 20.18.1.
+   Confirm the same version is available as `node-v20.18.1-win-arm64.zip`
+   before starting (Node has shipped Windows ARM64 builds since 20.0).
+   If we ever have to skew versions across arches, document it in
+   `concepts/build-and-test`.
+2. **Third native module audit.** Beyond `better-sqlite3`, is anything
+   else pulling native binaries at install time? Run `rg -l
+   "binding.gyp"` under `node_modules/` after a clean install and list.
+3. **Icon / branding parity.** No change expected — `.ico` and favicons
+   are architecture-independent — but verify the launcher shortcut
+   creator on arm64 picks up the same `AdvisePointDocs.ico`.
+4. **Diagnostics bundle field.** Should `bundle-info.txt` gain a
+   `Detected arch:` line specifically, or is `Node process.arch` inside
+   the existing runtime-info section enough? Decide during
+   implementation; the file is already free-form.
+
+### Related open items to consider at the same time
+
+- **Mac build.** Not scheduled, but the arm64 packaging work builds
+  muscle for cross-arch packaging that a future Mac build (Universal /
+  arm64 + x64) would reuse.
+- **Cross-arch backup restore edge cases** — covered above; also
+  worth capturing in `concepts/gotchas` once we've done the first
+  round-trip on real hardware.
+
 ## Page viewer — sharper zoom from Fit mode — SHIPPED
 
 **Filed:** 2026-09-07
