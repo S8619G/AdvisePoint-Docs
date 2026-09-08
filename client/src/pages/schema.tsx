@@ -5,6 +5,7 @@ import { UpdateCheckPanel } from "@/components/UpdateCheckPanel";
 import { ViewerPrefsPanel } from "@/components/ViewerPrefsPanel";
 import { LibraryScanPanel } from "@/components/LibraryScanPanel";
 import { DiagnosticsPanel } from "@/components/DiagnosticsPanel";
+import { BackupPanel } from "@/components/BackupPanel";
 import { DocumentTypeManager } from "@/components/DocumentTypeManager";
 
 const FIELD_GROUPS = [
@@ -104,6 +105,7 @@ export default function SchemaPage() {
           <UpdateCheckPanel />
           <ViewerPrefsPanel />
           <LibraryScanPanel />
+          <BackupPanel />
           <DiagnosticsPanel />
         </TabsContent>
 

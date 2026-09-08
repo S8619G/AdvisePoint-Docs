@@ -167,15 +167,25 @@ async function fetchLatestRelease() {
   if (!release || !/^v?\d+\.\d+\.\d+(?:\.\d+)*$/.test(String(release.tag_name || ""))) {
     throw new Error("Latest release has an invalid version tag");
   }
-  const expectedName = `AdvisePoint-Docs-v${String(release.tag_name).replace(/^v/i, "")}.zip`.toLowerCase();
-  const asset = Array.isArray(release.assets)
-    ? release.assets.find((item) =>
-      typeof item?.name === "string" &&
-      item.name.toLowerCase() === expectedName &&
-      isTrustedAssetUrl(item.browser_download_url) &&
-      Number.isSafeInteger(item.size) &&
-      item.size > 0)
-    : null;
+  // v1.0.3: accept both the new canonical version-free filename and the
+  // legacy versioned filename. New builds ship AdvisePoint-Docs.zip; the
+  // versioned pattern remains supported for older releases and any future
+  // release that reverts to the versioned name for a specific reason.
+  const canonicalName = "advisepoint-docs.zip";
+  const versionedName = `advisepoint-docs-v${String(release.tag_name).replace(/^v/i, "")}.zip`;
+  const isMatchingAsset = (item) =>
+    typeof item?.name === "string" &&
+    (item.name.toLowerCase() === canonicalName || item.name.toLowerCase() === versionedName) &&
+    isTrustedAssetUrl(item.browser_download_url) &&
+    Number.isSafeInteger(item.size) &&
+    item.size > 0;
+  const assetList = Array.isArray(release.assets) ? release.assets : [];
+  // Prefer the canonical version-free name when both are somehow present.
+  const asset =
+    assetList.find((item) => isMatchingAsset(item) && item.name.toLowerCase() === canonicalName) ||
+    assetList.find(isMatchingAsset) ||
+    null;
+  const expectedName = `${canonicalName} or ${versionedName}`;
   if (!asset) {
     // v1.0.1.1: enumerate what the API actually returned so this class of
     // bug is diagnosable from update.log without needing the source tree.

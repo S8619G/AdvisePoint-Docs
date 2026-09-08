@@ -117,6 +117,20 @@ sqlite.pragma("journal_mode = WAL");
 export const db = drizzle(sqlite);
 export const rawDb = sqlite;
 
+// v1.0.3: exported so the backup/restore module can locate the DB file
+// (for VACUUM INTO staging) and the sibling pages/ directory. The pages
+// dir mirror of pages.ts's getPagesDir() is kept simple here to avoid a
+// circular import.
+export const DB_FILE_PATH = DB_PATH;
+export function getPagesDirForBackup(): string {
+  return process.env.RAG_PAGES_DIR ?? join(dirname(DB_PATH), "pages");
+}
+export function getDataDirForBackup(): string {
+  // The folder that contains data.db and (by default) pages/. Backup
+  // and restore stage new content next to this folder.
+  return dirname(DB_PATH);
+}
+
 // Bootstrap tables if they don't exist (drizzle-kit push not available at runtime).
 sqlite.exec(`
 CREATE TABLE IF NOT EXISTS documents (

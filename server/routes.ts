@@ -15,6 +15,22 @@ import { buildZip } from "./zip";
 import { bootState, readRecentLogLines } from "./boot";
 import { APP_VERSION } from "../client/src/version";
 import {
+  writeBackupTo,
+  stageImport,
+  cleanupStaged,
+  importWipeReplace,
+  importMerge,
+  type BackupManifest,
+} from "./backup";
+import {
+  readSettings as readBackupSettings,
+  writeSettings as writeBackupSettings,
+  startBackupScheduler,
+  isBackupInFlight,
+  withBackupLock,
+} from "./backup-scheduler";
+import { unlinkSync } from "node:fs";
+import {
   ingestRequestSchema,
   searchRequestSchema,
   documentPatchSchema,
@@ -1005,6 +1021,136 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       res.status(500).json({ ok: false, error: String(err) });
     }
   });
+
+  // -------- v1.0.3: Backup & Restore --------
+
+  // Multer for backup uploads: disk storage (backups can be large), 5 GB
+  // ceiling (well above any realistic library size), no file filter --
+  // the backup module validates by looking for manifest.json inside.
+  const backupUpload = multer({
+    storage: multer.diskStorage({
+      destination: (_req, _file, cb) => {
+        const os = require("node:os");
+        const path = require("node:path");
+        const fs = require("node:fs");
+        const dir = path.join(os.tmpdir(), "advisepoint-docs-import-uploads");
+        try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
+        cb(null, dir);
+      },
+      filename: (_req, file, cb) => {
+        cb(null, `import-${Date.now()}-${file.originalname.replace(/[^A-Za-z0-9._-]/g, "_")}`);
+      },
+    }),
+    limits: { fileSize: 5 * 1024 * 1024 * 1024 },
+  });
+
+  // POST /api/backup/export -- streams a fresh backup zip to the client.
+  // Accepts an optional JSON body with `{ localStorage: string }` so the
+  // browser can include its state; when the request is a plain GET the
+  // backup ships without localStorage.
+  const doExport = async (req: Request, res: any) => {
+    if (isBackupInFlight()) {
+      return res.status(409).json({ ok: false, error: "A backup is already in progress" });
+    }
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const stamp =
+      `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
+      `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    const filename = `advisepoint-docs-backup-${stamp}.zip`;
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    // Streaming; do not set Content-Length.
+    let ls: string | null = null;
+    if (req.method === "POST" && req.body && typeof req.body.localStorage === "string") {
+      ls = req.body.localStorage;
+    }
+    try {
+      await withBackupLock(() => writeBackupTo(res, { localStorageJson: ls }));
+    } catch (err) {
+      // If headers were already flushed the client sees a truncated stream;
+      // there's not much more we can do. Log for diagnostics.
+      console.error("[BACKUP] export failed:", err);
+      if (!res.headersSent) res.status(500).json({ ok: false, error: String((err as Error).message || err) });
+      else res.end();
+    }
+  };
+  app.get("/api/backup/export", doExport);
+  app.post("/api/backup/export", doExport);
+
+  // POST /api/backup/import  (multipart, `file` + `mode`)
+  //   mode = "wipe" | "merge"
+  app.post("/api/backup/import", backupUpload.single("file"), async (req: Request, res) => {
+    if (isBackupInFlight()) {
+      return res.status(409).json({ ok: false, error: "A backup is already in progress" });
+    }
+    if (!req.file) {
+      return res.status(400).json({ ok: false, error: "No backup file uploaded" });
+    }
+    const mode = String(req.body?.mode || "").toLowerCase();
+    if (mode !== "wipe" && mode !== "merge") {
+      try { unlinkSync(req.file.path); } catch { /* ignore */ }
+      return res.status(400).json({ ok: false, error: "mode must be 'wipe' or 'merge'" });
+    }
+
+    const started = Date.now();
+    type Staged = Awaited<ReturnType<typeof stageImport>>;
+    let staged: Staged | null = null;
+    try {
+      const stagedNonNull: Staged = await withBackupLock(async () => await stageImport(req.file!.path));
+      staged = stagedNonNull;
+      if (!stagedNonNull.dbPath) {
+        return res.status(400).json({ ok: false, error: "Backup is missing db/data.db" });
+      }
+      if (mode === "wipe") {
+        if (stagedNonNull.manifest && stagedNonNull.manifest.schema_version && stagedNonNull.manifest.schema_version !== 1) {
+          console.warn(`[BACKUP] schema version mismatch (backup=${stagedNonNull.manifest.schema_version} current=1); proceeding.`);
+        }
+        const { bak_dir } = importWipeReplace(stagedNonNull);
+        return res.json({
+          ok: true,
+          mode,
+          bak_dir,
+          manifest: stagedNonNull.manifest,
+          restart_required: true,
+          duration_ms: Date.now() - started,
+        });
+      } else {
+        const stats = importMerge(stagedNonNull);
+        return res.json({
+          ok: true,
+          mode,
+          ...stats,
+          manifest: stagedNonNull.manifest,
+          restart_required: false,
+          duration_ms: Date.now() - started,
+        });
+      }
+    } catch (err) {
+      const msg = (err as Error).message || String(err);
+      console.error("[BACKUP] import failed:", msg);
+      return res.status(500).json({ ok: false, error: msg });
+    } finally {
+      if (staged) cleanupStaged(staged);
+      try { if (req.file) unlinkSync(req.file.path); } catch { /* ignore */ }
+    }
+  });
+
+  // GET/POST /api/backup/settings  -- read or update scheduled-backup config.
+  app.get("/api/backup/settings", (_req, res) => {
+    res.json({ ok: true, settings: readBackupSettings() });
+  });
+  app.post("/api/backup/settings", (req, res) => {
+    try {
+      const s = writeBackupSettings(req.body || {});
+      res.json({ ok: true, settings: s });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: String((err as Error).message || err) });
+    }
+  });
+
+  // Kick the scheduler once routes are wired. Idempotent.
+  startBackupScheduler();
 
   return httpServer;
 }
