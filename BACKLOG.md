@@ -4,6 +4,48 @@ Items accepted for a future release but deliberately deferred from the current
 version. Each item should have enough detail that a fresh session can pick it
 up without going back to the source conversation.
 
+## v1.0.4 — release scope summary
+
+Seven planned items, grouped by theme. See each linked section below
+for full detail. Update this summary whenever an item is added,
+reordered, removed, or promoted to SHIPPED.
+
+**Headline feature**
+
+1. [Windows on ARM — full ARM64 support](#windows-on-arm--full-arm64-support-v104--planned) — first-class native ARM64 build alongside x64. Multi-arch packager, native module rebuilds, launcher arch detection.
+
+**Reliability**
+
+2. [Renderer — per-page timeout, abort, and queue continuation](#renderer--per-page-timeout-abort-and-queue-continuation-v104--planned) — pdfjs calls get wrapped in configurable timeouts; hung pages skip forward, hung docs release the queue. Multi-doc uploads no longer starve on a single bad file.
+3. [PageViewer — false "still rendering" spinner on non-PDF documents](#pageviewer--false-still-rendering-spinner-on-non-pdf-documents-v104--planned) — small client-only fix so DOCX/TXT/MD viewers stop showing a forever-spinner.
+
+**Feature additions**
+
+4. [DOCX viewer — render extracted content in the PageViewer dialog](#docx-viewer--render-extracted-content-in-the-pageviewer-dialog-v104--planned) — real in-app viewer for DOCX/TXT/MD, reusing the mammoth-extracted HTML. Ships after the PageViewer fix.
+5. [Header — background rendering activity indicator](#header--background-rendering-activity-indicator-v104--planned) — subtle spinner between Query and stats counter, visible only while rendering is active, hover-for-progress tooltip.
+6. [Backup Settings — show current backup size for storage planning](#backup-settings--show-current-backup-size-for-storage-planning-v104--planned) — muted line under retention row showing DB + pages footprint so users can plan disk space.
+
+**Cosmetic / polish**
+
+7. [node.exe Task Manager visibility — Version Resource + icon embed](#nodeexe-task-manager-visibility--version-resource--icon-embed-v104--planned) — rcedit rewrites node.exe's ProductName/FileDescription/icon so Task Manager shows "AdvisePoint Docs" instead of "Node.js JavaScript Runtime." Keeps filename `node.exe` to avoid launcher churn.
+
+### Suggested implementation order
+
+1. **Renderer per-page timeout first** — reliability fix, unblocks everything else if hangs are actually happening in the field.
+2. **PageViewer non-PDF spinner fix** (~30 min) — trivial standalone client fix.
+3. **node.exe rebrand** — one-shot packaging change, low interaction with other work.
+4. **Header render-status indicator** — depends on the queue bookkeeping the timeout entry may already touch, so land after item 1.
+5. **Backup size display** — small, self-contained.
+6. **DOCX viewer** — builds on the PageViewer fix from item 2.
+7. **Windows on ARM** — largest scope, best done as its own focused sprint at the end so it doesn't collide with other work in progress.
+
+### Cross-cutting concerns
+
+- The **Header render-status indicator** (item 5) and **renderer timeout** (item 2) both touch queue bookkeeping. Land the timeout first so the indicator can consume the failed-doc signal for its red/badge state.
+- The **DOCX viewer** (item 4) reuses PageViewer's dialog chrome — the PageViewer fix (item 3) is a prerequisite so the mode switcher extends the same conditional tree cleanly.
+
+---
+
 ## Option B updater helper — `Update.bat` (planned for v0.9.32)
 
 **Filed:** 2026-09-03
