@@ -6,44 +6,62 @@ up without going back to the source conversation.
 
 ## v1.0.4 — release scope summary
 
-Seven planned items, grouped by theme. See each linked section below
-for full detail. Update this summary whenever an item is added,
-reordered, removed, or promoted to SHIPPED.
+**Committed scope (2026-09-08):** 4 items — reliability drop.
+Deferred DOCX viewer, node.exe rebrand, and Windows on ARM to v1.0.5
+for scope + credit budget reasons. Update this summary whenever an
+item is added, reordered, removed, or promoted to SHIPPED.
 
-**Headline feature**
+**Reliability (headline)**
 
-1. [Windows on ARM — full ARM64 support](#windows-on-arm--full-arm64-support-v104--planned) — first-class native ARM64 build alongside x64. Multi-arch packager, native module rebuilds, launcher arch detection.
+1. [Renderer — per-page timeout, abort, and queue continuation](#renderer--per-page-timeout-abort-and-queue-continuation-v104--planned) — pdfjs calls get wrapped in configurable timeouts; hung pages skip forward, hung docs release the queue. Multi-doc uploads no longer starve on a single bad file.
+2. [PageViewer — false "still rendering" spinner on non-PDF documents](#pageviewer--false-still-rendering-spinner-on-non-pdf-documents-v104--planned) — small client-only fix so DOCX/TXT/MD viewers stop showing a forever-spinner.
 
-**Reliability**
+**Observability**
 
-2. [Renderer — per-page timeout, abort, and queue continuation](#renderer--per-page-timeout-abort-and-queue-continuation-v104--planned) — pdfjs calls get wrapped in configurable timeouts; hung pages skip forward, hung docs release the queue. Multi-doc uploads no longer starve on a single bad file.
-3. [PageViewer — false "still rendering" spinner on non-PDF documents](#pageviewer--false-still-rendering-spinner-on-non-pdf-documents-v104--planned) — small client-only fix so DOCX/TXT/MD viewers stop showing a forever-spinner.
+3. [Header — background rendering activity indicator](#header--background-rendering-activity-indicator-v104--planned) — subtle spinner between Query and stats counter, visible only while rendering is active. Hover-for-progress tooltip. Failure state (red glyph, click-to-dismiss) surfaces failed docs by name.
 
 **Feature additions**
 
-4. [DOCX viewer — render extracted content in the PageViewer dialog](#docx-viewer--render-extracted-content-in-the-pageviewer-dialog-v104--planned) — real in-app viewer for DOCX/TXT/MD, reusing the mammoth-extracted HTML. Ships after the PageViewer fix.
-5. [Header — background rendering activity indicator](#header--background-rendering-activity-indicator-v104--planned) — subtle spinner between Query and stats counter, visible only while rendering is active, hover-for-progress tooltip.
-6. [Backup Settings — show current backup size for storage planning](#backup-settings--show-current-backup-size-for-storage-planning-v104--planned) — muted line under retention row showing DB + pages footprint so users can plan disk space.
-
-**Cosmetic / polish**
-
-7. [node.exe Task Manager visibility — Version Resource + icon embed](#nodeexe-task-manager-visibility--version-resource--icon-embed-v104--planned) — rcedit rewrites node.exe's ProductName/FileDescription/icon so Task Manager shows "AdvisePoint Docs" instead of "Node.js JavaScript Runtime." Keeps filename `node.exe` to avoid launcher churn.
+4. [Backup Settings — show current backup size for storage planning](#backup-settings--show-current-backup-size-for-storage-planning-v104--planned) — muted line under retention row showing DB + pages footprint so users can plan disk space.
 
 ### Suggested implementation order
 
-1. **Renderer per-page timeout first** — reliability fix, unblocks everything else if hangs are actually happening in the field.
-2. **PageViewer non-PDF spinner fix** (~30 min) — trivial standalone client fix.
-3. **node.exe rebrand** — one-shot packaging change, low interaction with other work.
-4. **Header render-status indicator** — depends on the queue bookkeeping the timeout entry may already touch, so land after item 1.
-5. **Backup size display** — small, self-contained.
-6. **DOCX viewer** — builds on the PageViewer fix from item 2.
-7. **Windows on ARM** — largest scope, best done as its own focused sprint at the end so it doesn't collide with other work in progress.
+1. **PageViewer non-PDF spinner fix** (~30 min) — trivial standalone client fix; unblocks nothing else but easy warm-up.
+2. **Renderer per-page timeout** — reliability core; must land before header indicator so the failure signal is real.
+3. **Header render-status indicator** — consumes the failed-doc signal from step 2.
+4. **Backup size display** — small, self-contained, ship at the end.
 
 ### Cross-cutting concerns
 
-- The **Header render-status indicator** (item 5) and **renderer timeout** (item 2) both touch queue bookkeeping. Land the timeout first so the indicator can consume the failed-doc signal for its red/badge state.
-- The **DOCX viewer** (item 4) reuses PageViewer's dialog chrome — the PageViewer fix (item 3) is a prerequisite so the mode switcher extends the same conditional tree cleanly.
-- **User-notification hard requirement:** every failure signal (toast, tooltip, badge, anywhere) MUST name the specific failing document by title. "A render failed" without saying which one is not acceptable in multi-document uploads. Both the renderer timeout entry (item 2) and the header render-status indicator entry (item 5) capture this.
+- The **Header render-status indicator** (item 3) and **renderer timeout** (item 1) both touch queue bookkeeping. Land the timeout first so the indicator can consume the failed-doc signal for its red/badge state.
+- **User-notification hard requirement:** every failure signal (toast, tooltip, badge, anywhere) MUST name the specific failing document by title. "A render failed" without saying which one is not acceptable in multi-document uploads. Both the renderer timeout entry (item 1) and the header render-status indicator entry (item 3) capture this.
+
+## v1.0.5 — release scope summary
+
+**Deferred from v1.0.4 on 2026-09-08.** Three items, no ordering
+commitment yet. Update whenever scope shifts.
+
+**Headline feature**
+
+1. [Windows on ARM — full ARM64 support](#windows-on-arm--full-arm64-support-v105--planned) — first-class native ARM64 build alongside x64. Multi-arch packager, native module rebuilds, launcher arch detection. Largest single line item in the v1.0.x line — should get its own focused sprint.
+
+**Feature additions**
+
+2. [DOCX viewer — render extracted content in the PageViewer dialog](#docx-viewer--render-extracted-content-in-the-pageviewer-dialog-v105--planned) — real in-app viewer for DOCX/TXT/MD, reusing the mammoth-extracted HTML. Builds on the PageViewer fix already shipped in v1.0.4.
+
+**Cosmetic / polish**
+
+3. [node.exe Task Manager visibility — Version Resource + icon embed](#nodeexe-task-manager-visibility--version-resource--icon-embed-v105--planned) — rcedit rewrites node.exe's ProductName/FileDescription/icon so Task Manager shows "AdvisePoint Docs" instead of "Node.js JavaScript Runtime." Keeps filename `node.exe` to avoid launcher churn.
+
+### Suggested implementation order
+
+1. **node.exe rebrand** first — one-shot packaging change, isolates well from the other two.
+2. **DOCX viewer** — self-contained feature, no ARM64 interaction.
+3. **Windows on ARM** — largest scope, land it last so it doesn't collide with other work in progress.
+
+Alternate ordering: if v1.0.4 field validation of the renderer
+timeout surfaces any issue, hotfix that first before starting
+v1.0.5 work.
 
 ### Definition of done — v1.0.4 release gate
 
@@ -74,9 +92,9 @@ added.
 **DOCX / non-PDF handling:**
 
 - [ ] PageViewer no longer shows "Page 1 is still rendering" for `status: "missing"` (DOCX/TXT/MD)
-- [ ] DOCX viewer renders extracted content with headings, lists, tables, embedded images
-- [ ] TXT and MD files render in the same viewer
 - [ ] PDF page-image viewer still works exactly as v1.0.3.1 (no regression)
+
+_(DOCX viewer itself moved to v1.0.5; the PageViewer fix landed here to stop the false spinner without adding a new viewer surface.)_
 
 **Standing gates (apply to every release):**
 
@@ -85,17 +103,10 @@ added.
 - [ ] `client/src/version.ts` bumped to 1.0.4
 - [ ] Release notes written in impersonal tone (no signature, no location footer)
 - [ ] Launcher `.bat` unchanged OR both `EXPECTED_LAUNCHER_SHA256` and `NEW_LAUNCHER_SHA256` in `scripts/package-windows.mjs` updated to match the shipped launcher
-- [ ] Manual test: upload the KEY-OP-TRAINING_Guide_5012.docx file that surfaced the DOCX issue; confirm content viewer renders it properly
+- [ ] Manual test: upload the KEY-OP-TRAINING_Guide_5012.docx file that surfaced the DOCX issue; confirm no false "Page 1 is still rendering" spinner (content viewer itself is v1.0.5)
 
-**Windows on ARM (if it lands in v1.0.4):**
-
-- [ ] Native ARM64 build produced alongside x64
-- [ ] Native modules (better-sqlite3, canvas, etc.) rebuilt for ARM64
-- [ ] Launcher detects host architecture and runs the matching node.exe
-- [ ] Manual test: install and run on a real Windows on ARM device (Surface Pro X or Copilot+ PC)
-
-If Windows on ARM slips to a later release, remove or strike
-through its checklist items and note the slip in the summary above.
+_(Windows on ARM deferred to v1.0.5 on 2026-09-08. Its DoD items
+will be re-added when v1.0.5 scope is finalized.)_
 
 ---
 
@@ -1090,10 +1101,10 @@ upload returned HTTP 200 in 850 ms with 9 chunks / 24,876 tokens
 extracted; `pages/status` returned `"missing"` immediately and stayed
 that way — exactly matching the reported symptom.
 
-## DOCX viewer — render extracted content in the PageViewer dialog (v1.0.4 — PLANNED)
+## DOCX viewer — render extracted content in the PageViewer dialog (v1.0.5 — PLANNED)
 
 **Filed:** 2026-09-08
-**Target release:** v1.0.4
+**Target release:** v1.0.5 (deferred from v1.0.4 on 2026-09-08 for scope + credit budget)
 **Status:** planned. New feature. Complements the PageViewer fix
 above.
 
@@ -1523,10 +1534,10 @@ LibraryScanPanel and DiagnosticsPanel.
 ~1–2 hours: ~20 lines server + ~15 lines client + one round of
 visual QA on the Settings panel.
 
-## node.exe Task Manager visibility — Version Resource + icon embed (v1.0.4 — PLANNED)
+## node.exe Task Manager visibility — Version Resource + icon embed (v1.0.5 — PLANNED)
 
 **Filed:** 2026-09-08
-**Target release:** v1.0.4
+**Target release:** v1.0.5 (deferred from v1.0.4 on 2026-09-08 for scope + credit budget)
 **Status:** planned. Option A chosen (rewrite Windows Version Resource,
 keep filename `node.exe` so launcher stays untouched).
 **Ask:** In Task Manager today the app's Node process shows up as
@@ -1593,17 +1604,17 @@ unsigned. Windows SmartScreen behavior doesn't change.
 ~1–2 hours: install rcedit-linux, add ~10 lines to
 `package-windows.mjs`, one round of Windows verification.
 
-## Windows on ARM — full ARM64 support (v1.0.4 — PLANNED)
+## Windows on ARM — full ARM64 support (v1.0.5 — PLANNED)
 
 **Filed:** 2026-09-08
-**Target release:** v1.0.4
-**Status:** planned, not yet started. Headline feature for v1.0.4.
+**Target release:** v1.0.5 (deferred from v1.0.4 on 2026-09-08 for scope + credit budget; largest single line item in the v1.0.x line)
+**Status:** planned, not yet started. Headline feature for v1.0.5.
 **Ask:** AdvisePoint Docs currently ships only an x64 Windows portable. Users
 on Windows on ARM devices (Surface Pro X / Pro 9 5G / Pro 11, Copilot+ PCs
 like the Surface Laptop 7 and various ARM-based ThinkPad/HP/Dell/Samsung
 Galaxy Book models) fall back to the x64 emulator today, which drags the
 native-module story down (better-sqlite3, pdf worker) and inflates memory
-and startup time. Ship a real ARM64 build for v1.0.4.
+and startup time. Ship a real ARM64 build for v1.0.5.
 
 ### Deliverables
 
