@@ -38,34 +38,75 @@ item is added, reordered, removed, or promoted to SHIPPED.
 
 ## v1.0.5 — release scope summary
 
-**Deferred from v1.0.4 on 2026-09-08.** Five items now, no ordering
-commitment yet. Update whenever scope shifts.
-
-**Headline feature**
-
-1. [Windows on ARM — full ARM64 support](#windows-on-arm--full-arm64-support-v105--planned) — first-class native ARM64 build alongside x64. Multi-arch packager, native module rebuilds, launcher arch detection. Largest single line item in the v1.0.x line — should get its own focused sprint.
+**Split from a proposed 5-item v1.0.5 on 2026-09-08.** ARM64 moved
+to its own v1.0.6 release to isolate the highest-risk item and keep
+v1.0.5 as a tight, low-risk consolidation release. Four items in
+v1.0.5; ARM64 is the sole headline feature of v1.0.6 (see below).
 
 **Feature additions**
 
-2. [DOCX viewer — render extracted content in the PageViewer dialog](#docx-viewer--render-extracted-content-in-the-pageviewer-dialog-v105--planned) — real in-app viewer for DOCX/TXT/MD, reusing the mammoth-extracted HTML. Builds on the PageViewer fix already shipped in v1.0.4.
-3. [Install-location guidance and cloud-sync detection](#install-location-guidance-and-cloud-sync-detection-v105--planned) — README section, boot-time path detection, dismissible header banner, and a muted note under the backup-folder input in Settings. Added 2026-09-08 after a KEY-OP-TRAINING.docx upload silently failed with browser-side "Failed to fetch" when the app was running from inside a OneDrive-synced folder.
-4. [Render event-loop stalls — raise reconnect threshold and add micro-yields](#render-event-loop-stalls--raise-reconnect-threshold-and-add-micro-yields-v105--planned) — raise `RECONNECT_THRESHOLD` from 1 to 3 (banner appears after ~6s of failure instead of ~2s) and add `setImmediate` yields around `canvas.toBuffer` inside the render loop. Addresses the user-visible "reconnecting" banner false-positives from a v1.0.4 field report. Full architectural fix (worker_threads for pdfjs) deferred to v1.0.6 for a focused sprint. NOT a v1.0.4 regression — exists since v0.9.30 — but v1.0.4's per-page timeout + queue continuation on failure makes the exposure slightly worse.
+1. [DOCX viewer — render extracted content in the PageViewer dialog](#docx-viewer--render-extracted-content-in-the-pageviewer-dialog-v105--planned) — real in-app viewer for DOCX/TXT/MD, reusing the mammoth-extracted HTML. Builds on the PageViewer fix already shipped in v1.0.4.
+2. [Install-location guidance and cloud-sync detection](#install-location-guidance-and-cloud-sync-detection-v105--planned) — README section, boot-time path detection, dismissible header banner, and a muted note under the backup-folder input in Settings. Added 2026-09-08 after a KEY-OP-TRAINING.docx upload silently failed with browser-side "Failed to fetch" when the app was running from inside a OneDrive-synced folder.
+3. [Render event-loop stalls — raise reconnect threshold and add micro-yields](#render-event-loop-stalls--raise-reconnect-threshold-and-add-micro-yields-v105--planned) — raise `RECONNECT_THRESHOLD` from 1 to 3 (banner appears after ~6s of failure instead of ~2s) and add `setImmediate` yields around `canvas.toBuffer` inside the render loop. Addresses the user-visible "reconnecting" banner false-positives from a v1.0.4 field report. Full architectural fix (worker_threads for pdfjs) deferred to v1.0.7-candidate for a focused sprint. NOT a v1.0.4 regression — exists since v0.9.30 — but v1.0.4's per-page timeout + queue continuation on failure makes the exposure slightly worse.
 
 **Cosmetic / polish**
 
-5. [node.exe Task Manager visibility — Version Resource + icon embed](#nodeexe-task-manager-visibility--version-resource--icon-embed-v105--planned) — rcedit rewrites node.exe's ProductName/FileDescription/icon so Task Manager shows "AdvisePoint Docs" instead of "Node.js JavaScript Runtime." Keeps filename `node.exe` to avoid launcher churn.
+4. [node.exe Task Manager visibility — Version Resource + icon embed](#nodeexe-task-manager-visibility--version-resource--icon-embed-v105--planned) — rcedit rewrites node.exe's ProductName/FileDescription/icon so Task Manager shows "AdvisePoint Docs" instead of "Node.js JavaScript Runtime." Keeps filename `node.exe` to avoid launcher churn.
 
 ### Suggested implementation order
 
-1. **Install-location guidance** first — pure additive, zero interaction with the other four, and ships user-visible value even if the release slips on the other items.
+1. **Install-location guidance** first — pure additive, zero interaction with the other three, and ships user-visible value even if the release slips on the other items.
 2. **Render event-loop stalls** — ~15 lines of code (threshold bump + micro-yields), no packaging risk. Do this right after install-location and it's essentially free.
-3. **node.exe rebrand** — one-shot packaging change, isolates well from DOCX/ARM.
-4. **DOCX viewer** — self-contained feature, no ARM64 interaction.
-5. **Windows on ARM** — largest scope, land it last so it doesn't collide with other work in progress.
+3. **node.exe rebrand** — one-shot packaging change, isolates well from DOCX.
+4. **DOCX viewer** — self-contained feature, largest item in this release, land it last so any UI issues don't block the other three.
 
 Alternate ordering: if v1.0.4 field validation of the renderer
 timeout surfaces any issue, hotfix that first before starting
 v1.0.5 work.
+
+### Batching decision (2026-09-08)
+
+All four items batch into a single v1.0.5 build to share the
+release + QA cycle overhead. Total code footprint is modest and
+risk is low-to-medium across the set. ARM64 is deliberately NOT in
+this release — it's the largest single line item in the v1.0.x
+line and needs its own focused sprint with a separate QA cycle,
+which v1.0.6 provides.
+
+## v1.0.6 — release scope summary
+
+**Split from v1.0.5 on 2026-09-08.** Single-headline release: full
+Windows on ARM support. Isolating this item from v1.0.5 keeps the
+high-risk multi-arch packaging + native-module-rebuild work from
+colliding with the low-risk consolidation work in v1.0.5.
+
+**Headline feature**
+
+1. [Windows on ARM — full ARM64 support](#windows-on-arm--full-arm64-support-v106--planned) — first-class native ARM64 build alongside x64. Multi-arch packager, native module rebuilds (`better-sqlite3`, `@napi-rs/canvas`), launcher arch detection, in-app updater arch matching. Ships two portable zips per release (`AdvisePoint-Docs.zip` for x64, `AdvisePoint-Docs-arm64.zip` for arm64).
+
+**Prerequisites:**
+
+- v1.0.5 shipped and stable in the field for at least one release
+  cycle, so any ARM64 issues surface against a known-good baseline
+  rather than getting confused with concurrent DOCX-viewer or
+  install-location changes.
+- Field validation of the event-loop stalls fix (v1.0.5 item 3)
+  confirms whether the cheap threshold/yield fix is sufficient or
+  whether the worker_threads refactor also needs to land — the
+  refactor would be its own item, NOT bundled into v1.0.6.
+
+### Batching decision (2026-09-08)
+
+ARM64 is a single focused sprint with its own build + QA cycle. Do
+NOT bundle any additional items into v1.0.6 unless they're
+directly related to ARM64 (e.g. arch-specific launcher fixes
+discovered during development). Any unrelated feature or bugfix
+found during the v1.0.6 sprint should be filed as v1.0.7 or a
+v1.0.5.x hotfix rather than absorbed into v1.0.6.
+
+**Suggested implementation order:** monolithic — one focused sprint
+for the whole ARM64 stack. See the full spec below for the ordered
+sub-tasks.
 
 ### Definition of done — v1.0.4 release gate
 
@@ -1909,11 +1950,11 @@ unsigned. Windows SmartScreen behavior doesn't change.
 ~1–2 hours: install rcedit-linux, add ~10 lines to
 `package-windows.mjs`, one round of Windows verification.
 
-## Windows on ARM — full ARM64 support (v1.0.5 — PLANNED)
+## Windows on ARM — full ARM64 support (v1.0.6 — PLANNED)
 
 **Filed:** 2026-09-08
-**Target release:** v1.0.5 (deferred from v1.0.4 on 2026-09-08 for scope + credit budget; largest single line item in the v1.0.x line)
-**Status:** planned, not yet started. Headline feature for v1.0.5.
+**Target release:** v1.0.6 (deferred from v1.0.4 on 2026-09-08 for scope + credit budget; split from v1.0.5 on 2026-09-08 into its own single-headline release; largest single line item in the v1.0.x line)
+**Status:** planned, not yet started. Sole headline feature for v1.0.6. Do NOT start until v1.0.5 has shipped and been field-validated for at least one release cycle.
 **Ask:** AdvisePoint Docs currently ships only an x64 Windows portable. Users
 on Windows on ARM devices (Surface Pro X / Pro 9 5G / Pro 11, Copilot+ PCs
 like the Surface Laptop 7 and various ARM-based ThinkPad/HP/Dell/Samsung
