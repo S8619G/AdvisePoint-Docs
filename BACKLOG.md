@@ -38,7 +38,7 @@ item is added, reordered, removed, or promoted to SHIPPED.
 
 ## v1.0.5 — release scope summary
 
-**Deferred from v1.0.4 on 2026-09-08.** Three items, no ordering
+**Deferred from v1.0.4 on 2026-09-08.** Four items now, no ordering
 commitment yet. Update whenever scope shifts.
 
 **Headline feature**
@@ -48,16 +48,18 @@ commitment yet. Update whenever scope shifts.
 **Feature additions**
 
 2. [DOCX viewer — render extracted content in the PageViewer dialog](#docx-viewer--render-extracted-content-in-the-pageviewer-dialog-v105--planned) — real in-app viewer for DOCX/TXT/MD, reusing the mammoth-extracted HTML. Builds on the PageViewer fix already shipped in v1.0.4.
+3. [Install-location guidance and cloud-sync detection](#install-location-guidance-and-cloud-sync-detection-v105--planned) — README section, boot-time path detection, dismissible header banner, and a muted note under the backup-folder input in Settings. Added 2026-09-08 after a KEY-OP-TRAINING.docx upload silently failed with browser-side "Failed to fetch" when the app was running from inside a OneDrive-synced folder.
 
 **Cosmetic / polish**
 
-3. [node.exe Task Manager visibility — Version Resource + icon embed](#nodeexe-task-manager-visibility--version-resource--icon-embed-v105--planned) — rcedit rewrites node.exe's ProductName/FileDescription/icon so Task Manager shows "AdvisePoint Docs" instead of "Node.js JavaScript Runtime." Keeps filename `node.exe` to avoid launcher churn.
+4. [node.exe Task Manager visibility — Version Resource + icon embed](#nodeexe-task-manager-visibility--version-resource--icon-embed-v105--planned) — rcedit rewrites node.exe's ProductName/FileDescription/icon so Task Manager shows "AdvisePoint Docs" instead of "Node.js JavaScript Runtime." Keeps filename `node.exe` to avoid launcher churn.
 
 ### Suggested implementation order
 
-1. **node.exe rebrand** first — one-shot packaging change, isolates well from the other two.
-2. **DOCX viewer** — self-contained feature, no ARM64 interaction.
-3. **Windows on ARM** — largest scope, land it last so it doesn't collide with other work in progress.
+1. **Install-location guidance** first — pure additive, zero interaction with the other three, and ships user-visible value even if the release slips on the other items.
+2. **node.exe rebrand** — one-shot packaging change, isolates well from DOCX/ARM.
+3. **DOCX viewer** — self-contained feature, no ARM64 interaction.
+4. **Windows on ARM** — largest scope, land it last so it doesn't collide with other work in progress.
 
 Alternate ordering: if v1.0.4 field validation of the renderer
 timeout surfaces any issue, hotfix that first before starting
@@ -1533,6 +1535,134 @@ LibraryScanPanel and DiagnosticsPanel.
 
 ~1–2 hours: ~20 lines server + ~15 lines client + one round of
 visual QA on the Settings panel.
+
+## Install-location guidance and cloud-sync detection (v1.0.5 — PLANNED)
+
+**Filed:** 2026-09-08
+**Target release:** v1.0.5
+**Status:** planned. First implementation priority in v1.0.5 (pure
+additive, zero interaction with the other three items).
+
+**Ask:** After the v1.0.4 upgrade, a KEY-OP-TRAINING.docx upload silently
+failed with browser-side "Failed to fetch" — no `POST /api/upload` ever
+reached the server. Root cause was that the user was running the app
+from inside a corporate OneDrive-synced folder
+(`C:\Users\...\OneDrive - Kyocera Document Solutions America Inc\...\AdvisePoint Docs\`).
+OneDrive can mark files as online-only placeholders, apply tenant DLP
+rules that block uploads to loopback, or hold file locks during sync —
+any of which produces browser `Failed to fetch` errors with no
+server-side signal at all. Portable-app design assumes a stable local
+working directory; running from inside cloud-sync folders violates that
+assumption in ways that are difficult to debug from field reports.
+
+Provide guidance to users about running the app from OneDrive or
+similar structures and recommend a root folder setup.
+
+**Scope (all three surfaces — user choice on 2026-09-08):**
+
+1. **README section** — durable "Install location — recommended folder
+   setup" section with:
+   - The recommended pattern: extract to a root-adjacent folder like
+     `C:\AdvisePoint Docs\` or `D:\AdvisePoint Docs\`; do NOT extract
+     into OneDrive, Dropbox, Google Drive, iCloud, Box, or any network
+     drive path.
+   - Explicit "problem folders" list with the exact path patterns the
+     app detects (see boot-time detection below).
+   - Explanation of why: silent OneDrive placeholder fetch, DLP tenant
+     rules, sync-time file locks, network path latency, MOTW
+     inheritance from synced files.
+   - Recovery instructions if the user already installed inside
+     OneDrive: how to close the app, move the folder, and preserve the
+     data folder at `%LOCALAPPDATA%\AdvisePoint Docs\` (which is
+     unaffected because it's outside the app folder).
+
+2. **Boot-time detection with header banner** — detect problem paths
+   at startup, warn once per install location.
+
+   Detection lives in `server/boot.ts` (or a new
+   `server/install-location.ts`). On boot, compute the app's own path
+   (`process.cwd()` or the `dirname` of the running node bundle) and
+   match against known cloud-sync + network path patterns:
+
+   - `\OneDrive` or `\OneDrive - ` anywhere in the path (personal +
+     business)
+   - `\Dropbox\` or `\Dropbox (`
+   - `\Google Drive\` or `\GoogleDrive\`
+   - `\iCloudDrive\` or `\iCloud Drive\`
+   - `\Box\` or `\Box Sync\`
+   - UNC network paths: starts with `\\`
+   - Windows mapped drives: heuristic — skip for now to avoid false
+     positives; users on genuinely local mapped drives shouldn't
+     see the banner.
+
+   Emit a `[boot] warn install_location=cloud_sync provider=<name>
+   path=<masked>` log line whenever a match hits so support
+   conversations can spot this immediately in server.log.
+
+   Expose the detection result via a new field on `GET /api/health`:
+   `install_location: { ok: boolean, provider: string | null,
+   masked_path: string }` — masked so the tenant name in
+   "OneDrive - <TenantName>" doesn't leak in support pastes.
+
+   Client: new `InstallLocationBanner` component reads that field, only
+   shows when `ok=false`, provides a Learn More link to the README
+   anchor, and a dismiss button. Dismissal persists in localStorage
+   keyed by `installLocationDismissed:<masked_path>` so the banner
+   re-alerts if the user moves the app to a different problem folder.
+
+3. **Settings note under backup-folder input** — muted `text-xs`
+   line under the backup folder input in `BackupPanel.tsx`: "Tip: keep
+   your backup folder outside OneDrive, Dropbox, and other cloud-sync
+   locations — file locks during sync can corrupt backups mid-write."
+   Do NOT actively detect the folder value here (users legitimately
+   backup to sync folders sometimes) — pure informational.
+
+**Non-goals for v1.0.5:**
+
+- Do not block startup when a problem path is detected. Warn only.
+  Some users may knowingly accept the risk (e.g. temporary evaluation).
+- Do not auto-move the app folder. Too many edge cases; instructions
+  in the README are enough.
+- Do not warn about the data folder (`%LOCALAPPDATA%`) location —
+  it's already outside the app folder by design and outside typical
+  cloud-sync patterns.
+
+**False-positive management:**
+
+- Match on path substrings that require a following path separator
+  (`\OneDrive\` or `\OneDrive - `), not just "OneDrive" anywhere, so a
+  folder literally named `MyOneDriveArchive` doesn't trip it.
+- Log the match reason so support can eyeball the path if a false
+  positive is reported.
+
+**Definition of done:**
+
+- [ ] README has "Install location — recommended folder setup"
+      section with recommended pattern, problem folders list, and
+      recovery instructions
+- [ ] `GET /api/health` response includes `install_location.ok`,
+      `install_location.provider`, `install_location.masked_path`
+- [ ] Server logs `[boot] warn install_location=...` line once at
+      startup when a problem path is detected
+- [ ] Header shows dismissible `InstallLocationBanner` component
+      when `install_location.ok=false`; hidden when true
+- [ ] Banner "Learn more" link opens README anchor in default browser
+- [ ] Banner dismissal persists in localStorage per masked path
+- [ ] `BackupPanel.tsx` shows muted tip line under backup-folder input
+- [ ] Manual test: run app from `C:\AdvisePoint Docs\` — banner hidden,
+      `install_location.ok=true` in health response
+- [ ] Manual test: run app from a OneDrive-synced folder — banner
+      visible, correct provider detected, log line written, dismiss
+      persists across reload
+- [ ] Manual test: banner does NOT re-appear on reload after dismiss
+      for the same path
+- [ ] Manual test: banner DOES re-appear after moving the app folder
+      to a different problem location
+- [ ] `rg -i kyocera` returns zero hits after this change
+
+**Rough size:** ~40 lines server (detection + health field), ~60 lines
+client (banner + Settings note), ~80 lines README. One focused sprint,
+test across three scenarios (clean install, OneDrive, Dropbox).
 
 ## node.exe Task Manager visibility — Version Resource + icon embed (v1.0.5 — PLANNED)
 
