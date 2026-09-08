@@ -575,6 +575,107 @@ worth it as a hard release gate.
 - Keep the smoke test skippable via `SKIP_SMOKE=1` env var for debugging
   edge cases in CI.
 
+## Backup Settings — show current backup size for storage planning (v1.0.4 — PLANNED)
+
+**Filed:** 2026-09-08
+**Target release:** v1.0.4
+**Status:** planned. Small UX addition to the existing Backup card.
+**Ask:** Users configuring scheduled backups have no visibility into
+how much disk space each backup will consume, so they can't decide
+intelligently between retention counts or plan for external storage.
+Surface the current expected backup size directly in the Backup card so
+the retention setting becomes an informed choice ("3 backups × 250 MB
+= 750 MB").
+
+### What to show
+
+**"Current backup size: ~<size>"** — the expected size of a backup
+taken right now, computed as: SQLite DB file size + total bytes under
+the `pages/` directory + a small ZIP overhead estimate (~1–2%). Format
+as human-readable (KB / MB / GB) with one decimal.
+
+Example rendering:
+```
+Current backup size: ~487 MB
+```
+
+Optional secondary line if space allows:
+```
+Retention: 3 backups (~1.4 GB total at current size)
+```
+
+### Where to put it in the UI
+
+Two reasonable placements in `BackupPanel.tsx`:
+
+1. **Below the retention row, right-aligned or full-width
+   muted-foreground note.** Cleanest — doesn't fight for space with
+   the retention input.
+2. **To the right of the retention number input.** Compact but tight;
+   the retention row already carries a label + input + unit text
+   ("backups"), so a size projection might crowd it on narrower Settings
+   panels.
+
+Recommend option 1 (below retention row, muted text) as the primary
+layout, with the multiplied total on a second muted line only when
+retention > 1. Matches the current shadcn spacing pattern used in
+LibraryScanPanel and DiagnosticsPanel.
+
+### Implementation
+
+1. **Server:** Extend `GET /api/backup/settings` response with two new
+   fields:
+   - `current_backup_size_bytes: number` — sum of `statSync(DB_FILE_PATH).size`
+     + recursive size of `getPagesDirForBackup()`.
+   - `current_backup_size_estimate_bytes: number` — raw size + 2% ZIP
+     overhead estimate (the store is mostly PDFs and SQLite pages,
+     both of which compress ~2–5%; use 2% as a conservative floor so
+     the shown estimate is never smaller than the actual backup).
+
+   Compute lazily on each request; a full walk of the pages dir for
+   the typical corpus (~500 MB) is fast (<50ms) and this endpoint is
+   only hit when the Backup card is visible.
+
+2. **Client (`BackupPanel.tsx`):** Add a `<p className="text-xs
+   text-muted-foreground">` line under the retention row displaying
+   "Current backup size: ~{human-readable}". When retention > 1, add
+   a second line "{retention} backups × ~{size} = ~{total}". Poll
+   this alongside the existing 30s settings refresh — no separate
+   endpoint call needed.
+
+3. **Format helper:** Reuse or add a `formatBytes(bytes: number,
+   decimals = 1)` helper. If one already exists elsewhere in the
+   client (check `client/src/lib/utils.ts`), reuse it.
+
+### Edge cases
+
+- **Empty library.** DB is ~40KB, pages/ is empty → shows
+  "Current backup size: ~40 KB" — fine, informative.
+- **Very large corpus.** Multi-GB pages/ dir. The recursive stat walk
+  should still complete well under 500ms on SSD; if benchmarks show
+  it slower on spinning disk, cache the value for 60s server-side.
+- **Retention count edit in real time.** The multiplied "total" line
+  should update live from the input's current value, not wait for a
+  Save.
+- **Actual backup size will vary.** ZIP compression on PDFs is
+  minimal but not zero; the estimate is deliberately conservative
+  (higher than actual). Add a subtle "~" prefix and treat this as a
+  planning aid, not a precise measurement.
+
+### Testing
+
+- Freshly-installed empty install — confirm sensible small size.
+- Install with a realistic corpus (500–1000 documents) — confirm
+  size number matches within ±5% of an actual backup taken via the
+  manual export button.
+- Retention change from 1 → 5 — confirm the multiplied total
+  updates without needing a Save click.
+
+### Effort estimate
+
+~1–2 hours: ~20 lines server + ~15 lines client + one round of
+visual QA on the Settings panel.
+
 ## node.exe Task Manager visibility — Version Resource + icon embed (v1.0.4 — PLANNED)
 
 **Filed:** 2026-09-08
