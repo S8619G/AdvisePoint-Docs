@@ -38,27 +38,30 @@ item is added, reordered, removed, or promoted to SHIPPED.
 
 ## v1.0.5 — release scope summary
 
-**Split from a proposed 5-item v1.0.5 on 2026-09-08.** ARM64 moved
-to its own v1.0.6 release to isolate the highest-risk item and keep
-v1.0.5 as a tight, low-risk consolidation release. Four items in
-v1.0.5; ARM64 is the sole headline feature of v1.0.6 (see below).
+**Split from a proposed 5-item v1.0.5 on 2026-09-08** (ARM64 moved
+to v1.0.6). **Further trimmed on 2026-09-08 pre-build review** —
+node.exe Task Manager rebrand deferred because its planned tool
+(`rcedit-linux`) does not exist as a Linux npm package; the real
+`rcedit` is a wrapper around a Windows `.exe` and requires `wine`
+in the Linux build sandbox. Ship the three cheap items in v1.0.5
+and revisit the node.exe rebrand alongside the ARM64 build in
+v1.0.6 (or v1.0.7 if v1.0.6 stays ARM64-only).
 
 **Feature additions**
 
-1. [DOCX viewer — render extracted content in the PageViewer dialog](#docx-viewer--render-extracted-content-in-the-pageviewer-dialog-v105--planned) — real in-app viewer for DOCX/TXT/MD, reusing the mammoth-extracted HTML. Builds on the PageViewer fix already shipped in v1.0.4.
-2. [Install-location guidance and cloud-sync detection](#install-location-guidance-and-cloud-sync-detection-v105--planned) — README section, boot-time path detection, dismissible header banner, and a muted note under the backup-folder input in Settings. Added 2026-09-08 after a KEY-OP-TRAINING.docx upload silently failed with browser-side "Failed to fetch" when the app was running from inside a OneDrive-synced folder.
+1. [DOCX viewer — render extracted content in the PageViewer dialog](#docx-viewer--render-extracted-content-in-the-pageviewer-dialog-v105--planned) — real in-app viewer for DOCX/TXT/MD. **Implementation reroute during 2026-09-08 pre-build review:** the spec's server plan assumed a `documents.body` column that does not exist (the extracted `body` field is only a request-time property on `ingestRequestSchema` — it is chunked into `chunks.content` and never persisted whole). Ship instead by reassembling text from `chunks WHERE parent_id = :id ORDER BY chunk_index`, which works retroactively for every already-uploaded DOCX with zero schema change. Full mammoth-HTML pathway deferred as an optional v1.0.6+ enhancement.
+2. [Install-location guidance and cloud-sync detection](#install-location-guidance-and-cloud-sync-detection-v105--planned) — README section, boot-time path detection, dismissible header banner, and a muted note under the backup-folder input in Settings. Added 2026-09-08 after a KEY-OP-TRAINING.docx upload silently failed with browser-side "Failed to fetch" when the app was running from inside a OneDrive-synced folder. NB: the shipped "README" is `packaging/README.txt` (plain text), not Markdown — the banner's "Learn more" surface should reference a searchable heading in that file rather than a Markdown anchor.
 3. [Render event-loop stalls — raise reconnect threshold and add micro-yields](#render-event-loop-stalls--raise-reconnect-threshold-and-add-micro-yields-v105--planned) — raise `RECONNECT_THRESHOLD` from 1 to 3 (banner appears after ~6s of failure instead of ~2s) and add `setImmediate` yields around `canvas.toBuffer` inside the render loop. Addresses the user-visible "reconnecting" banner false-positives from a v1.0.4 field report. Full architectural fix (worker_threads for pdfjs) deferred to v1.0.7-candidate for a focused sprint. NOT a v1.0.4 regression — exists since v0.9.30 — but v1.0.4's per-page timeout + queue continuation on failure makes the exposure slightly worse.
 
-**Cosmetic / polish**
+**Deferred out of v1.0.5 during 2026-09-08 pre-build review:**
 
-4. [node.exe Task Manager visibility — Version Resource + icon embed](#nodeexe-task-manager-visibility--version-resource--icon-embed-v105--planned) — rcedit rewrites node.exe's ProductName/FileDescription/icon so Task Manager shows "AdvisePoint Docs" instead of "Node.js JavaScript Runtime." Keeps filename `node.exe` to avoid launcher churn.
+- [node.exe Task Manager visibility — Version Resource + icon embed](#nodeexe-task-manager-visibility--version-resource--icon-embed-v106-or-v107--candidate) — needs a Linux-runnable rcedit path (electron/rcedit's `rcedit-x64.exe` under `wine`) or a Windows build step. Revisit alongside ARM64 packaging work or as a standalone v1.0.7 item.
 
 ### Suggested implementation order
 
-1. **Install-location guidance** first — pure additive, zero interaction with the other three, and ships user-visible value even if the release slips on the other items.
+1. **Install-location guidance** first — pure additive, zero interaction with the other two, and ships user-visible value even if the release slips on the other items.
 2. **Render event-loop stalls** — ~15 lines of code (threshold bump + micro-yields), no packaging risk. Do this right after install-location and it's essentially free.
-3. **node.exe rebrand** — one-shot packaging change, isolates well from DOCX.
-4. **DOCX viewer** — self-contained feature, largest item in this release, land it last so any UI issues don't block the other three.
+3. **DOCX viewer** — self-contained feature, largest item in this release, land it last so any UI issues don't block the other two.
 
 Alternate ordering: if v1.0.4 field validation of the renderer
 timeout surfaces any issue, hotfix that first before starting
@@ -66,12 +69,12 @@ v1.0.5 work.
 
 ### Batching decision (2026-09-08)
 
-All four items batch into a single v1.0.5 build to share the
+All three items batch into a single v1.0.5 build to share the
 release + QA cycle overhead. Total code footprint is modest and
-risk is low-to-medium across the set. ARM64 is deliberately NOT in
-this release — it's the largest single line item in the v1.0.x
-line and needs its own focused sprint with a separate QA cycle,
-which v1.0.6 provides.
+risk is low across the set. ARM64 is deliberately NOT in this
+release — it's the largest single line item in the v1.0.x line and
+needs its own focused sprint with a separate QA cycle, which
+v1.0.6 provides.
 
 ## v1.0.6 — release scope summary
 
@@ -1182,28 +1185,32 @@ real page-image pipeline.
 
 #### Server — expose extracted content
 
-`documents` table already stores the extracted text (`body` column,
-via `ingestParsed`). Options:
+**Correction 2026-09-08 pre-build review:** the earlier plan
+assumed a `documents.body` column. That column does not exist
+— `body` is only a request-time field on `ingestRequestSchema`.
+Extracted text lives in `chunks.content` after chunking and is
+never persisted whole.
 
-1. **Reuse `body`** if it's the mammoth markdown output verbatim.
-2. **Extend extract-worker** to return both markdown (for chunking)
-   and HTML (for viewing) in one pass. Mammoth has
-   `convertToHtml({buffer})` alongside `convertToMarkdown`. Add
-   `extracted.html` to the payload, store in a new column or a
-   sidecar file next to the extracted text.
+**Actual approach for v1.0.5 — reassemble from chunks:**
 
-Option 2 gives cleaner viewer output (headings, lists, tables
-preserved as real HTML). Option 1 works but forces the client to
-re-parse markdown → HTML on open. Recommend option 2.
-
-New endpoint:
+Add a new endpoint that queries the chunks table:
 
 ```
 GET /api/documents/:id/content
-→ { format: "docx"|"text"|"markdown", html: "<...>" }
+→ { format: "docx"|"text"|"markdown", markdown: "<full text>" }
 ```
 
-Returns 404 for PDFs (they use the page-image endpoints).
+Server joins `chunks WHERE parent_id = :id ORDER BY chunk_index`,
+concatenates `content` with double-newline separators, returns as
+markdown. Returns 404 for PDFs (they use the page-image
+endpoints). Zero schema change; works retroactively for every
+already-uploaded DOCX/TXT/MD.
+
+**Client renders markdown to HTML** via the existing markdown
+renderer already used for chunk display. Optional future
+enhancement (v1.0.6+): extend extract-worker to also emit HTML
+via `mammoth.convertToHtml`, store as sidecar file, prefer HTML
+over markdown when available for richer table/image rendering.
 
 #### Client — PageViewer content mode
 
@@ -1257,16 +1264,10 @@ Content-mode viewer:
 
 ### Interaction with the PageViewer fix above
 
-Both ship in v1.0.4. Order of implementation:
-
-1. Land the PageViewer fix first (~30 min) so any interim build has
-   a clean fallback if the DOCX viewer isn't wired up yet.
-2. Land the DOCX viewer, which replaces that fallback with the real
-   content viewer.
-
-The fix is intentionally self-contained so the DOCX viewer PR can
-lean on it (the mode switcher just extends the same conditional
-tree) without a merge conflict.
+The PageViewer false-"still rendering" spinner fix shipped in
+v1.0.4. This DOCX viewer builds on top of that fix in v1.0.5 —
+the mode switcher extends the same conditional tree without a
+merge conflict.
 
 ### Testing
 
@@ -1640,7 +1641,7 @@ window of exposure. Not the root cause.
 
 **Cheap and boring — 3 tiny code changes, no architecture work.**
 The full worker_threads refactor was considered and deferred to
-v1.0.6 (see below) because it introduces meaningful packaging risk
+v1.0.7-candidate (see below) because it introduces meaningful packaging risk
 (new CJS to ship, `@napi-rs/canvas` native addon must load inside
 worker, `createImageBitmap` polyfill must be re-applied inside
 worker's globalThis, per-page transferList vs worker-writes-to-disk
@@ -1674,7 +1675,7 @@ user-visible symptom.
 **Non-goals for v1.0.5:**
 
 - Do not refactor pdfjs into a `worker_threads` worker (deferred to
-  v1.0.6).
+  v1.0.7-candidate; v1.0.6 is single-headline ARM64).
 - Do not remove `disableWorker: true` (worker_threads change would
   invalidate the reason it's set).
 - Do not move search or SQLite off the main thread.
@@ -1702,7 +1703,7 @@ user-visible symptom.
 - [ ] `RENDER_PAGE_TIMEOUT_MS` default lowered from 120_000 to 60_000
       (env-var override still respected)
 - [ ] Comment blocks in both files updated to reference this fix and
-      point to the v1.0.6 worker refactor as follow-up
+      point to the v1.0.7-candidate worker refactor as follow-up
 - [ ] Manual test: uploading the PowerPoint-export PDF that surfaced
       the JP2/JPX blank-graphics fix in v0.9.29 no longer triggers
       the amber "reconnecting" banner during render
@@ -1719,7 +1720,7 @@ updates. ~30 min work, zero packaging risk, no new dependencies, no
 files added to the zip. Test on a large library reload (many docs
 queued) and confirm the banner behavior matches expectations.
 
-### Deferred follow-up: worker_threads refactor (v1.0.6 — CANDIDATE)
+### Deferred follow-up: worker_threads refactor (v1.0.7 — CANDIDATE)
 
 If field validation of the v1.0.5 fix shows the banner still
 appears on truly pathological docs, refactor `server/pages.ts` to
@@ -1880,12 +1881,22 @@ similar structures and recommend a root folder setup.
 client (banner + Settings note), ~80 lines README. One focused sprint,
 test across three scenarios (clean install, OneDrive, Dropbox).
 
-## node.exe Task Manager visibility — Version Resource + icon embed (v1.0.5 — PLANNED)
+## node.exe Task Manager visibility — Version Resource + icon embed (v1.0.6-or-v1.0.7 — CANDIDATE)
 
 **Filed:** 2026-09-08
-**Target release:** v1.0.5 (deferred from v1.0.4 on 2026-09-08 for scope + credit budget)
+**Target release:** deferred from v1.0.5 on 2026-09-08 during pre-build review. Candidate for v1.0.6 (alongside ARM64 packaging work) or v1.0.7 as a standalone item.
 **Status:** planned. Option A chosen (rewrite Windows Version Resource,
 keep filename `node.exe` so launcher stays untouched).
+
+**Deferral reason (2026-09-08):** the plan below calls for
+`rcedit-linux` as a devDependency. That npm package does not
+exist. The real `rcedit` package is a Node wrapper around a
+Windows `.exe` that does not run natively under Linux. To keep
+our Linux build sandbox self-sufficient we need `wine` +
+electron/rcedit's `rcedit-x64.exe` binary (~1MB), or a Windows
+build step. Neither was ready in time for v1.0.5. When we
+pick this back up, spec update needed: replace "add rcedit-linux
+as a devDependency" with the wine + rcedit-x64.exe pattern.
 **Ask:** In Task Manager today the app's Node process shows up as
 generic `node.exe` with description "Node.js JavaScript Runtime" and
 the Node hexagon icon. Users can't tell which running Node process is
