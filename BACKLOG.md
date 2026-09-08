@@ -575,6 +575,76 @@ worth it as a hard release gate.
 - Keep the smoke test skippable via `SKIP_SMOKE=1` env var for debugging
   edge cases in CI.
 
+## node.exe Task Manager visibility — Version Resource + icon embed (v1.0.4 — PLANNED)
+
+**Filed:** 2026-09-08
+**Target release:** v1.0.4
+**Status:** planned. Option A chosen (rewrite Windows Version Resource,
+keep filename `node.exe` so launcher stays untouched).
+**Ask:** In Task Manager today the app's Node process shows up as
+generic `node.exe` with description "Node.js JavaScript Runtime" and
+the Node hexagon icon. Users can't tell which running Node process is
+AdvisePoint Docs vs. any other Node app they might have. Rewrite the
+bundled `node.exe`'s Windows Version Resource block so Task Manager
+shows it as an AdvisePoint Docs process without renaming the file.
+
+### Deliverables
+
+1. **Add `rcedit-linux` (or equivalent cross-platform rcedit wrapper)
+   as a devDependency.** MIT-licensed, ~1MB, runs on Linux — needed
+   because our packaging runs from a Linux sandbox.
+
+2. **Modify `scripts/package-windows.mjs`** to, after extracting the
+   baseline zip and before rezipping, run rcedit on
+   `AdvisePoint Docs/node/node.exe` with:
+   - `--set-file-version` → current app version (e.g. 1.0.4)
+   - `--set-product-version` → current app version
+   - `--set-version-string ProductName "AdvisePoint Docs"`
+   - `--set-version-string FileDescription "AdvisePoint Docs Server"`
+   - `--set-version-string CompanyName "AdvisePoint"`
+   - `--set-version-string OriginalFilename "node.exe"` (kept as-is
+     so any deep tooling that inspects it still works)
+   - `--set-icon packaging/launcher/AdvisePointDocs.ico`
+
+3. **Do NOT touch the launcher.** Filename stays `node.exe`; the
+   launcher's `.\node\node.exe` path reference is unchanged. This
+   preserves the launcher hash-pin rule.
+
+### Why Option A over Option B (full filename rename)
+
+- Preserves the launcher-baseline rule (no new SHA-256 pin needed)
+- Task Manager's Details tab shows Description + Icon prominently —
+  "AdvisePoint Docs" + our icon jumps out even with filename
+  `node.exe`
+- Zero risk to updater, backup, or any code path
+- If we later want the filename rename too (Option B), Option A costs
+  nothing to keep in place alongside
+
+### Known side effect
+
+Rewriting the Version Resource strips Microsoft's Authenticode
+signature on `node.exe` ("Verified publisher: OpenJS Foundation"
+disappears from file properties). Non-issue for us because we don't
+code-sign our own builds today — the launcher itself is already
+unsigned. Windows SmartScreen behavior doesn't change.
+
+### Testing checklist
+
+- Package a build; extract; run `powershell -c "(Get-Item .\node\node.exe).VersionInfo | Format-List"`
+  on Windows to confirm ProductName / FileDescription / CompanyName /
+  version numbers are set as expected.
+- Launch the app; open Task Manager → Details tab; confirm
+  Description column shows "AdvisePoint Docs Server" and the icon
+  column shows the AdvisePoint Docs mark instead of the Node hexagon.
+- Confirm launch smoke test still passes (Version Resource edits
+  should have no runtime effect).
+- Confirm launcher .bat still runs without changes.
+
+### Effort estimate
+
+~1–2 hours: install rcedit-linux, add ~10 lines to
+`package-windows.mjs`, one round of Windows verification.
+
 ## Windows on ARM — full ARM64 support (v1.0.4 — PLANNED)
 
 **Filed:** 2026-09-08
