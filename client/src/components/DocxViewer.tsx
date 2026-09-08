@@ -25,8 +25,40 @@
 //   * renderAsync throws            -> Silent-fallback to /content text
 //                                      with an amber "showing text
 //                                      fallback" banner (v1.0.6 spec).
+//
+// v1.0.6.1 hotfixes on top of the above:
+//   1. Page-break synthesis: docx-preview's `breakPages` only splits on
+//      `<w:lastRenderedPageBreak>` markers desktop Word wrote at last
+//      save; docs authored elsewhere (Word Online, LibreOffice, pandoc,
+//      docx4j) often have zero of those, so the viewer previously showed
+//      one giant section and "Page 1 of 1". We now walk the rendered
+//      tree for any pagination hint (last-rendered breaks, explicit
+//      `w:type="page"` line breaks, CSS `page-break-before` /
+//      `break-before: page`) and slice the single section into multiple
+//      synthetic sections at those points. When no hint exists at all
+//      the toolbar switches to "Continuous view" and Prev/Next disable
+//      themselves so we never lie to the user with "Page 1 of 1".
+//   2. Fit-to-width: replaces the old two-state 100%/175% toggle. We
+//      measure the natural rendered width of the docx (via a temporary
+//      reset of the CSS scale) against the container's client width and
+//      compute the exact scale that makes the doc fill the pane, then
+//      toggle between that computed fit and 100%.
+//   3. Print via hidden iframe: v1.0.6's window.open + document.write
+//      approach shipped with a "<\/script>" escape that HTML5's script
+//      end-tag parser doesn't recognize, so the print window ate the
+//      rest of the document as script text and showed raw code. The
+//      hidden-iframe path is well-formed HTML (srcdoc), has no popup
+//      blocker risk, and hands off to the browser's native print
+//      dialog directly.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   Dialog,
   DialogContent,
@@ -48,7 +80,15 @@ import {
 } from "lucide-react";
 import { Link } from "wouter";
 import { apiRequest } from "@/lib/queryClient";
-import { MIN_ZOOM, MAX_ZOOM, READABLE_ZOOM } from "@/hooks/use-zoom-pan";
+
+// v1.0.6.1: DOCX zoom bounds are separate from use-zoom-pan's MIN_ZOOM
+// (which is 1 -- native pixel size, appropriate for scanned page
+// bitmaps). docx-preview renders at native paper width (~816 CSS px
+// for US Letter at 96 DPI), and the dialog pane is often narrower than
+// that, so Fit-to-width has to scale below 1 to actually fit. We
+// allow down to 25% and up to 400% -- enough room for Fit on a small
+// pane and for detailed inspection on wide docs, matching the range
+// most PDF viewers expose.
 
 // ------------------------------------------------------------------
 // Public API. Matches the fields PageViewerDialog forwards so the
@@ -81,11 +121,18 @@ type ContentResponse = {
   original_bytes?: number | null;
 };
 
-// Zoom scale steps mirror the PDF viewer -- 1 = "Fit width", READABLE_ZOOM
-// (~1.75) = "Comfortable read", MAX_ZOOM = "Deep inspect". docx-preview
-// content is already laid out at natural size, so the transform we apply
-// is CSS-only and doesn't re-render the docx.
+// Natural / "100%" zoom. Fit is computed from container width at render
+// time (v1.0.6.1); we no longer alternate against a hard-coded readable
+// zoom because the two-state toggle was misleading users.
 const DEFAULT_ZOOM = 1;
+const DOCX_MIN_ZOOM = 0.25;
+const DOCX_MAX_ZOOM = 4;
+
+// Marker class we attach to synthetic <section> wrappers so subsequent
+// re-runs don't wrap them again and print CSS can page-break on them
+// too. Distinct from docx-preview's own ".docx" class so we can tell
+// engine-rendered sections apart from ones we created.
+const SYNTHETIC_PAGE_CLASS = "advisepoint-docx-synthetic-page";
 
 export function DocxViewerDialog({
   open,
@@ -107,17 +154,32 @@ export function DocxViewerDialog({
   const [renderError, setRenderError] = useState<string | null>(null);
   const [pageCount, setPageCount] = useState<number>(0);
   const [currentPage, setCurrentPage] = useState<number>(1);
+  // v1.0.6.1: when the source .docx has no pagination hints at all, we
+  // collapse the pager UI to "Continuous view" instead of lying about
+  // "Page 1 of 1". True only when the synthesizer couldn't produce >1
+  // section from the render.
+  const [continuous, setContinuous] = useState<boolean>(false);
 
   // Container refs for docx-preview.
   //  - renderRef: the pane where docx-preview appends its <section> pages.
   //  - styleRef: dedicated <style> host, keeps docx CSS scoped to us.
+  //  - scrollRef: the scroll container around renderRef; parent of the
+  //    scaled render pane, used both for scroll-to-section and for
+  //    measuring "Fit-to-width" against its client width.
+  //  - printFrameRef: hidden <iframe> we mount into (used by handlePrint).
   const renderRef = useRef<HTMLDivElement | null>(null);
   const styleRef = useRef<HTMLDivElement | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const printFrameRef = useRef<HTMLIFrameElement | null>(null);
 
   // Zoom is applied as a CSS scale on the render pane. We keep track of
   // it in state so the toolbar readout stays in sync and we can honor
-  // Fit / Readable toggles.
+  // Fit / 100% toggles.
   const [zoom, setZoom] = useState<number>(DEFAULT_ZOOM);
+  // v1.0.6.1: computed fit-to-width scale, refreshed after render and on
+  // window resize. Zero means "not measured yet"; the Fit button falls
+  // back to 100% until we have a real number.
+  const [fitZoom, setFitZoom] = useState<number>(0);
   const zoomPct = useMemo(() => `${Math.round(zoom * 100)}%`, [zoom]);
 
   // ---------- Effect: probe /content on open ----------
@@ -134,6 +196,9 @@ export function DocxViewerDialog({
     setMeta(null);
     setMetaError(null);
     setRenderState("loading");
+    setContinuous(false);
+    setFitZoom(0);
+    setZoom(DEFAULT_ZOOM);
     (async () => {
       try {
         const res = await apiRequest("GET", `/api/documents/${documentId}/content`);
@@ -211,16 +276,27 @@ export function DocxViewerDialog({
             experimental: true,
             // Trust the docx's declared page numbers when present -- the
             // toolbar's "page X of N" reads directly off the rendered
-            // <section> count below.
+            // <section> count below (after v1.0.6.1's synthesis pass).
             breakPages: true,
           },
         );
         if (cancelled) return;
 
-        // Count rendered pages so the toolbar can show "X of N".
-        const sections = renderRef.current?.querySelectorAll("section") ?? [];
-        setPageCount(sections.length || 1);
+        // v1.0.6.1: try to synthesize extra page breaks if the engine only
+        // emitted a single section. See synthesizePageBreaks() for the
+        // heuristics list. If we still end up with 1 section, flip on
+        // "Continuous view" so the toolbar tells the truth.
+        const rendered = renderRef.current;
+        let sectionCount = rendered
+          ? rendered.querySelectorAll("section").length
+          : 0;
+        if (rendered && sectionCount <= 1) {
+          const synthesized = synthesizePageBreaks(rendered);
+          if (synthesized > 1) sectionCount = synthesized;
+        }
+        setPageCount(sectionCount || 1);
         setCurrentPage(1);
+        setContinuous(sectionCount <= 1);
         setRenderState("ready");
       } catch (err) {
         if (cancelled) return;
@@ -243,6 +319,7 @@ export function DocxViewerDialog({
   // scroll.
   useEffect(() => {
     if (renderState !== "ready" || !renderRef.current) return;
+    if (continuous) return; // no pager UI to keep in sync
     const sections = Array.from(renderRef.current.querySelectorAll("section"));
     if (sections.length === 0) return;
 
@@ -261,11 +338,53 @@ export function DocxViewerDialog({
         if (bestIdx >= 0) setCurrentPage(bestIdx + 1);
       },
       // Threshold list gives us reasonable resolution as pages scroll by.
-      { root: renderRef.current, threshold: [0.15, 0.5, 0.85] },
+      { root: scrollRef.current, threshold: [0.15, 0.5, 0.85] },
     );
     for (const s of sections) observer.observe(s);
     return () => observer.disconnect();
-  }, [renderState, pageCount]);
+  }, [renderState, pageCount, continuous]);
+
+  // ---------- Fit-to-width measurement ----------
+  //
+  // Called after render completes and again on window resize. We reset
+  // the CSS scale to 1 for the measurement so scrollWidth reports the
+  // *natural* rendered width, then divide by the scroll container's
+  // client width (minus a small horizontal padding budget). The result
+  // is stored in state; the "Fit" button toggles between it and 100%.
+  //
+  // useLayoutEffect so the temporary scale reset never paints.
+  const measureFit = useCallback(() => {
+    const pane = renderRef.current;
+    const wrapper = scrollRef.current;
+    if (!pane || !wrapper) return;
+    const prevTransform = pane.style.transform;
+    // Reset scale for the measurement, but keep the origin so we don't
+    // jump horizontally.
+    pane.style.transform = "scale(1)";
+    // Force a reflow before reading scrollWidth.
+    const naturalWidth = pane.scrollWidth;
+    pane.style.transform = prevTransform;
+    if (!naturalWidth) return;
+    // 24px padding budget matches the py-6 (24px vertical) rhythm and
+    // leaves visual breathing room from the pane edges.
+    const target = Math.max(1, wrapper.clientWidth - 24);
+    const scale = target / naturalWidth;
+    // Clamp to the same MIN/MAX_ZOOM band the +/- buttons obey so Fit
+    // never lands somewhere the user can't get back from with -.
+    const clamped = Math.max(DOCX_MIN_ZOOM, Math.min(DOCX_MAX_ZOOM, scale));
+    setFitZoom(+clamped.toFixed(3));
+  }, []);
+
+  useLayoutEffect(() => {
+    if (renderState !== "ready") return;
+    // Measure once after the render commits.
+    measureFit();
+    // Re-measure on window resize; wrappers change width when the
+    // Dialog resizes or the user drags the browser window.
+    const onResize = () => measureFit();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [renderState, measureFit]);
 
   const gotoPage = useCallback(
     (n: number) => {
@@ -282,53 +401,159 @@ export function DocxViewerDialog({
   );
 
   // ---------- Zoom controls ----------
-  // Mirror the PDF viewer: [-] steps down, [+] steps up, Fit resets to 1.
+  // Mirror the PDF viewer: [-] steps down, [+] steps up, Fit toggles
+  // between the measured fit-to-width scale and 100%. Falls back to 100%
+  // when Fit is clicked before the measurement lands.
   const zoomOut = useCallback(() => {
-    setZoom((z) => Math.max(MIN_ZOOM, +(z - 0.1).toFixed(2)));
+    setZoom((z) => Math.max(DOCX_MIN_ZOOM, +(z - 0.1).toFixed(2)));
   }, []);
   const zoomIn = useCallback(() => {
-    setZoom((z) => Math.min(MAX_ZOOM, +(z + 0.1).toFixed(2)));
+    setZoom((z) => Math.min(DOCX_MAX_ZOOM, +(z + 0.1).toFixed(2)));
   }, []);
   const zoomFit = useCallback(() => {
-    // "Fit" and "Readable" alternate on repeated clicks so users can
-    // toggle between the two the same way they do in the PDF viewer.
-    setZoom((z) => (z === DEFAULT_ZOOM ? READABLE_ZOOM : DEFAULT_ZOOM));
-  }, []);
+    // Use the measured fit; if we're already very close to it, toggle
+    // back to 100% so a second click "undoes" fit.
+    setZoom((z) => {
+      if (!fitZoom || fitZoom <= 0) return DEFAULT_ZOOM;
+      const nearFit = Math.abs(z - fitZoom) < 0.005;
+      return nearFit ? DEFAULT_ZOOM : fitZoom;
+    });
+  }, [fitZoom]);
 
   // ---------- Print ----------
   //
-  // Open a new window with just the rendered DOCX + its stylesheet, then
-  // window.print() after images/fonts settle. Same pattern the PDF
-  // viewer uses for its Print action, minus the multi-page load
-  // shepherding (docx-preview inlines everything so imgs load
-  // synchronously off the base64 URLs).
+  // v1.0.6.1: use a hidden <iframe> instead of window.open. The previous
+  // implementation wrote a full HTML document into a popup, including a
+  // "<\/script>" that HTML5's script-end-tag matcher doesn't accept as
+  // a closing tag -- so the print window ate the rest of the document
+  // (including </body></html>) as script text and rendered as raw code
+  // instead of triggering the browser's print dialog.
+  //
+  // The iframe path:
+  //   1. Build a well-formed HTML srcdoc (no inline <script>).
+  //   2. Mount the iframe hidden inside our dialog (no popup blocker).
+  //   3. On iframe 'load', call print() on its contentWindow.
+  //   4. Clean up on 'afterprint' or after a 30s watchdog.
   const handlePrint = useCallback(() => {
     if (renderState !== "ready") return;
     const renderHtml = renderRef.current?.innerHTML ?? "";
     const styleHtml = styleRef.current?.innerHTML ?? "";
     if (!renderHtml) return;
-    const safeTitle = (documentTitle || documentFileName || "Document")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-    const w = window.open("", "_blank", "width=900,height=1100");
-    if (!w) return;
-    w.document.open();
-    w.document.write(
-      `<!doctype html><html><head><meta charset="utf-8"><title>${safeTitle}</title>` +
-        `<style>${styleHtml}\n@page { margin: 12mm; }\nbody { margin: 0; background: #fff; }\n` +
-        `section.docx { page-break-after: always; }\nsection.docx:last-of-type { page-break-after: auto; }\n</style>` +
-        `</head><body>${renderHtml}` +
-        `<script>window.addEventListener('load', function(){` +
-        `  setTimeout(function(){ window.focus(); window.print(); }, 200);` +
-        `  window.addEventListener('afterprint', function(){ window.close(); });` +
-        `});<\\/script></body></html>`,
+    const safeTitle = escapeHtml(
+      documentTitle || documentFileName || "Document",
     );
-    w.document.close();
+
+    // Compose a well-formed print document. @page + section page-break
+    // rules mirror what docx-preview emits so the browser paginates
+    // sensibly. Includes our synthetic-page class in the page-break
+    // selector so v1.0.6.1's synthesized breaks also translate to
+    // print-time page breaks.
+    const srcdoc =
+      `<!doctype html><html><head><meta charset="utf-8">` +
+      `<title>${safeTitle}</title>` +
+      `<style>${styleHtml}\n` +
+      `@page { margin: 12mm; }\n` +
+      `html, body { margin: 0; background: #fff; }\n` +
+      `section.docx, section.${SYNTHETIC_PAGE_CLASS} { page-break-after: always; }\n` +
+      `section.docx:last-of-type, section.${SYNTHETIC_PAGE_CLASS}:last-of-type { page-break-after: auto; }\n` +
+      `</style></head><body>${renderHtml}</body></html>`;
+
+    // Remove any stale iframe from a previous print click.
+    if (printFrameRef.current) {
+      printFrameRef.current.remove();
+      printFrameRef.current = null;
+    }
+
+    const iframe = document.createElement("iframe");
+    iframe.setAttribute("aria-hidden", "true");
+    iframe.style.position = "fixed";
+    iframe.style.right = "0";
+    iframe.style.bottom = "0";
+    iframe.style.width = "0";
+    iframe.style.height = "0";
+    iframe.style.border = "0";
+    iframe.style.visibility = "hidden";
+    // srcdoc is the reliable, no-script way to inject a full document
+    // into an iframe. Content Security Policy on the outer app doesn't
+    // interfere because srcdoc runs in an about:srcdoc origin.
+    iframe.srcdoc = srcdoc;
+
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      try {
+        iframe.remove();
+      } catch {
+        /* ignore */
+      }
+      if (printFrameRef.current === iframe) printFrameRef.current = null;
+    };
+
+    iframe.addEventListener("load", () => {
+      // Give the browser one tick to lay out and resolve inline images
+      // before printing. docx-preview base64-encodes embedded media so
+      // there are no network fetches to wait on.
+      const win = iframe.contentWindow;
+      if (!win) {
+        cleanup();
+        return;
+      }
+      try {
+        win.addEventListener("afterprint", cleanup);
+      } catch {
+        /* cross-origin edge case; watchdog handles it */
+      }
+      // requestAnimationFrame lets the browser commit layout first;
+      // some engines throw NS_ERROR_NOT_AVAILABLE if print() runs
+      // before that happens.
+      win.requestAnimationFrame(() => {
+        try {
+          win.focus();
+          win.print();
+        } catch (err) {
+          // Swallow -- worst case, the user closes the (invisible)
+          // iframe via the watchdog. We deliberately don't surface a
+          // toast because print failures are rare and users will
+          // notice missing output on their own.
+          console.warn("Print failed:", err);
+          cleanup();
+        }
+      });
+    });
+
+    // Watchdog in case afterprint never fires (Safari historically
+    // omits it in some print flows).
+    window.setTimeout(cleanup, 30_000);
+
+    document.body.appendChild(iframe);
+    printFrameRef.current = iframe;
   }, [renderState, documentTitle, documentFileName]);
+
+  // Clean up any lingering print iframe when the dialog closes.
+  useEffect(() => {
+    if (open) return;
+    if (printFrameRef.current) {
+      try {
+        printFrameRef.current.remove();
+      } catch {
+        /* ignore */
+      }
+      printFrameRef.current = null;
+    }
+  }, [open]);
 
   // ---------- Legacy DOCX branch ----------
   // meta arrived, has_original === false -> pre-v1.0.6 upload.
   const isLegacy = meta !== null && meta.has_original === false;
+
+  // Toolbar page-counter text. v1.0.6.1: prefer "Continuous view" over
+  // the misleading "Page 1 of 1" when we couldn't synthesize any breaks.
+  const pageLabel = (() => {
+    if (renderState !== "ready") return "\u2014";
+    if (continuous) return "Continuous view";
+    return `Page ${currentPage} of ${pageCount}`;
+  })();
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -404,7 +629,7 @@ export function DocxViewerDialog({
               write. Hidden with visibility until the render completes so
               users don't see docx-preview's incremental build-up. */}
           {!isLegacy && renderState !== "fallback" && (
-            <div className="h-full overflow-auto bg-background">
+            <div ref={scrollRef} className="h-full overflow-auto bg-background">
               <div ref={styleRef} />
               <div
                 ref={renderRef}
@@ -427,19 +652,25 @@ export function DocxViewerDialog({
           <div className="px-4 py-2 border-t border-border shrink-0 flex items-center gap-2 text-xs">
             <button
               type="button"
-              disabled={renderState !== "ready" || currentPage <= 1}
+              disabled={
+                renderState !== "ready" || continuous || currentPage <= 1
+              }
               onClick={() => gotoPage(currentPage - 1)}
               title="Previous page"
               className="inline-flex items-center justify-center h-7 w-7 rounded hover:bg-muted disabled:opacity-40"
             >
               <ChevronLeft className="h-4 w-4" />
             </button>
-            <div className="tabular-nums text-muted-foreground min-w-[80px] text-center">
-              {renderState === "ready" ? `Page ${currentPage} of ${pageCount}` : "\u2014"}
+            <div className="tabular-nums text-muted-foreground min-w-[110px] text-center">
+              {pageLabel}
             </div>
             <button
               type="button"
-              disabled={renderState !== "ready" || currentPage >= pageCount}
+              disabled={
+                renderState !== "ready" ||
+                continuous ||
+                currentPage >= pageCount
+              }
               onClick={() => gotoPage(currentPage + 1)}
               title="Next page"
               className="inline-flex items-center justify-center h-7 w-7 rounded hover:bg-muted disabled:opacity-40"
@@ -452,7 +683,7 @@ export function DocxViewerDialog({
             <button
               type="button"
               onClick={zoomOut}
-              disabled={renderState !== "ready" || zoom <= MIN_ZOOM}
+              disabled={renderState !== "ready" || zoom <= DOCX_MIN_ZOOM}
               title="Zoom out (-)"
               className="inline-flex items-center justify-center h-7 w-7 rounded hover:bg-muted disabled:opacity-40"
             >
@@ -464,7 +695,7 @@ export function DocxViewerDialog({
             <button
               type="button"
               onClick={zoomIn}
-              disabled={renderState !== "ready" || zoom >= MAX_ZOOM}
+              disabled={renderState !== "ready" || zoom >= DOCX_MAX_ZOOM}
               title="Zoom in (+)"
               className="inline-flex items-center justify-center h-7 w-7 rounded hover:bg-muted disabled:opacity-40"
             >
@@ -474,7 +705,11 @@ export function DocxViewerDialog({
               type="button"
               onClick={zoomFit}
               disabled={renderState !== "ready"}
-              title="Fit / Readable"
+              title={
+                fitZoom
+                  ? `Fit to width (${Math.round(fitZoom * 100)}%)`
+                  : "Fit to width"
+              }
               className="inline-flex items-center gap-1 h-7 px-2 rounded hover:bg-muted disabled:opacity-40"
             >
               <Maximize2 className="h-3.5 w-3.5" /> Fit
@@ -493,4 +728,154 @@ export function DocxViewerDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+// ------------------------------------------------------------------
+// v1.0.6.1: page-break synthesis.
+//
+// docx-preview's `breakPages` only fires for `<w:lastRenderedPageBreak>`
+// markers desktop Word wrote on last save. Docs authored elsewhere often
+// have zero of those, so we get one giant section and "Page 1 of 1".
+//
+// This function looks for other pagination hints the docx may carry
+// through to the rendered DOM:
+//
+//   * <br class="lastRenderedPageBreak"> -- what docx-preview emits for
+//     the same w:lastRenderedPageBreak marker when breakPages happens to
+//     be disabled or the marker is deep inside nested content the engine
+//     didn't split on.
+//   * <br style="page-break-before: always"> and CSS-driven
+//     `page-break-before: always` / `break-before: page` on any element
+//     -- what most other converters (LibreOffice, pandoc, docx4j) emit.
+//   * Elements with `mso-special-character: line-break` +
+//     `page-break-before: always` -- the Word HTML export flavor.
+//
+// When we find any hint, we slice the single rendered section at those
+// hint points, wrapping each slice in a synthetic <section> with the
+// SYNTHETIC_PAGE_CLASS marker. Prev/Next then works page-by-page and
+// print CSS breaks at the same points.
+//
+// Returns the resulting section count (>=1). If we couldn't produce >1
+// section, the caller flips on "Continuous view".
+// ------------------------------------------------------------------
+function synthesizePageBreaks(host: HTMLElement): number {
+  // Find the docx-preview wrapper (a .docx-wrapper > section.docx tree).
+  // We operate on the innermost single <section> to keep the DOM shape
+  // predictable.
+  const sections = host.querySelectorAll("section");
+  if (sections.length !== 1) return sections.length;
+  const soleSection = sections[0] as HTMLElement;
+
+  // Look for break candidates *inside* the section. We include the
+  // section itself only if it has an explicit page-break-before set on
+  // some descendant.
+  const candidates: HTMLElement[] = [];
+  const all = soleSection.querySelectorAll<HTMLElement>("*");
+  for (const el of Array.from(all)) {
+    if (isPageBreakElement(el)) candidates.push(el);
+  }
+  if (candidates.length === 0) return 1;
+
+  // Build slices: everything from (last-break exclusive) to next-break
+  // (exclusive) becomes one synthetic page. We walk the direct children
+  // of soleSection to keep the slice granularity at the block level.
+  //
+  // For candidates that sit deep inside a block, we treat their nearest
+  // top-level ancestor as the boundary marker so we don't split a
+  // paragraph mid-word. That means multiple breaks inside the same
+  // block collapse to one boundary, which is fine -- Word treats stacked
+  // page breaks as one anyway.
+  const topLevelBreakChildren = new Set<Element>();
+  for (const c of candidates) {
+    const topLevel = nearestTopLevelChild(soleSection, c);
+    if (topLevel) topLevelBreakChildren.add(topLevel);
+  }
+  if (topLevelBreakChildren.size === 0) return 1;
+
+  const kids = Array.from(soleSection.children);
+  const slices: Element[][] = [[]];
+  for (const kid of kids) {
+    if (topLevelBreakChildren.has(kid)) {
+      // Start a new slice; the break marker itself goes with the *next*
+      // page (so page N+1 starts *at* the marker, matching Word's
+      // behavior with a "page break before" paragraph).
+      if (slices[slices.length - 1].length > 0) slices.push([]);
+      slices[slices.length - 1].push(kid);
+    } else {
+      slices[slices.length - 1].push(kid);
+    }
+  }
+
+  // If we ended up with only one slice (all breaks were in the very
+  // first block), don't rebuild the DOM.
+  if (slices.length <= 1) return 1;
+
+  // Build synthetic sections. Preserve the sole section's className +
+  // inline styles so page dimensions carry through.
+  const parent = soleSection.parentNode;
+  if (!parent) return 1;
+  const originalClass = soleSection.className;
+  const originalStyle = soleSection.getAttribute("style") ?? "";
+
+  const frag = host.ownerDocument.createDocumentFragment();
+  for (const slice of slices) {
+    const s = host.ownerDocument.createElement("section");
+    s.className = `${originalClass} ${SYNTHETIC_PAGE_CLASS}`.trim();
+    if (originalStyle) s.setAttribute("style", originalStyle);
+    for (const el of slice) s.appendChild(el);
+    frag.appendChild(s);
+  }
+  parent.replaceChild(frag, soleSection);
+
+  // Re-count on the actual DOM in case something upstream (e.g. an
+  // adjacent .docx-wrapper node) also holds a stray section we didn't
+  // touch.
+  return host.querySelectorAll("section").length;
+}
+
+// True when the element should be treated as a page-break marker for
+// synthesis purposes. Checks class hints first (cheap), then inline
+// style, then computed style (most expensive, only reached when the
+// element looks like it could be a break carrier).
+function isPageBreakElement(el: HTMLElement): boolean {
+  if (el.tagName === "BR") {
+    if (el.classList.contains("lastRenderedPageBreak")) return true;
+    if (el.classList.contains("pageBreak")) return true;
+    const styleAttr = el.getAttribute("style") ?? "";
+    if (/page-break-before\s*:\s*always/i.test(styleAttr)) return true;
+    if (/break-before\s*:\s*page/i.test(styleAttr)) return true;
+  }
+  const inline = el.getAttribute("style") ?? "";
+  if (/page-break-before\s*:\s*always/i.test(inline)) return true;
+  if (/break-before\s*:\s*page/i.test(inline)) return true;
+  // Skip computed-style probes on non-BR / non-styled elements to keep
+  // this cheap on large documents. The two lookups above cover the
+  // formats we've seen in practice.
+  return false;
+}
+
+// Walk up from `descendant` until we hit a direct child of `section`,
+// or bail (return null) if we walked out of the section entirely.
+function nearestTopLevelChild(
+  section: HTMLElement,
+  descendant: HTMLElement,
+): Element | null {
+  let cur: Element | null = descendant;
+  while (cur && cur.parentElement && cur.parentElement !== section) {
+    cur = cur.parentElement;
+  }
+  if (!cur || cur.parentElement !== section) return null;
+  return cur;
+}
+
+// Minimal HTML escaper for <title> injection into the print iframe. We
+// don't ship a real escaping lib because this is the only spot in the
+// component that needs one and the input surface is tiny.
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }

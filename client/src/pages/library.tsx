@@ -617,7 +617,7 @@ function DocCard({
                 {doc.updated_at && (
                   <div
                     className="flex items-baseline justify-between gap-2"
-                    title={new Date(doc.updated_at).toISOString()}
+                    title={absoluteLocalTime(doc.updated_at)}
                   >
                     <span className="text-muted-foreground">Updated</span>
                     <span className="text-right">{relativeTime(doc.updated_at)}</span>
@@ -861,7 +861,11 @@ function MetaRow({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
 
 // v0.9.29: relative-time helper for the expanded-card "Updated" field. Tries
 // to feel natural ("just now", "3d ago", "2mo ago") without dragging in a
-// full i18n library. Anything older than a year drops back to an ISO date.
+// full i18n library. Anything older than a year drops back to a local date.
+//
+// v1.0.6.1: year+ fallback now uses toLocaleDateString() instead of the UTC
+// ISO slice so users in western time zones don't see a date that reads as
+// "one day off" from what they'd see in Windows Explorer.
 function relativeTime(iso: string): string {
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return iso;
@@ -876,7 +880,17 @@ function relativeTime(iso: string): string {
   if (d < 30) return `${d}d ago`;
   const mo = Math.round(d / 30);
   if (mo < 12) return `${mo}mo ago`;
-  return new Date(t).toISOString().slice(0, 10);
+  return new Date(t).toLocaleDateString();
+}
+
+// v1.0.6.1: absolute local-time helper used for the "Updated" tooltip and
+// anywhere else we want a full, human-readable timestamp in the user's
+// wall-clock time. Falls back to the raw string on parse failure so
+// callers always get something displayable.
+function absoluteLocalTime(iso: string): string {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return iso;
+  return new Date(t).toLocaleString();
 }
 
 // v0.9.29: tag chip row for the expanded Library card. Wraps to 2 lines
@@ -1477,7 +1491,19 @@ function DocDetail({ id }: { id: string }) {
               sectionTotal={sections.length}
               onPrev={safeSectionIdx > 0 ? () => setSelected(safeSectionIdx - 1) : undefined}
               onNext={safeSectionIdx < sections.length - 1 ? () => setSelected(safeSectionIdx + 1) : undefined}
-              onViewPages={activeSection.page_start ? () => openPageViewer(activeSection.page_start!) : undefined}
+              // v1.0.6.1: widen the "View original pages" icon so DOCX (and
+              // any future file type routed through PageViewerDialog with a
+              // retained source file) gets the same affordance PDFs already
+              // had. PDFs still open at the section's page_start when we know
+              // it; DOCX has no chunk-level page number, so we just launch the
+              // viewer at page 1 and let DocxViewerDialog take over.
+              onViewPages={
+                activeSection.page_start
+                  ? () => openPageViewer(activeSection.page_start!)
+                  : data.document.original_ext
+                  ? () => openPageViewer(1)
+                  : undefined
+              }
               highlightQuery={docSearchQuery}
             />
           )}

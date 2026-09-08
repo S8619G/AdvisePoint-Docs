@@ -655,7 +655,12 @@ function fmtDate(v: unknown): string {
   else if (typeof v === "string" && /^\d{10,}$/.test(v)) d = new Date(parseInt(v, 10));
   else d = new Date(String(v));
   if (Number.isNaN(d.getTime())) return String(v);
-  return d.toISOString().replace("T", " ").slice(0, 19);
+  // v1.0.6.1: format in the user's local time zone. Prior versions used
+  // toISOString(), which always renders in UTC and can be off by several
+  // hours (or a full day) from what Windows Explorer shows for the same
+  // file. The compare-duplicates dialog surfaces "Ingested" and "Last
+  // updated" side-by-side, so local time is what users expect.
+  return d.toLocaleString();
 }
 function fmtHash(v: unknown): string {
   if (!v) return "";
