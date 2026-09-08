@@ -45,6 +45,58 @@ reordered, removed, or promoted to SHIPPED.
 - The **DOCX viewer** (item 4) reuses PageViewer's dialog chrome — the PageViewer fix (item 3) is a prerequisite so the mode switcher extends the same conditional tree cleanly.
 - **User-notification hard requirement:** every failure signal (toast, tooltip, badge, anywhere) MUST name the specific failing document by title. "A render failed" without saying which one is not acceptable in multi-document uploads. Both the renderer timeout entry (item 2) and the header render-status indicator entry (item 5) capture this.
 
+### Definition of done — v1.0.4 release gate
+
+Before v1.0.4 ships, verify each item below. Any unchecked item is
+a blocker. Update this checklist whenever a new release gate is
+added.
+
+**Failed-document naming (user requirement, 2026-09-08):**
+
+- [ ] Upload-page toast on render failure names the failing document by title (falls back to filename if title is empty)
+- [ ] Upload-page toast includes the specific failure reason (page N timeout, malformed stream, etc.) — not a generic "render failed"
+- [ ] Upload-page toast uses `variant: "destructive"` and does not auto-dismiss
+- [ ] Header render-status indicator's failure tooltip lists EACH failed document by title, one line per failure, with its specific reason
+- [ ] Header indicator failure glyph stays visible until user clicks to dismiss (does not fade like the clean-completion signal)
+- [ ] `GET /api/render/status` response includes a `recent_failures[]` array with `title`, `file_name`, and `error` per failed doc
+
+**Renderer reliability (from renderer-timeout entry):**
+
+- [ ] Per-page render timeout enforced (default 2 min, env-var configurable)
+- [ ] `doc.getPage(n)` timeout enforced (default 30 sec)
+- [ ] `pdfjs.getDocument()` load timeout enforced (default 1 min)
+- [ ] Whole-document wall-clock timeout enforced (default 30 min)
+- [ ] Hung page fails soft: rest of the doc still renders, doc marked `"ready"` with `(partial)` note when < 25% pages failed
+- [ ] Hung page fails hard: doc marked `"error"` when > 25% pages failed, first failure reason recorded
+- [ ] Hung doc does NOT starve the queue: next queued doc starts rendering
+- [ ] Integration test: mock hung page in doc 1 of 3-doc batch, confirm docs 2 and 3 render normally
+
+**DOCX / non-PDF handling:**
+
+- [ ] PageViewer no longer shows "Page 1 is still rendering" for `status: "missing"` (DOCX/TXT/MD)
+- [ ] DOCX viewer renders extracted content with headings, lists, tables, embedded images
+- [ ] TXT and MD files render in the same viewer
+- [ ] PDF page-image viewer still works exactly as v1.0.3.1 (no regression)
+
+**Standing gates (apply to every release):**
+
+- [ ] `rg -i kyocera dist/ client/ server/ shared/ script/ scripts/ packaging/` returns zero hits
+- [ ] Build smoke test passes (server binds port, port responds within 15s)
+- [ ] `client/src/version.ts` bumped to 1.0.4
+- [ ] Release notes written in impersonal tone (no signature, no location footer)
+- [ ] Launcher `.bat` unchanged OR both `EXPECTED_LAUNCHER_SHA256` and `NEW_LAUNCHER_SHA256` in `scripts/package-windows.mjs` updated to match the shipped launcher
+- [ ] Manual test: upload the KEY-OP-TRAINING_Guide_5012.docx file that surfaced the DOCX issue; confirm content viewer renders it properly
+
+**Windows on ARM (if it lands in v1.0.4):**
+
+- [ ] Native ARM64 build produced alongside x64
+- [ ] Native modules (better-sqlite3, canvas, etc.) rebuilt for ARM64
+- [ ] Launcher detects host architecture and runs the matching node.exe
+- [ ] Manual test: install and run on a real Windows on ARM device (Surface Pro X or Copilot+ PC)
+
+If Windows on ARM slips to a later release, remove or strike
+through its checklist items and note the slip in the summary above.
+
 ---
 
 ## Option B updater helper — `Update.bat` (planned for v0.9.32)
