@@ -575,6 +575,263 @@ worth it as a hard release gate.
 - Keep the smoke test skippable via `SKIP_SMOKE=1` env var for debugging
   edge cases in CI.
 
+## PageViewer — false "still rendering" spinner on non-PDF documents (v1.0.4 — PLANNED)
+
+**Filed:** 2026-09-08
+**Target release:** v1.0.4
+**Status:** planned. Small client-only bug fix. UI-only, no server change.
+**Bug:** Clicking "View original pages" on a DOCX (or TXT/MD) document
+shows a permanent "Page 1 is still rendering..." spinner in the viewer
+body, even though the tab header correctly reports "No page images
+available for this document." The spinner will spin forever because
+non-PDF documents deliberately never enter the page renderer.
+
+### Root cause
+
+`server/routes.ts:604` guards `if (extracted.format === "pdf")` before
+calling `scheduleRender`. DOCX / TXT / MD uploads never register a
+render job at all, so `GET /api/documents/:id/pages/status` returns
+`{status: "missing", rendered: 0, total: 0}` forever.
+
+`client/src/components/PageViewer.tsx:685-694` has a fallback branch
+that renders when `currentPageRendered` is false:
+
+```tsx
+<div className="mt-16 text-center text-sm text-muted-foreground max-w-md">
+  <Loader2 className="h-5 w-5 animate-spin mx-auto mb-3" />
+  <div>Page {pageNumber} is still rendering.</div>
+  {status && (
+    <div className="mt-1 text-xs">
+      {status.rendered} of {status.total} pages ready - this page
+      will appear as soon as it's finished.
+    </div>
+  )}
+</div>
+```
+
+It does not check for `status?.status === "missing"` before falling
+into this branch, so DOCX viewers get "Page 1 is still rendering /
+0 of 0 pages ready" indefinitely. The tab header at
+`PageViewer.tsx:594-596` correctly handles `"missing"` — the body
+does not.
+
+### Fix
+
+In the fallback branch, split the not-rendered case by status:
+
+- `status?.status === "missing"` → show a friendly "no page images for
+  this document" message. Reason: this document type doesn't produce
+  page images. Suggest using the document text or the Query tab.
+- `status?.status === "error"` → show the render error (existing
+  header already does this; body can either mirror or defer to it).
+- Otherwise (rendering in progress but this specific page not ready)
+  → keep the existing "Page N is still rendering" spinner as-is.
+
+Suggested "missing" body copy:
+> This document has no rendered page images. DOCX, TXT, and Markdown
+> files are searchable via the Query tab and readable via the
+> document detail view, but don't produce visual page renders.
+
+### Related concern — should "View original pages" even show for non-PDFs?
+
+Currently `library.tsx:1328` renders the button unconditionally. Two
+options:
+
+1. **Hide the button entirely** for non-PDF documents. Cleanest.
+   Slight risk: if we later ship the DOCX viewer (separate backlog
+   entry), we'd need to unhide it.
+2. **Keep the button, fix the body copy** so it explains why there
+   are no page images. Zero surprise if the DOCX viewer arrives
+   later — the button already exists, its behavior just improves.
+
+**Recommendation:** Option 2. The button is a natural entry point for
+the DOCX viewer feature; hiding it now just means adding it back
+later. The body-copy fix already makes it not-broken.
+
+### Testing
+
+- Upload the sample DOCX (KEY-OP-TRAINING_Guide_5012.docx or any
+  other DOCX). Click "View original pages" on the document. Confirm:
+  - No spinning loader
+  - No "Page 1 is still rendering" text
+  - Friendly "no page images" message visible
+  - Header still says "No page images available for this document."
+- Same for a .txt and a .md upload.
+- Upload a PDF. Confirm existing behavior unchanged:
+  - Spinner + "Page N is still rendering / 0 of 5 pages ready"
+    appears briefly, then real page images replace it as they finish.
+- Upload a PDF that fails to render (corrupt or password-protected).
+  Confirm existing error handling still works.
+
+### Effort estimate
+
+~30 minutes. ~10 lines of TSX plus one Playwright test if we want
+regression coverage.
+
+### Provenance
+
+Reproduced end-to-end in the sandbox against a live v1.0.3.1 build:
+upload returned HTTP 200 in 850 ms with 9 chunks / 24,876 tokens
+extracted; `pages/status` returned `"missing"` immediately and stayed
+that way — exactly matching the reported symptom.
+
+## DOCX viewer — render extracted content in the PageViewer dialog (v1.0.4 — PLANNED)
+
+**Filed:** 2026-09-08
+**Target release:** v1.0.4 (candidate; may slip to v1.0.5 if scope
+grows)
+**Status:** planned. New feature. Complements the PageViewer fix
+above.
+
+**Ask:** DOCX uploads extract cleanly (mammoth → markdown, ~200ms for
+the test file) but users have no way to *see* the document — only its
+chunks and search results. Give the "View original pages" button on a
+DOCX something meaningful to open: an in-app viewer that renders the
+mammoth-extracted content in a readable layout, with the same
+navigation and search affordances as the PDF page viewer.
+
+### Approach — render extracted HTML/markdown, not fake page images
+
+We already have the fully-extracted document text (mammoth's markdown
+output) sitting in the database. Rendering it as HTML in the existing
+PageViewer dialog gets us 80% of the value at 10% of the cost of a
+real page-image pipeline.
+
+**Rejected alternatives (documented so they don't come back):**
+
+1. **LibreOffice headless (`soffice --headless --convert-to pdf`)**
+   — produces faithful page images by piggybacking on the existing
+   pdfjs pipeline. Adds ~150 MB to the portable zip. Overkill for
+   the user problem ("let me see the DOCX"), and blows our
+   portable-download budget.
+2. **DOCX → HTML → wkhtmltopdf / puppeteer** — smaller install than
+   LibreOffice but page layout drifts noticeably from Word, and we
+   inherit puppeteer's Chromium download (~120 MB). Same objection.
+
+### Implementation
+
+#### Server — expose extracted content
+
+`documents` table already stores the extracted text (`body` column,
+via `ingestParsed`). Options:
+
+1. **Reuse `body`** if it's the mammoth markdown output verbatim.
+2. **Extend extract-worker** to return both markdown (for chunking)
+   and HTML (for viewing) in one pass. Mammoth has
+   `convertToHtml({buffer})` alongside `convertToMarkdown`. Add
+   `extracted.html` to the payload, store in a new column or a
+   sidecar file next to the extracted text.
+
+Option 2 gives cleaner viewer output (headings, lists, tables
+preserved as real HTML). Option 1 works but forces the client to
+re-parse markdown → HTML on open. Recommend option 2.
+
+New endpoint:
+
+```
+GET /api/documents/:id/content
+→ { format: "docx"|"text"|"markdown", html: "<...>" }
+```
+
+Returns 404 for PDFs (they use the page-image endpoints).
+
+#### Client — PageViewer content mode
+
+Extend PageViewer with a second display mode:
+
+- **Page-image mode** (current): PDFs. Renders JPG/WebP images from
+  `/pages/N.jpg`.
+- **Content mode** (new): DOCX / TXT / MD. Fetches HTML from
+  `/content` and renders it in a scrollable pane inside the same
+  dialog frame.
+
+Selector: based on `document.file_name` extension or a new
+`document.viewer_mode` field.
+
+Content-mode viewer:
+
+- Same dialog chrome (header, close button, keyboard shortcuts)
+- Sanitize the HTML (DOMPurify) — mammoth output is generally clean
+  but we should not skip this
+- Preserve mammoth's image embeds (mammoth inlines them as base64
+  by default) so screenshots in the DOCX show up
+- Reuse the existing Ctrl+F search panel if possible — it currently
+  operates on page images (OCR text?); may need to switch to DOM
+  text search in content mode
+- Zoom via browser default (Ctrl+scroll on the pane) rather than the
+  page-viewer's custom zoom — HTML content doesn't need the pixel-
+  perfect zoom the page images do
+
+#### Existing PageViewer plumbing to preserve
+
+- Dialog open/close animation
+- URL/state persistence via `pageViewerStart` and `docSearchQuery`
+- The "View original pages" button in `library.tsx:1328` — no change
+  needed; it opens the same dialog, which now branches internally
+
+### Edge cases
+
+- **DOCX with embedded images.** Mammoth inlines them as data URIs
+  by default — verify sizes stay reasonable (large embedded images
+  could balloon the response payload; consider streaming or
+  extracting to `/pages/` sidecar files if this is a problem).
+- **DOCX with unsupported content** (equations, complex tables,
+  SmartArt). Mammoth already logs warnings via its `messages` array
+  — surface a subtle "Some formatting may not display correctly"
+  note when `messages.length > 0`.
+- **TXT / MD files.** Same viewer, different transform: TXT wraps in
+  `<pre>`, MD renders through a markdown-to-HTML pass (already have
+  a markdown renderer in the codebase from chunk display).
+- **Very long documents.** DOCX/MD/TXT can be 500k+ chars.
+  Virtualize the content pane if scroll performance suffers.
+
+### Interaction with the PageViewer fix above
+
+These two entries are independent:
+
+- The PageViewer fix ships the friendly "no page images" fallback so
+  the current DOCX experience is not broken.
+- The DOCX viewer replaces that fallback with an actual viewer when
+  it lands.
+
+If the DOCX viewer slips to v1.0.5, the fix above still stands on
+its own and non-PDFs stop showing the false spinner.
+
+### Testing
+
+- Upload the test DOCX (KEY-OP-TRAINING_Guide_5012.docx). Click
+  "View original pages." Confirm the extracted content renders as
+  formatted HTML with headings, lists, tables, and any embedded
+  images.
+- Upload a DOCX with an embedded image. Confirm the image appears
+  inline.
+- Upload a large DOCX (500+ pages of text). Confirm the viewer
+  opens promptly and scrolling stays smooth.
+- Upload a .md file. Confirm markdown renders (headings, links,
+  code blocks).
+- Upload a .txt file. Confirm plain-text display in monospace
+  wrapping.
+- Upload a PDF. Confirm the page-image viewer still works exactly
+  as before — no regression from the mode switcher.
+- Ctrl+F inside a DOCX viewer — confirm text search works against
+  the rendered HTML.
+
+### Effort estimate
+
+~1 full day:
+
+- ~2h: server — extract-worker HTML output + new endpoint + tests
+- ~4h: client — PageViewer mode switcher, content pane component,
+  HTML sanitization, image handling, keyboard shortcut integration
+- ~1h: markdown / TXT handling
+- ~1h: visual polish, edge cases, Playwright coverage
+
+### Provenance
+
+Same reproduction as the PageViewer fix above. Mammoth extracts the
+full 4-page DOCX to 747 KB of markdown in ~200 ms, so the data we
+need to render is already sitting there ready to use.
+
 ## Header — background rendering activity indicator (v1.0.4 — PLANNED)
 
 **Filed:** 2026-09-08
