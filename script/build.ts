@@ -8,6 +8,18 @@ import { platform } from "node:process";
 
 // server deps to bundle to reduce openat(2) syscalls
 // which helps cold start times
+//
+// v1.0.8: this list is also the safety net for the v1.0.7.4.1 class of
+// bug. The packager reuses the v1.0.0 baseline's node_modules; any new
+// direct dep added to package.json that ISN'T in this allowlist has to be
+// present in that frozen baseline, or the packaged app fails with
+// MODULE_NOT_FOUND at startup. Bundling via this allowlist is the
+// simpler path -- the packager doesn't need a special-case copy list.
+//
+// Rule of thumb: any new `require("...")` in server/ code that resolves
+// to a package added since v1.0.0 must be in this list. See
+// `assertKnownDeps` below -- the build fails loudly if a new dep sneaks
+// in without being categorized.
 const allowlist = [
   "@google/generative-ai",
   "archiver",
@@ -19,6 +31,9 @@ const allowlist = [
   "express",
   "express-rate-limit",
   "express-session",
+  // v1.0.7.4: RTF codepage decoding. Added to the bundle allowlist in
+  // v1.0.8 (was in the packager's EXTRA_RUNTIME_DEPS in v1.0.7.4.1).
+  "iconv-lite",
   "jsonwebtoken",
   "memorystore",
   "multer",
@@ -27,6 +42,8 @@ const allowlist = [
   "openai",
   "passport",
   "passport-local",
+  // iconv-lite's runtime dep -- bundle alongside it.
+  "safer-buffer",
   "stripe",
   "uuid",
   "ws",
@@ -34,6 +51,89 @@ const allowlist = [
   "zod",
   "zod-validation-error",
 ];
+
+// Direct deps that we intentionally do NOT bundle -- the packager either
+// pulls them from the frozen v1.0.0 baseline node_modules, or they're
+// only used by the client (Vite bundles those into dist/public). Adding
+// a new direct dep that isn't in `allowlist` and isn't in this list
+// will fail the build via assertKnownDeps() below.
+const knownExternal = new Set([
+  // Client-side / bundled by Vite into dist/public.
+  "@hookform/resolvers",
+  "@jridgewell/trace-mapping",
+  "@radix-ui/react-accordion",
+  "@radix-ui/react-alert-dialog",
+  "@radix-ui/react-aspect-ratio",
+  "@radix-ui/react-avatar",
+  "@radix-ui/react-checkbox",
+  "@radix-ui/react-collapsible",
+  "@radix-ui/react-context-menu",
+  "@radix-ui/react-dialog",
+  "@radix-ui/react-dropdown-menu",
+  "@radix-ui/react-hover-card",
+  "@radix-ui/react-label",
+  "@radix-ui/react-menubar",
+  "@radix-ui/react-navigation-menu",
+  "@radix-ui/react-popover",
+  "@radix-ui/react-progress",
+  "@radix-ui/react-radio-group",
+  "@radix-ui/react-scroll-area",
+  "@radix-ui/react-select",
+  "@radix-ui/react-separator",
+  "@radix-ui/react-slider",
+  "@radix-ui/react-slot",
+  "@radix-ui/react-switch",
+  "@radix-ui/react-tabs",
+  "@radix-ui/react-toast",
+  "@radix-ui/react-toggle",
+  "@radix-ui/react-toggle-group",
+  "@radix-ui/react-tooltip",
+  "@supabase/supabase-js",
+  "@tanstack/react-query",
+  "class-variance-authority",
+  "clsx",
+  "cmdk",
+  "docx-preview",
+  "embla-carousel-react",
+  "framer-motion",
+  "input-otp",
+  "jszip",
+  "lucide-react",
+  "next-themes",
+  "react",
+  "react-day-picker",
+  "react-dom",
+  "react-hook-form",
+  "react-icons",
+  "react-resizable-panels",
+  "recharts",
+  "tailwind-merge",
+  "tailwindcss-animate",
+  "tw-animate-css",
+  "vaul",
+  "wouter",
+  // Server-side but present in the v1.0.0 baseline node_modules.
+  "@napi-rs/canvas",
+  "better-sqlite3",
+  "dotenv",
+  "mammoth",
+  "pdf-parse",
+  "pdfjs-dist",
+]);
+
+function assertKnownDeps(deps: string[]): void {
+  const unknown = deps.filter(
+    (d) => !allowlist.includes(d) && !knownExternal.has(d),
+  );
+  if (unknown.length > 0) {
+    throw new Error(
+      `Unrecognized direct dependencies in package.json: ${unknown.join(", ")}.\n` +
+        `Add each to script/build.ts \`allowlist\` (to bundle into dist/index.cjs) ` +
+        `or \`knownExternal\` (present in the v1.0.0 baseline node_modules).\n` +
+        `See the v1.0.7.4.1 hotfix notes for the failure mode this catches.`,
+  );
+  }
+}
 
 async function buildAll() {
   await rm("dist", { recursive: true, force: true });
@@ -47,6 +147,9 @@ async function buildAll() {
     ...Object.keys(pkg.dependencies || {}),
     ...Object.keys(pkg.devDependencies || {}),
   ];
+  // v1.0.8: fail the build if a direct dep isn't categorized. Prevents
+  // repeats of the v1.0.7.4.1 iconv-lite MODULE_NOT_FOUND class of bug.
+  assertKnownDeps(Object.keys(pkg.dependencies || {}));
   const externals = allDeps.filter((dep) => !allowlist.includes(dep));
 
   await esbuild({

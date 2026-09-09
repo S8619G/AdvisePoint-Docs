@@ -114,6 +114,13 @@ try {
 
   rmSync(join(appRoot, "dist"), { recursive: true, force: true });
   cpSync(join(repoRoot, "dist"), join(appRoot, "dist"), { recursive: true });
+
+  // v1.0.8: EXTRA_RUNTIME_DEPS retired. Direct deps added since v1.0.0
+  // (e.g. iconv-lite, safer-buffer for RTF) are now bundled into
+  // dist/index.cjs by script/build.ts. That script's assertKnownDeps()
+  // fails the build if a direct dep isn't categorized, so the class of
+  // bug this list existed to catch (v1.0.7.4.1 MODULE_NOT_FOUND at
+  // startup) can no longer happen silently.
   cpSync(
     join(repoRoot, "packaging", "Update AdvisePoint Docs.bat"),
     join(appRoot, "Update AdvisePoint Docs.bat"),

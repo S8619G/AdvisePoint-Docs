@@ -76,40 +76,537 @@ release — it's the largest single line item in the v1.0.x line and
 needs its own focused sprint with a separate QA cycle, which
 v1.0.6 provides.
 
-## v1.0.6 — release scope summary
+## v1.0.6 — SHIPPED 2026-09-08
 
-**Split from v1.0.5 on 2026-09-08.** Single-headline release: full
-Windows on ARM support. Isolating this item from v1.0.5 keeps the
-high-risk multi-arch packaging + native-module-rebuild work from
-colliding with the low-risk consolidation work in v1.0.5.
+**Rescoped from ARM64 to the rich DOCX viewer on 2026-09-08** after
+v1.0.5 field feedback: opening a `.docx` in the library showed a
+chunk of extracted text and "formatting gibberish" from the
+reassembled-text viewer, not the actual Word document. The DOCX
+viewer was a much lower-risk, higher-visibility win than ARM64
+packaging, so it took the v1.0.6 headline slot. ARM64 slid to a
+future release (see v1.0.7 candidates).
 
-**Headline feature**
+**Headline feature (shipped)**
 
-1. [Windows on ARM — full ARM64 support](#windows-on-arm--full-arm64-support-v106--planned) — first-class native ARM64 build alongside x64. Multi-arch packager, native module rebuilds (`better-sqlite3`, `@napi-rs/canvas`), launcher arch detection, in-app updater arch matching. Ships two portable zips per release (`AdvisePoint-Docs.zip` for x64, `AdvisePoint-Docs-arm64.zip` for arm64).
+1. **Rich in-app DOCX viewer** — clicking a `.docx` in the library
+   renders it with its original fonts, tables, images, headers, and
+   page breaks via the in-browser `docx-preview` engine. Toolbar
+   parity with the PDF viewer: previous/next page, page X of N,
+   Zoom −/+, Fit (toggles to a comfortable read zoom), Print.
+2. **DOCX originals persisted** — new uploads store the original
+   `.docx` bytes under `<dataDir>/originals/<id>.docx`. Backup /
+   restore includes the folder automatically. Deleting a document
+   also removes its retained original.
+3. **Legacy DOCX handling** — DOCX rows uploaded before v1.0.6 show
+   an amber "Legacy — re-upload for viewing" badge; opening them
+   shows a Re-upload prompt in the viewer. Re-uploading the same
+   file activates the rich viewer.
+4. **Silent text fallback** — if `docx-preview` fails on a specific
+   document, the viewer falls back to the reassembled chunk text
+   with an amber banner instead of erroring.
+5. **Server API additions** — `GET /api/documents/:id/original`
+   streams source bytes with correct MIME + `Content-Disposition`.
+   `/content` payload adds `has_original` / `original_ext` /
+   `original_bytes`. Documents list surfaces `original_ext`.
+6. **Legacy-name scrub** — removed the last two prose references to
+   the legacy vendor name from `server/install-location.ts` and
+   this BACKLOG's v1.0.5 gotcha section, keeping the standing
+   `rg -i kyocera` gate at zero hits across shipped surfaces.
 
-**Prerequisites:**
+**Explicitly deferred out of v1.0.6:** Windows on ARM (multi-arch
+packaging + native-module rebuilds), node.exe rebrand via VersionInfo,
+worker_threads refactor for the pdfjs render loop. See v1.0.7
+candidates below.
 
-- v1.0.5 shipped and stable in the field for at least one release
-  cycle, so any ARM64 issues surface against a known-good baseline
-  rather than getting confused with concurrent DOCX-viewer or
-  install-location changes.
-- Field validation of the event-loop stalls fix (v1.0.5 item 3)
-  confirms whether the cheap threshold/yield fix is sufficient or
-  whether the worker_threads refactor also needs to land — the
-  refactor would be its own item, NOT bundled into v1.0.6.
+**Baseline used:** `AdvisePoint-Docs-baseline-v1.0.0.zip` (launcher
+SHA-256 `7ac72e45fdaf2ad2ca366ecbd651f6f13e1854b73f78017720914f551fa75c98`,
+unchanged since v1.0.0).
 
-### Batching decision (2026-09-08)
+## v1.0.6.1 — SHIPPED 2026-09-08 (same-day hotfix)
 
-ARM64 is a single focused sprint with its own build + QA cycle. Do
-NOT bundle any additional items into v1.0.6 unless they're
-directly related to ARM64 (e.g. arch-specific launcher fixes
-discovered during development). Any unrelated feature or bugfix
-found during the v1.0.6 sprint should be filed as v1.0.7 or a
-v1.0.5.x hotfix rather than absorbed into v1.0.6.
+Same-day hotfix stacking five reported issues against v1.0.6. Point
+release per convention — the base v1.0.6 tag is not reused.
 
-**Suggested implementation order:** monolithic — one focused sprint
-for the whole ARM64 stack. See the full spec below for the ordered
-sub-tasks.
+1. **Local-time timestamps** — `library.tsx` `relativeTime()` year+
+   fallback and Updated-row tooltip, plus `LibraryScanPanel.tsx`
+   `fmtDate()` for the compare-duplicates dialog, switched from
+   `toISOString()` (UTC) to `toLocaleDateString()` /
+   `toLocaleString()` so displayed ingested / updated times match
+   Windows Explorer.
+2. **"View original pages" icon for DOCX** — section-view icon at
+   `library.tsx:1494` was gated on `activeSection.page_start` (PDF
+   only); widened to also fire for any doc with `original_ext` set,
+   routing DOCX through `DocxViewerDialog` via `PageViewerDialog`.
+3. **DOCX page-break synthesis** — docx-preview's `breakPages` only
+   fires for Word-written `<w:lastRenderedPageBreak>` markers, so
+   docs authored elsewhere collapsed to "Page 1 of 1". Added a
+   post-render pass that walks the rendered tree for other
+   pagination hints (last-rendered breaks, CSS/inline
+   `page-break-before`, `<br>` page-break variants) and slices the
+   single section into synthetic sections. When nothing usable is
+   found, toolbar switches to "Continuous view" and Prev/Next
+   disable.
+4. **Real Fit-to-width** — replaced the fixed two-state
+   `DEFAULT_ZOOM ↔ READABLE_ZOOM` toggle with a measurement of the
+   docx pane's natural width vs. the scroll container's client
+   width; Fit toggles between 100% and the computed fit scale, and
+   re-measures on window resize. Defined local `DOCX_MIN_ZOOM = 0.25`
+   so Fit can actually shrink below native paper width
+   (`use-zoom-pan`'s `MIN_ZOOM = 1` was clamping Fit to 100%).
+5. **Print via hidden iframe** — v1.0.6's `window.open` +
+   `document.write` shipped with a broken `<\\/script>` escape that
+   the HTML5 script-end-tag matcher doesn't recognize, so the
+   popup rendered as raw HTML instead of triggering the print
+   dialog. Rewrote to mount a hidden `<iframe>` with `srcdoc` (no
+   inline script, no popup blocker path), call `iframe.contentWindow.
+   print()` on `load`, and clean up on `afterprint` + 30 s
+   watchdog.
+
+**Baseline used:** `AdvisePoint-Docs-baseline-v1.0.0.zip` (launcher
+unchanged from v1.0.0).
+
+## v1.0.6.3 — SHIPPED 2026-09-08 (Open in Word)
+
+Small feature release adding an **Open in Word** button to the DOCX
+viewer toolbar so complex Word documents that docx-preview can't
+reproduce faithfully (newsletter templates, multi-column layouts,
+floating/anchored images with wrap, Structured Document Tags, text
+boxes, SmartArt) can be handed off to Microsoft Word for viewing,
+printing, and Save As.
+
+**Implementation:** New `handleOpenInWord` callback in `DocxViewer.tsx`
+creates an `<a download>` element pointing at the existing
+`/api/documents/:id/original` route (from v1.0.6), so the browser
+downloads the retained `.docx` bytes to Downloads instead of trying to
+inline-preview them. On Windows the Chrome/Edge "Always open files of
+this type" toggle then routes the file to Word (or LibreOffice /
+WordPad, whatever is registered for `.docx`). Button is placed between
+Fit and Print in the toolbar.
+
+**Filename hygiene:** the download filename prefers `documentFileName`,
+falling back to `${documentTitle}.docx`, with Windows-illegal chars
+stripped and the `.docx` extension enforced so shell association fires
+correctly.
+
+**Gate:** enabled whenever `meta.has_original` is true (retained
+original exists server-side). Works even during the fallback / error
+render states, since it doesn't depend on docx-preview succeeding.
+
+**Deliberately not in this release:**
+
+- Round-tripping edits from Word back into the library. Any Save in
+  Word lands in the user's Downloads folder, NOT back in
+  `%LOCALAPPDATA%\AdvisePointDocs\originals\`. See v1.0.7 entry below
+  for the drag-to-update flow with similarity detection.
+- Native OS integration (protocol handler, WebDAV mount). Both would
+  enable true edit-in-place but require significant complexity and
+  hurt the portable-app posture.
+
+**Baseline used:** `AdvisePoint-Docs-baseline-v1.0.0.zip` (launcher
+unchanged from v1.0.0).
+
+## v1.0.6.2 — SHIPPED 2026-09-08 (same-day print hotfix)
+
+Second same-day hotfix, addressing two DOCX print-output issues visible
+in the v1.0.6.1 hardcopy the user shared:
+
+1. **Raw CSS text on first printed page** — v1.0.6.1's print iframe
+   wrapped `styleRef.innerHTML` inside its own `<style>` block, but
+   docx-preview's styleRef content is a sequence of real
+   `<style>...</style>` elements. The first inner `</style>` closed
+   the outer block early, so every subsequent rule (`@page`,
+   page-break rules) plus `</style></head><body>` leaked out as
+   body text and printed as literal CSS at the top of the doc.
+   Emit `styleHtml` unmodified in `<head>` and put print-only
+   overrides in a separate trailing `<style>` block; cascade order
+   still favors our rules.
+2. **Shaded strip on top/left of printed pages** — docx-preview's
+   default on-screen chrome wraps each `<section>` in a white
+   page-on-gray-tray box-shadow and outer padding on `.docx-wrapper`,
+   which leaked into print as a shadow strip along the top and left
+   edges of the physical page and shifted content off-center. Added
+   a print-only override that flattens `.docx-wrapper` and
+   `section.docx` backgrounds/shadows and sets `@page { margin: 0 }`
+   (the doc's own `w:pgMar` is already applied as inline section
+   padding, so keeping the browser's default `@page` margin on top
+   of it would double the inset).
+
+**Baseline used:** `AdvisePoint-Docs-baseline-v1.0.0.zip` (launcher
+unchanged from v1.0.0).
+
+## v1.0.7 — candidates (not yet scoped)
+
+Ungrouped list of items still on deck after v1.0.6. Pick the
+headline once v1.0.6 has one field-cycle of soak.
+
+- **v1.0.8 grouped fixes** (rolled up from deferred v1.0.7.4 hotfix
+  items + TXT/MD Print, 2026-09-08). User decided against a separate
+  v1.0.7.4 hotfix; all cosmetic / small-scope fixes get batched into
+  v1.0.8 alongside the RTF work below. Items:
+
+  1. **Edit-in-place status pill auto-dismiss.** After closing the
+     Word document, the pill ("Editing in Word — waiting for save")
+     stays on screen indefinitely, even if the user closes and
+     reopens the viewer. Two things to verify and fix:
+     a. Confirm `scheduleLockReleaseCleanup` in `server/editInbox.ts`
+        actually detects Word releasing its exclusive lock in the
+        field. If the `openSync(O_RDWR)` probe never returns
+        "unlocked" for the user's Word version, the server never
+        ends the session and the client never sees the 404 that
+        would clear the pill. Add a log line on each poll attempt
+        so a diagnostics zip can confirm.
+     b. Even when the server does end the session cleanly, the
+        client pill in the "ended" state has no auto-dismiss timer
+        — it sits until manually X'd. Add a ~5s auto-dismiss
+        (`setTimeout` + `dismissEditSession`) whenever
+        `editSession.status === "ended"`.
+     c. Belt-and-braces: on viewer unmount, also call
+        `setEditSession(null)` synchronously (not just the async
+        close request) so the pill can never survive a viewer
+        close+reopen. The current cleanup fires the close request
+        but leaves `editSession` state hydrated if a poll timer
+        already scheduled the next fetch.
+     Cosmetic only; no data risk.
+
+  2. **TXT/MD viewer: Print button.** `DocumentContentViewerDialog`
+     (used for `.txt`, `.md`, `.markdown`) currently has no
+     toolbar controls beyond a highlight-search input — no Print,
+     no zoom. User accepted skipping zoom (browser Ctrl +/- is
+     fine) but wants Print for consistency with the PDF and DOCX
+     viewers. Implementation: a Print button in the toolbar row
+     that calls `window.print()` with a print-only stylesheet
+     targeting the `<pre data-testid="text-document-content">`
+     element. No range picker — TXT/MD are one continuous flow,
+     not paginated. Match the button styling used in the PDF
+     viewer toolbar (`Printer` icon + "Print" label, `h-7 px-2`).
+
+- **[SHIPPED v1.0.7.4]** RTF ingest + viewer (Option C: DOCX-style toolbar over plain-text
+  canvas) — shipped 2026-09-09 in v1.0.7.4 (feature) + v1.0.7.4.1 (packaging
+  hotfix for iconv-lite MODULE_NOT_FOUND) + v1.0.7.4.2/.3 (RTF upload MIME
+  gate hotfixes). Post-mortem entries live in the v1.0.8 release notes and
+  in `AdvisePoint-Docs-combined-release-notes.md`. Original v1.0.8 backlog
+  spec preserved below for historical reference:
+
+  Original spec: add first-
+  class RTF support so technical writers can drop `.rtf` files into
+  the library alongside `.docx`. RTF and DOCX are entirely different
+  formats (RTF is flat text with control words; DOCX is a zipped XML
+  package), so `docx-preview` cannot render RTF and there is no
+  JS-only RTF→DOCX converter small enough to bundle in a portable
+  app. Chosen approach is a hybrid: ship the DOCX-style *toolbar*
+  (Open in Word, Print, edit-in-place watcher, drag-to-update) over
+  a plain-text *canvas* like the current TXT/MD viewer. Users get
+  every interaction they care about; on-screen formatting fidelity
+  is traded for zero extra binary weight and no new render engine.
+
+  ### Ingest
+  - Add `.rtf` to the upload accept list
+    (`client/src/pages/upload.tsx`, currently
+    `application/pdf,…wordprocessingml.document,text/plain,text/markdown`)
+    and to the server ingest dispatcher.
+  - Strip RTF to plain text with a small npm library (evaluate
+    `rtf-parser` and `node-rtf-parser` on real Word / LibreOffice /
+    WordPad output before picking). Feed the resulting text through
+    the same chunker path TXT/MD use — no new RAG code.
+  - Respect `\ansicpg` for non-Unicode runs so `\'e9` decodes
+    correctly (é in cp1252, ê in cp850, etc.). Libraries handle
+    this; verify the picked one does.
+  - Skip embedded images / WMF / EMF objects with a
+    “N embedded objects skipped” note in the ingest log, matching
+    how the DOCX pipeline handles SmartArt / charts today.
+
+  ### Retained original + edit-in-place
+  - Save the `.rtf` bytes exactly the way `.docx` bytes are saved
+    today (`server/originals.ts` — already extension-agnostic).
+  - `server/editInbox.ts` needs no code changes: it copies the
+    retained original to `<dataDir>/edit-inbox/<id>.rtf` and
+    launches the OS default handler. Word opens `.rtf` natively;
+    the fs.watch → re-ingest path fires the same way. Confirm the
+    lock-release detector behaves the same for `.rtf` as for
+    `.docx` (Word may hold the lock differently).
+  - `reingestDocxIntoExisting` is DOCX-shaped in name only — it
+    accepts bytes + filename. Either rename it
+    (`reingestOriginalIntoExisting`) or add an `reingestRtf`
+    sibling; either way the DB path (preserve doc_id, wipe +
+    rebuild chunks, update hash / stats / updated_at / file_name)
+    is the same.
+
+  ### Viewer
+  - New component `RtfViewer.tsx` (or extend
+    `DocumentContentViewerDialog` with a toolbar prop). Renders the
+    plain-text canvas the TXT/MD viewer already renders, plus the
+    full DOCX-style toolbar: Print, Open in Word, edit-in-place
+    status pill, drag-to-update overlay.
+  - Route `.rtf` in `PageViewer.tsx` alongside `.docx` / `.txt` /
+    `.md`.
+  - Cursor stays on the browser ‘Ctrl +/-’ for zoom — no in-viewer
+    zoom controls (matches the deferred TXT/MD decision).
+
+  ### Risks
+  - RTF variability is high: Word RTF, WordPad RTF, LibreOffice
+    RTF, and hand-authored RTF all differ. Expect at least one
+    soak-cycle hotfix after v1.0.8 ships.
+  - Non-Unicode encoding bugs are the most likely field failure.
+    Collect a test corpus from real user files before locking the
+    parser choice.
+
+  ### Definition of done
+  - Upload accept list includes `.rtf`; drag-drop and file picker
+    both accept it.
+  - RTF file ingests, chunks appear in search results, viewer
+    opens on click, plain-text canvas renders with search-in-
+    document highlight working.
+  - Print button prints the canvas.
+  - Open in Word launches Word on the retained original; edits
+    save back through the fs.watch loop; pill shows status.
+  - Drag-to-update onto an existing RTF document works and
+    preserves the doc_id.
+  - `rg -i kyocera` still zero (RTF-parser package README /
+    keywords must not contain the legacy name).
+
+- **System tray icon** (v1.1 candidate; user request 2026-09-08) —
+  add an optional Windows notification-area (system tray) icon so
+  the app has a visible presence beyond the console window that the
+  launcher `.bat` opens. Menu targets under discussion:
+  - Open library (focus/open the browser tab)
+  - Backup now (trigger the manual backup path)
+  - Show data folder (open `%LOCALAPPDATA%\AdvisePointDocs\` in
+    Explorer)
+  - Recent backups / next scheduled backup (read from
+    `backup-scheduler` state)
+  - Quit AdvisePoint Docs (clean shutdown of the Node server)
+
+  Weigh against the "keep it portable / dependency-light" rule:
+  needs a native tray library (e.g. `node-tray`, `trayicon`, or a
+  small Rust/Go sidecar exe) that adds platform-specific binaries
+  to the zip. Investigate whether the tray process can be a
+  separate tiny binary launched by the same `.bat` (so the Node
+  server itself stays dependency-clean and Mac/Linux builds
+  aren't blocked). Not a v1.0.x hotfix candidate; schedule for
+  the v1.1 line once the edit-in-place watcher has soaked.
+
+- **Windows on ARM — full ARM64 support** (was v1.0.6 headline; see
+  [full spec](#windows-on-arm--full-arm64-support-v106--planned)
+  further down — still valid; only the target release changed).
+  First-class native ARM64 build alongside x64, multi-arch
+  packager, native module rebuilds (`better-sqlite3`,
+  `@napi-rs/canvas`), launcher arch detection, in-app updater arch
+  matching. Ships two portable zips per release.
+- **node.exe Task Manager visibility — Version Resource + icon
+  embed** — stamp `AdvisePoint Docs` product name + version + icon
+  onto the bundled `node.exe` so it doesn't show as "Node.js" in
+  Task Manager. Needs a Linux-runnable rcedit path (electron/rcedit
+  under `wine`) or a Windows build step.
+- **worker_threads refactor for pdfjs render loop** — full fix for
+  the event-loop stalls that v1.0.5 mitigated with a reconnect
+  threshold + micro-yields. Move `pdfjs.getDocument` +
+  `canvas.toBuffer` into a worker so the HTTP handler thread never
+  blocks. Higher packaging risk (needs an extra worker entry in
+  the bundler config), so gate this behind a release-cycle where
+  no other high-risk work ships.
+- **DOCX viewer polish (soak-driven)** — remaining polish that may
+  surface once field users exercise the v1.0.6 viewer: e.g.
+  configurable page zoom persistence across sessions, keyboard
+  shortcut parity with PDF viewer, better handling of exotic
+  embedded objects (charts, SmartArt) beyond the current silent
+  fallback.
+- **[REJECTED]** DOCX edit-in-place via WebDAV + drag-to-update fallback
+  (was proposed as v1.0.7 headline 2026-09-08; rejected during v1.0.7
+  build after Windows WebDAV negotiation kept failing on the shipped
+  Node backend). Replaced by the local file-watcher approach in v1.0.7.3
+  (retained-original edit-in-place: Open in Word writes to
+  `<dataDir>/edit-inbox/<id>.docx`, fs.watch re-ingests on save, lock
+  release ends the session). The v1.0.8 lock-release logging + auto-
+  dismiss pill polish keeps that path healthy. Historical WebDAV spec
+  preserved below for the record only:
+
+  ### Primary path: WebDAV mount (Word only)
+
+  Bundle a minimal WebDAV server inside the existing Node backend
+  exposing each retained DOCX at:
+
+  ```
+  http://127.0.0.1:<port>/webdav/documents/<doc-id>.docx
+  ```
+
+  Toolbar button changes from a `<a download>` to a link with the
+  Word protocol handler:
+
+  ```
+  ms-word:ofe|u|http://127.0.0.1:<port>/webdav/documents/<doc-id>.docx
+  ```
+
+  Word treats the URL as a network doc, opens it directly (no
+  download shelf, no temp file the user has to find), and Save
+  round-trips over WebDAV back to the Node backend, which writes it
+  through the standard re-ingestion path (chunks refresh,
+  `updated_at` bumps, search index updates).
+
+  Minimum WebDAV verbs Word needs (this is not a full class-2 WebDAV
+  server — just the subset Word probes for):
+
+  * `OPTIONS` — advertise `DAV: 1, 2` and allowed verbs.
+  * `PROPFIND` (Depth: 0 and 1) — return content-length,
+    last-modified, resourcetype, displayname for the doc collection
+    and each doc.
+  * `HEAD`, `GET` — serve the retained bytes (already exists via
+    `/api/documents/:id/original`, wire it into the WebDAV route).
+  * `PUT` — accept the saved bytes, replace the retained original,
+    hand the file to the ingestion pipeline for chunk refresh.
+  * `LOCK`, `UNLOCK` — Word requires class-2 locking. In-memory lock
+    table keyed by doc id is fine for a single-user portable app;
+    honor Word's lock tokens and refresh timeouts.
+  * `PROPPATCH` — no-op stub returning 200 with an empty response;
+    Word probes this and gets sad if it 404s.
+
+  Windows requirements (document these in the release notes):
+
+  * The **WebClient** service must be running (starts automatically
+    on Windows 10/11 Pro; Home edition often needs a manual start).
+    Detect at Open-in-Word time via a quick `sc query WebClient`
+    probe from the launcher; if stopped, show a one-line prompt to
+    start it and fall back to download-mode.
+  * Windows WebDAV client only trusts `http://` on localhost/127.0.0.1
+    by default. External hosts require HTTPS with a trusted cert,
+    which we don't need for a single-machine app.
+  * Word's version matters: Word 2016+ supports `ms-word:ofe|u|` URLs
+    reliably. Word 2013 works but sometimes prompts an extra time.
+    Word Online / Web ignores the scheme entirely — hence the
+    drag-to-update fallback.
+
+  Feature-detect flow (client-side):
+
+  1. First click on Open in Word: hit
+     `GET /webdav/documents/<id>.docx` with `OPTIONS`. If it 200s
+     with `DAV` header, cache "webdav-supported" for the session.
+  2. If WebDAV probe fails or WebClient service is down, fall back
+     silently to the current v1.0.6.3 download flow and log a
+     one-time toast: "Word will download the file to Downloads.
+     To edit in-place, start the Windows WebClient service."
+  3. If Word is not installed at all (registry probe for the
+     `Word.Application` COM class fails), also fall back to
+     download so LibreOffice users still get something.
+
+  Save-back flow (server-side):
+
+  * PUT handler writes the incoming bytes to a temp path first,
+    validates it's a valid `.docx` (open-zip, check for
+    `word/document.xml`), then atomically replaces the retained
+    original at
+    `%LOCALAPPDATA%\AdvisePointDocs\originals\<doc-id>.docx`.
+  * Previous version is preserved for 24h in
+    `%LOCALAPPDATA%\AdvisePointDocs\.trash\<doc-id>-<timestamp>.docx`
+    (same safeguard we use for drag-to-update).
+  * On successful PUT, kick the ingestion pipeline for that doc id
+    to refresh chunks and search index. This is async; the WebDAV
+    PUT response returns 200 to Word as soon as bytes are on disk,
+    so Word's Save dialog doesn't hang on chunk re-embedding.
+  * `updated_at` bumps; title / product_model / confidentiality /
+    bookmarks / document ID all preserved.
+
+  ### Fallback path: drag-to-update (unchanged from prior spec)
+
+  When WebDAV isn't available or the user is on LibreOffice /
+  Word Online, keep the drag-to-update flow: user downloads the doc
+  via Open in Word, edits it locally, drags the edited `.docx` back
+  onto the DOCX viewer toolbar's drop zone, and we update the
+  existing library record in place.
+
+  Similarity detection tier (server-side, uses existing extraction
+  pipeline):
+
+  * **Tier 1 (high similarity, silent update):** text overlap >=80%
+    OR matching `w:sdt` content-control IDs OR structural fingerprint
+    within 30% (heading count, paragraph count, image count). Small
+    toast confirmation, no dialog.
+  * **Tier 2 (medium similarity, confirm update):** 20–80% text
+    overlap. Modal offers Update existing / Import as new / Cancel,
+    with a compare summary ("Original: 4 sections, 2 images, 850
+    words. New: 6 sections, 3 images, 1,340 words.").
+  * **Tier 3 (low similarity, strong warning):** <20% text overlap.
+    Modal defaults to Cancel with warning "This doesn't look like an
+    edited version of X. Are you sure?", buttons Replace anyway /
+    Import as new / Cancel.
+
+  Safeguards (shared with WebDAV path):
+
+  * Retain the pre-update original in
+    `%LOCALAPPDATA%\AdvisePointDocs\.trash\<uuid>-<timestamp>.docx`
+    for 24h before cleanup sweep; expose "Undo replace" toast for 30s
+    after any Tier 2/3 replace.
+  * Never delete retained original until new ingestion completes and
+    validates; automatic rollback on ingestion failure.
+  * Preserve document ID, title, product_model, confidentiality,
+    ingested_at, bookmarks. Refresh chunks, retained original bytes,
+    updated_at, search index.
+
+  Not tracked in v1: version history. Recovery is limited to the
+  24h `.trash\` window. Full versions table is a v2 candidate.
+
+  ### Toolbar UX (unified)
+
+  Single **Open in Word** button; on click:
+
+  * If WebDAV probe succeeded AND Word is installed AND WebClient
+    service is up: navigate to the `ms-word:ofe|u|` URL, no download.
+  * Otherwise: fall through to the v1.0.6.3 download behavior with
+    a small one-time "Downloaded to Downloads folder. Drag back to
+    update." toast the first time the fallback fires per session.
+
+  Drop zone for drag-to-update lives in the same toolbar, only
+  visible/enabled when the doc-detail view is open. Not on the
+  library index (which stays wired to "create new").
+
+  ### Risks + open questions to resolve during scoping
+
+  * **WebClient service prompts UAC** on some Home editions when
+    starting. Detection + instructions in release notes are enough;
+    we shouldn't try to start it ourselves.
+  * **Port stability:** the WebDAV URLs bake in the current backend
+    port. If we ever move to random ports for the backend, `ms-word:`
+    links need to be generated fresh per session and cached mid-
+    session Word won't re-fetch the URL if the port changes.
+  * **Lock TTL:** Word aggressively holds LOCK on open docs. Need to
+    handle the case where a user force-closes Word and leaves a
+    stale lock; auto-expire locks server-side after N minutes of no
+    refresh (Word defaults to 30min refresh cadence).
+  * **Antivirus interference:** some AV products flag WebDAV
+    traffic on localhost. May need a doc'd exception.
+  * **First-run permission dialog:** browsers show a one-time "Allow
+    this site to open ms-word links?" prompt. Document this; users
+    who click Cancel get the fallback download flow silently.
+
+- **DOCX Continuous ↔ Simulated pages toggle** (user request,
+  2026-09-08) — when the source DOCX has no author-specified page
+  breaks (no `<w:lastRenderedPageBreak>` and no CSS/BR page-break
+  hints — typically docs authored in Word Online, LibreOffice,
+  pandoc, docx4j, or exported from other apps), v1.0.6.1's
+  synthesizer falls back to "Continuous view" with Prev/Next
+  disabled. Add an opt-in toolbar toggle so the user can switch
+  that view into a best-effort simulated-pagination mode: slice
+  the rendered content at fixed vertical intervals (approx.
+  11 inches at 96 DPI for Letter, or the doc's declared
+  `w:pgSz` height when available) or at heading boundaries,
+  wrap into synthetic `<section class="advisepoint-docx-
+  synthetic-page">` blocks, and re-enable Prev/Next. Default
+  remains continuous when no hints exist; toggle state is
+  per-session only (no persistence needed for v1). Only show
+  the toggle when the viewer detected zero pagination hints —
+  docs with real breaks should not offer this control.
+- **Stray PowerShell window after in-place update** (user report,
+  2026-09-08) — the external updater from v1.0.4
+  (`Update AdvisePoint Docs.bat` + `updater.cjs`) leaves a
+  PowerShell console window open after the update completes,
+  apparently monitoring the connection or child process. User's
+  request: figure out which piece spawns the window and either
+  suppress it (headless PowerShell invocation, `-WindowStyle
+  Hidden`, or replace the monitor with a non-console approach)
+  or ensure it closes cleanly when the updater exits. Not urgent
+  — the update itself succeeds — but visible enough to be worth
+  addressing in a soak-window release. Reproduce first: fresh
+  install → run `Update AdvisePoint Docs.bat` from an older
+  version to a newer one → observe leftover `powershell.exe`
+  window after the launcher relaunches the app.
 
 ### Definition of done — v1.0.4 release gate
 

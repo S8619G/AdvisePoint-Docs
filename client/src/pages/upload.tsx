@@ -88,9 +88,11 @@ const emptyMeta = (product_model = ""): Meta => ({
   tags: "",
 });
 
-const ACCEPT_EXT = [".pdf", ".docx", ".txt", ".md", ".markdown"];
+// v1.0.7.4: added .rtf (application/rtf, text/rtf). RTF ingests via the
+// homegrown stripper and gets a viewer with DOCX-style toolbar controls.
+const ACCEPT_EXT = [".pdf", ".docx", ".rtf", ".txt", ".md", ".markdown"];
 const ACCEPT_MIME =
-  "application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown";
+  "application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/rtf,text/rtf,text/plain,text/markdown";
 const MAX_BYTES = 150 * 1024 * 1024; // 150 MB — matches server cap
 
 // -----------------------------------------------------------------------------
@@ -249,7 +251,7 @@ export default function Upload() {
     if (rejected > 0) {
       toast({
         title: `Skipped ${rejected} file${rejected === 1 ? "" : "s"}`,
-        description: "Only PDF, DOCX, TXT, or Markdown files up to 150 MB are supported.",
+        description: "Only PDF, DOCX, RTF, TXT, or Markdown files up to 150 MB are supported.",
         variant: "destructive",
       });
     }
@@ -453,7 +455,7 @@ export default function Upload() {
             Upload documents
           </CardTitle>
           <CardDescription>
-            Drop one or many files at once — PDF, DOCX, TXT, or Markdown (up to 150 MB each). Every excerpt gets the metadata below attached, which powers the filters in Query.
+            Drop one or many files at once — PDF, DOCX, RTF, TXT, or Markdown (up to 150 MB each). Every excerpt gets the metadata below attached, which powers the filters in Query.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-5">
@@ -665,7 +667,7 @@ function Dropzone({
       <div className="text-sm font-medium">
         {hasFiles ? "Drop more files to add to the batch" : "Drop one or more files here, or click to browse"}
       </div>
-      <div className="mt-1 text-xs text-muted-foreground">PDF · DOCX · TXT · Markdown · up to 150 MB each</div>
+      <div className="mt-1 text-xs text-muted-foreground">PDF · DOCX · RTF · TXT · Markdown · up to 150 MB each</div>
     </div>
   );
 }

@@ -436,6 +436,9 @@ export interface IStorage {
   deleteDocument(id: string): void;
   insertChunks(rows: Chunk[]): void;
   getChunksForDoc(parent_id: string): Chunk[];
+  // v1.0.7: used by the re-ingest path (WebDAV Save-back, drag-to-update)
+  // so we can rebuild a document in place without touching its id.
+  deleteChunksForDoc(parent_id: string): void;
   allChunks(): Chunk[];
   stats(): { documents: number; chunks: number };
   // v0.9.7 — page-image sidecar
@@ -531,6 +534,9 @@ export class SqliteStorage implements IStorage {
   }
   getChunksForDoc(parent_id: string): Chunk[] {
     return db.select().from(chunks).where(eq(chunks.parent_id, parent_id)).all() as Chunk[];
+  }
+  deleteChunksForDoc(parent_id: string): void {
+    db.delete(chunks).where(eq(chunks.parent_id, parent_id)).run();
   }
   allChunks(): Chunk[] {
     return db.select().from(chunks).all() as Chunk[];

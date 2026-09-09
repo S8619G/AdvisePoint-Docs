@@ -36,7 +36,12 @@ import { DB_FILE_PATH } from "./storage";
 // Extensions we currently retain. Kept narrow on purpose -- for PDFs the
 // per-page WebP renders under pages/ already give the viewer everything it
 // needs, and for TXT/MD the chunk reassembly is a lossless round-trip.
-const RETAINED_EXTENSIONS = new Set(["docx"]);
+//
+// v1.0.7.4: added rtf. Retained so users get "Open in Word" and
+// edit-in-place (server/editInbox.ts) for RTF documents. The stripper
+// throws away formatting on ingest for chunking, so we need the original
+// bytes to hand back to Word.
+const RETAINED_EXTENSIONS = new Set(["docx", "rtf"]);
 
 export function isRetainableExtension(ext: string): boolean {
   return RETAINED_EXTENSIONS.has(ext.toLowerCase().replace(/^\./, ""));

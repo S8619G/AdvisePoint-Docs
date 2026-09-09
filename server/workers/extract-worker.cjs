@@ -47,6 +47,12 @@ function loadMammoth() {
   const mod = require("mammoth");
   return mod.default ?? mod;
 }
+function loadRtfStripper() {
+  // v1.0.7.4: homegrown RTF -> plain text (see rtf-stripper.cjs header for
+  // rationale). Zero third-party parser dep; iconv-lite is a transitive dep
+  // used across the codebase.
+  return require("./rtf-stripper.cjs").stripRtf;
+}
 
 // -----------------------------------------------------------------------------
 // PDF text normalization — verbatim copy from the old in-process extractor.
@@ -120,8 +126,19 @@ async function extractTextFromFile(filename, buffer) {
     };
   }
 
+  if (lower.endsWith(".rtf")) {
+    // v1.0.7.4: RTF -> plain text via homegrown stripper. See
+    // rtf-stripper.cjs for the bake-off rationale.
+    const stripRtf = loadRtfStripper();
+    return {
+      text: stripRtf(Buffer.from(buffer)),
+      page_count: null,
+      format: "rtf",
+    };
+  }
+
   throw new Error(
-    `Unsupported file type: ${filename}. Supported: .pdf, .docx, .txt, .md`,
+    `Unsupported file type: ${filename}. Supported: .pdf, .docx, .rtf, .txt, .md`,
   );
 }
 

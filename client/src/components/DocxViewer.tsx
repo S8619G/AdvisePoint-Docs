@@ -81,6 +81,7 @@ import {
 } from "lucide-react";
 import { Link } from "wouter";
 import { apiRequest } from "@/lib/queryClient";
+import { DocxDropUpdate } from "./DocxDropUpdate";
 
 // v1.0.6.1: DOCX zoom bounds are separate from use-zoom-pan's MIN_ZOOM
 // (which is 1 -- native pixel size, appropriate for scanned page
@@ -143,6 +144,16 @@ export function DocxViewerDialog({
   documentTitleColor,
   documentFileName,
 }: Props) {
+  // v1.0.7.4: this viewer now services both .docx and .rtf files. For RTF
+  // we skip the docx-preview render pipeline entirely (it's a zip parser
+  // and would throw on RTF bytes anyway) and always show the text-content
+  // reassembly. Toolbar controls (Print, Open in Word, edit-in-place
+  // pill, drag-to-update) still work because they're driven by the
+  // extension-agnostic server endpoints. See rtf-stripper.cjs for the
+  // ingest side.
+  const lowerName = (documentFileName ?? "").toLowerCase();
+  const isRtf = lowerName.endsWith(".rtf");
+  const documentExt: "docx" | "rtf" = isRtf ? "rtf" : "docx";
   // ---------- Data + render state ----------
   // meta.has_original drives the "legacy vs current" branch and is the
   // one thing we absolutely need from /content before we can decide what
@@ -161,6 +172,27 @@ export function DocxViewerDialog({
   // section from the render.
   const [continuous, setContinuous] = useState<boolean>(false);
 
+  // v1.0.7: bump this to force /content re-probe + docx-preview re-render
+  // after a successful drag-to-update. The effects below depend on it.
+  const [reloadKey, setReloadKey] = useState<number>(0);
+
+  // v1.0.7: undo toast state, populated by DocxDropUpdate after a
+  // successful update. Auto-dismisses after undo_expires_seconds or on
+  // successful undo.
+  const [undoState, setUndoState] = useState<{
+    token: string;
+    expiresAt: number; // epoch ms
+  } | null>(null);
+  const [undoNow, setUndoNow] = useState<number>(() => Date.now());
+  useEffect(() => {
+    if (!undoState) return;
+    const iv = window.setInterval(() => setUndoNow(Date.now()), 1000);
+    return () => window.clearInterval(iv);
+  }, [undoState]);
+  useEffect(() => {
+    if (undoState && undoNow >= undoState.expiresAt) setUndoState(null);
+  }, [undoState, undoNow]);
+
   // Container refs for docx-preview.
   //  - renderRef: the pane where docx-preview appends its <section> pages.
   //  - styleRef: dedicated <style> host, keeps docx CSS scoped to us.
@@ -172,6 +204,10 @@ export function DocxViewerDialog({
   const styleRef = useRef<HTMLDivElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const printFrameRef = useRef<HTMLIFrameElement | null>(null);
+  // v1.0.7.4: separate ref for the RTF text pane; keeps the docx-preview
+  // print handler above from mistakenly reading a `<pre>` node when a real
+  // docx legitimately fell back to text.
+  const rtfBodyRef = useRef<HTMLDivElement | null>(null);
 
   // Zoom is applied as a CSS scale on the render pane. We keep track of
   // it in state so the toolbar readout stays in sync and we can honor
@@ -220,7 +256,7 @@ export function DocxViewerDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, documentId]);
+  }, [open, documentId, reloadKey]);
 
   // ---------- Effect: run docx-preview once container + meta are ready ----------
   //
@@ -235,6 +271,18 @@ export function DocxViewerDialog({
   useEffect(() => {
     if (!open) return;
     if (!meta?.has_original) return;
+
+    // v1.0.7.4: RTF short-circuits docx-preview -- go directly to the
+    // reassembled-text view. The "fallback" state name is a misnomer for
+    // RTF (nothing failed) but the render path is identical, and we
+    // suppress the yellow "couldn't render" banner below by branching
+    // on isRtf.
+    if (isRtf) {
+      setRenderError(null);
+      setRenderState("fallback");
+      return;
+    }
+
     if (!renderRef.current || !styleRef.current) return;
 
     let cancelled = false;
@@ -310,7 +358,7 @@ export function DocxViewerDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, meta?.has_original, documentId]);
+  }, [open, meta?.has_original, documentId, reloadKey]);
 
   // ---------- Effect: scroll the render pane to a page-anchored section ----------
   //
@@ -421,51 +469,259 @@ export function DocxViewerDialog({
     });
   }, [fitZoom]);
 
-  // ---------- Open in Word (v1.0.6.3) ----------
+  // ---------- Open in Word (v1.0.7.3 — local-file + folder watcher) ----------
   //
-  // Download the retained original .docx via /api/documents/:id/original
-  // and hand it off to the OS. On Windows, the browser drops the file
-  // into Downloads and (via Chrome/Edge "Always open files of this
-  // type" or Windows shell association) launches whatever is registered
-  // for .docx -- Word for most of our users, LibreOffice/WordPad as a
-  // fallback. This is a strict download, not a preview: the /original
-  // route serves inline by default, so we override with the download
-  // attribute + a filename hint so the browser writes it out cleanly.
+  // v1.0.6.3 shipped a plain "download and let the OS launch Word" flow.
+  // v1.0.7 tried WebDAV edit-in-place; Word 2016+ rejects loopback
+  // WebDAV URLs regardless of protocol correctness. v1.0.7.3 replaces
+  // both with a local-file + fs.watch approach:
   //
-  // Note on round-trip edits: any Save the user makes in Word lands on
-  // their local copy, NOT back in the library. Bringing an edited copy
-  // back into the library is deferred to v1.0.7 (drag-to-update flow
-  // with similarity detection).
-  const handleOpenInWord = useCallback(() => {
+  //   1. POST /api/documents/:id/edit-open -- server copies the
+  //      retained original to <dataDir>/edit-inbox/<id>.docx and spawns
+  //      the OS default handler (Word) on that path. Word treats it as
+  //      a fully editable local file. Server begins watching for saves.
+  //   2. Poll /api/documents/:id/edit-status?session=<id> every 2 s to
+  //      show the user a live status pill: opening / watching /
+  //      saving / saved. When Word closes the file (release of
+  //      exclusive lock) the server auto-ends the session and deletes
+  //      the inbox copy.
+  //   3. Errors (no retained original, ingest failure) surface in the
+  //      pill with a Download-instead fallback link.
+  const [editSession, setEditSession] = useState<{
+    sessionId: string;
+    status: "opening" | "watching" | "saving" | "saved" | "error" | "ended";
+    saveCount: number;
+    lastSavedAt: string | null;
+    lastError: string | null;
+  } | null>(null);
+  const editPollTimer = useRef<number | null>(null);
+  const editSessionRef = useRef<string | null>(null);
+  editSessionRef.current = editSession?.sessionId ?? null;
+
+  useEffect(() => {
+    // Close any edit session when the viewer closes or the doc changes.
+    return () => {
+      if (editPollTimer.current !== null) {
+        window.clearTimeout(editPollTimer.current);
+        editPollTimer.current = null;
+      }
+      const sid = editSessionRef.current;
+      if (sid) {
+        void fetch(`/api/documents/${encodeURIComponent(documentId)}/edit-close`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sid }),
+          keepalive: true,
+        }).catch(() => {});
+      }
+    };
+  // Intentionally only re-run when the viewer closes / doc changes; the
+  // sessionId is captured through the ref above.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, documentId]);
+
+  const downloadOriginal = useCallback(() => {
     if (!meta?.has_original) return;
     const url = `/api/documents/${encodeURIComponent(documentId)}/original`;
-    // Prefer the doc's original filename if we have it; fall back to the
-    // display title with .docx suffix so "Save As" defaults to something
-    // recognizable.
+    // v1.0.7.4: honor the doc's real extension so RTF downloads keep
+    // their .rtf suffix (Word opens them natively either way, but the
+    // Downloads folder should say what it is).
+    const dotExt = isRtf ? ".rtf" : ".docx";
     const rawName =
       documentFileName ||
-      (documentTitle ? `${documentTitle}.docx` : "document.docx");
-    // Strip characters that browsers strip anyway, and guarantee the
-    // .docx extension so Windows shell association fires correctly.
+      (documentTitle ? `${documentTitle}${dotExt}` : `document${dotExt}`);
     const cleanName = rawName.replace(/[\\/:*?"<>|]+/g, "_");
-    const withExt = /\.docx$/i.test(cleanName)
-      ? cleanName
-      : `${cleanName}.docx`;
+    const extRe = isRtf ? /\.rtf$/i : /\.docx$/i;
+    const withExt = extRe.test(cleanName) ? cleanName : `${cleanName}${dotExt}`;
     const a = document.createElement("a");
     a.href = url;
     a.download = withExt;
-    // rel=noopener defends against target-hijacking even though we're
-    // same-origin; harmless and future-proof if we ever add target=_blank.
     a.rel = "noopener";
     a.style.display = "none";
     document.body.appendChild(a);
     try {
       a.click();
     } finally {
-      // Detach on next tick so the click event fully propagates first.
       setTimeout(() => a.remove(), 0);
     }
-  }, [meta?.has_original, documentId, documentFileName, documentTitle]);
+  }, [meta?.has_original, documentId, documentFileName, documentTitle, isRtf]);
+
+  const pollEditStatus = useCallback(
+    async (sessionId: string): Promise<void> => {
+      try {
+        const res = await fetch(
+          `/api/documents/${encodeURIComponent(documentId)}/edit-status?session=${encodeURIComponent(sessionId)}`,
+          { method: "GET" },
+        );
+        if (res.status === 404) {
+          // Session ended (auto-cleanup after Word closed the file). If
+          // there were saves, refresh the viewer so the user sees the
+          // updated content.
+          setEditSession((prev) => {
+            if (prev && prev.saveCount > 0) setReloadKey((k) => k + 1);
+            return null;
+          });
+          return;
+        }
+        if (!res.ok) throw new Error(`edit-status failed (${res.status})`);
+        const body = (await res.json()) as {
+          status: "starting" | "watching" | "saving" | "saved" | "error" | "ended";
+          save_count: number;
+          last_saved_at: string | null;
+          last_error: string | null;
+        };
+        const uiStatus =
+          body.status === "starting"
+            ? "opening"
+            : body.status === "ended"
+              ? "ended"
+              : body.status;
+        setEditSession((prev) => {
+          // Detect new save -> bump reloadKey so the viewer re-renders
+          // with the fresh chunks + original bytes.
+          if (prev && body.save_count > prev.saveCount) {
+            setReloadKey((k) => k + 1);
+          }
+          return {
+            sessionId,
+            status: uiStatus,
+            saveCount: body.save_count,
+            lastSavedAt: body.last_saved_at,
+            lastError: body.last_error,
+          };
+        });
+        if (body.status !== "ended") {
+          editPollTimer.current = window.setTimeout(() => {
+            void pollEditStatus(sessionId);
+          }, 2000);
+        }
+      } catch (err) {
+        console.warn("[edit-inbox] status poll failed", err);
+        // Keep polling; the server may briefly be unreachable.
+        editPollTimer.current = window.setTimeout(() => {
+          void pollEditStatus(sessionId);
+        }, 4000);
+      }
+    },
+    [documentId],
+  );
+
+  const handleOpenInWord = useCallback(async () => {
+    if (!meta?.has_original) return;
+    // Reset any previous session state UI while we start a new one.
+    if (editPollTimer.current !== null) {
+      window.clearTimeout(editPollTimer.current);
+      editPollTimer.current = null;
+    }
+    setEditSession({
+      sessionId: "",
+      status: "opening",
+      saveCount: 0,
+      lastSavedAt: null,
+      lastError: null,
+    });
+    try {
+      const res = await fetch(
+        `/api/documents/${encodeURIComponent(documentId)}/edit-open`,
+        { method: "POST" },
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}) as { error?: string });
+        throw new Error(body.error || `edit-open failed (${res.status})`);
+      }
+      const body = (await res.json()) as { session_id: string };
+      setEditSession({
+        sessionId: body.session_id,
+        status: "opening",
+        saveCount: 0,
+        lastSavedAt: null,
+        lastError: null,
+      });
+      // Start polling.
+      editPollTimer.current = window.setTimeout(() => {
+        void pollEditStatus(body.session_id);
+      }, 500);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setEditSession({
+        sessionId: "",
+        status: "error",
+        saveCount: 0,
+        lastSavedAt: null,
+        lastError: msg,
+      });
+    }
+  }, [meta?.has_original, documentId, pollEditStatus]);
+
+  const dismissEditSession = useCallback(() => {
+    if (editPollTimer.current !== null) {
+      window.clearTimeout(editPollTimer.current);
+      editPollTimer.current = null;
+    }
+    const sid = editSession?.sessionId;
+    setEditSession(null);
+    if (sid) {
+      void fetch(`/api/documents/${encodeURIComponent(documentId)}/edit-close`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sid }),
+      }).catch(() => {});
+    }
+  }, [editSession?.sessionId, documentId]);
+
+  // v1.0.8: auto-dismiss the edit-status pill ~5 s after the session
+  // ends. Prior to this, the pill sat on screen indefinitely in the
+  // "ended" state until the user manually X'd it -- which most users
+  // never did, so the pill lingered across close+reopen of the viewer
+  // even though the underlying session was long gone.
+  useEffect(() => {
+    if (editSession?.status !== "ended") return;
+    const t = window.setTimeout(() => {
+      // Clear state directly (not dismissEditSession) -- the server
+      // session is already ended, so posting edit-close would 404.
+      setEditSession(null);
+    }, 5000);
+    return () => window.clearTimeout(t);
+  }, [editSession?.status]);
+
+  // v1.0.7: undo handler wired to the undo toast (calls
+  // /api/documents/:id/undo-replace which restores the pre-update backup
+  // from .trash/ and bumps reloadKey so the viewer refetches).
+  const handleUndoReplace = useCallback(async () => {
+    if (!undoState) return;
+    try {
+      const res = await fetch(
+        `/api/documents/${encodeURIComponent(documentId)}/undo-replace`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: undoState.token }),
+        },
+      );
+      if (!res.ok) throw new Error(`undo failed (${res.status})`);
+      setUndoState(null);
+      setReloadKey((k) => k + 1);
+    } catch {
+      // Silently drop -- the toast has a short lifetime anyway. Real
+      // errors show up in the server log; a follow-up drag re-does the
+      // update and produces a fresh undo token.
+      setUndoState(null);
+    }
+  }, [documentId, undoState]);
+
+  // v1.0.7: called by DocxDropUpdate when a replace succeeds.
+  const handleUpdated = useCallback(
+    (token: string | null, expiresSeconds: number) => {
+      setReloadKey((k) => k + 1);
+      if (token && expiresSeconds > 0) {
+        setUndoState({
+          token,
+          expiresAt: Date.now() + expiresSeconds * 1000,
+        });
+      }
+    },
+    [],
+  );
 
   // ---------- Print ----------
   //
@@ -482,13 +738,39 @@ export function DocxViewerDialog({
   //   3. On iframe 'load', call print() on its contentWindow.
   //   4. Clean up on 'afterprint' or after a 30s watchdog.
   const handlePrint = useCallback(() => {
-    if (renderState !== "ready") return;
-    const renderHtml = renderRef.current?.innerHTML ?? "";
-    const styleHtml = styleRef.current?.innerHTML ?? "";
-    if (!renderHtml) return;
     const safeTitle = escapeHtml(
       documentTitle || documentFileName || "Document",
     );
+
+    // v1.0.7.4: RTF prints from the reassembled plain text, not from a
+    // docx-preview render. We build a minimal srcdoc that mirrors the
+    // in-viewer <pre> block (same wrapping + font metrics), then run
+    // it through the same hidden-iframe print flow used for .docx.
+    let srcdoc: string;
+    if (isRtf) {
+      if (renderState !== "fallback" || !meta?.markdown) return;
+      const bodyHtml = escapeHtml(meta.markdown);
+      const rtfStyles =
+        `@page { margin: 15mm; }\n` +
+        `html, body { margin: 0; padding: 0; background: #fff; color: #000; }\n` +
+        `pre {\n` +
+        `  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;\n` +
+        `  font-size: 12pt;\n` +
+        `  line-height: 1.45;\n` +
+        `  white-space: pre-wrap;\n` +
+        `  word-wrap: break-word;\n` +
+        `  margin: 0;\n` +
+        `}\n`;
+      srcdoc =
+        `<!doctype html><html><head><meta charset="utf-8">` +
+        `<title>${safeTitle}</title>` +
+        `<style>${rtfStyles}</style>` +
+        `</head><body><pre>${bodyHtml}</pre></body></html>`;
+    } else {
+      if (renderState !== "ready") return;
+      const renderHtml = renderRef.current?.innerHTML ?? "";
+      const styleHtml = styleRef.current?.innerHTML ?? "";
+      if (!renderHtml) return;
 
     // v1.0.6.1 hotfix-on-a-hotfix: docx-preview's styleRef.innerHTML is
     // NOT plain CSS text -- it's a sequence of real `<style>...</style>`
@@ -542,12 +824,13 @@ export function DocxViewerDialog({
       `  page-break-after: auto;\n` +
       `}\n`;
 
-    const srcdoc =
-      `<!doctype html><html><head><meta charset="utf-8">` +
-      `<title>${safeTitle}</title>` +
-      styleHtml +
-      `<style>${printOverrides}</style>` +
-      `</head><body>${renderHtml}</body></html>`;
+      srcdoc =
+        `<!doctype html><html><head><meta charset="utf-8">` +
+        `<title>${safeTitle}</title>` +
+        styleHtml +
+        `<style>${printOverrides}</style>` +
+        `</head><body>${renderHtml}</body></html>`;
+    }
 
     // Remove any stale iframe from a previous print click.
     if (printFrameRef.current) {
@@ -619,7 +902,7 @@ export function DocxViewerDialog({
 
     document.body.appendChild(iframe);
     printFrameRef.current = iframe;
-  }, [renderState, documentTitle, documentFileName]);
+  }, [renderState, documentTitle, documentFileName, isRtf, meta?.markdown]);
 
   // Clean up any lingering print iframe when the dialog closes.
   useEffect(() => {
@@ -650,14 +933,25 @@ export function DocxViewerDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-5xl p-0 gap-0 h-[90vh] flex flex-col">
         <DialogHeader className="px-5 py-3 border-b border-border shrink-0">
-          <DialogTitle
-            className="text-sm font-medium truncate pr-8"
-            style={{ color: documentTitleColor ?? undefined }}
-          >
-            {documentTitle}
-          </DialogTitle>
+          <div className="flex items-baseline justify-between gap-3 pr-8">
+            <DialogTitle
+              className="text-sm font-medium truncate"
+              style={{ color: documentTitleColor ?? undefined }}
+            >
+              {documentTitle}
+            </DialogTitle>
+            {/* v1.0.7.4: persistent, muted drop hint so users discover the
+                drag-to-update affordance without having to drag first. Only
+                shown when we actually have a retained original the drop
+                would replace. */}
+            {meta?.has_original && (
+              <div className="shrink-0 text-[11px] text-muted-foreground/80 whitespace-nowrap">
+                Drop a {isRtf ? ".rtf" : ".docx"} here to update
+              </div>
+            )}
+          </div>
           <DialogDescription className="sr-only">
-            Word document viewer for {documentTitle}.
+            {isRtf ? "RTF" : "Word"} document viewer for {documentTitle}.
           </DialogDescription>
         </DialogHeader>
 
@@ -701,13 +995,22 @@ export function DocxViewerDialog({
 
           {renderState === "fallback" && meta && (
             <div className="h-full flex flex-col">
-              <div className="shrink-0 bg-amber-50 border-b border-amber-200 text-amber-900 text-xs px-4 py-2 flex items-center gap-2">
-                <AlertTriangle className="h-4 w-4" />
-                <span>
-                  Showing text fallback -- the original couldn't render{renderError ? ` (${renderError})` : ""}.
-                </span>
-              </div>
-              <div className="flex-1 min-h-0 overflow-auto bg-background px-6 py-4">
+              {/* v1.0.7.4: for .rtf files this pane is the normal render, not
+                  a fallback -- suppress the yellow "couldn't render" banner.
+                  For .docx files the banner still appears since it does mean
+                  docx-preview failed. */}
+              {!isRtf && (
+                <div className="shrink-0 bg-amber-50 border-b border-amber-200 text-amber-900 text-xs px-4 py-2 flex items-center gap-2">
+                  <AlertTriangle className="h-4 w-4" />
+                  <span>
+                    Showing text fallback -- the original couldn't render{renderError ? ` (${renderError})` : ""}.
+                  </span>
+                </div>
+              )}
+              <div
+                ref={rtfBodyRef}
+                className="flex-1 min-h-0 overflow-auto bg-background px-6 py-4"
+              >
                 <pre className="whitespace-pre-wrap font-sans text-sm leading-relaxed">
                   {meta.markdown}
                 </pre>
@@ -809,7 +1112,7 @@ export function DocxViewerDialog({
               type="button"
               onClick={handleOpenInWord}
               disabled={!meta?.has_original}
-              title="Download the original .docx so you can open, edit, print, or Save As in Microsoft Word (or your system’s default Word handler)."
+              title={`Open the original ${isRtf ? ".rtf" : ".docx"} in Microsoft Word (or your system's default Word handler) for edit, print, or Save As.`}
               className="inline-flex items-center gap-1 h-7 px-2 rounded hover:bg-muted disabled:opacity-40"
             >
               <ExternalLink className="h-3.5 w-3.5" /> Open in Word
@@ -817,11 +1120,118 @@ export function DocxViewerDialog({
             <button
               type="button"
               onClick={handlePrint}
-              disabled={renderState !== "ready"}
+              disabled={
+                isRtf
+                  ? renderState !== "fallback" || !meta?.markdown
+                  : renderState !== "ready"
+              }
               title="Print"
               className="inline-flex items-center gap-1 h-7 px-2 rounded hover:bg-muted disabled:opacity-40"
             >
               <Printer className="h-3.5 w-3.5" /> Print
+            </button>
+          </div>
+        )}
+        {/* v1.0.7: drag-to-update overlay + confirm modals. Rendered
+            inside DialogContent so it lives above the docx canvas but
+            still under any nested toolbars. Only active while the dialog
+            is open. */}
+        <DocxDropUpdate
+          documentId={documentId}
+          documentTitle={documentTitle}
+          documentExt={documentExt}
+          active={open && !!meta?.has_original}
+          onUpdated={handleUpdated}
+        />
+
+        {/* v1.0.7.3: Open-in-Word status pill. Shows the current watcher
+            state (opening / watching / saving / saved / error). Dismisses
+            with an X; also auto-closes when the server ends the session
+            after Word closes the file. */}
+        {editSession && (
+          <div className="pointer-events-auto absolute bottom-14 right-4 z-[65] max-w-sm rounded-lg border border-border bg-background p-3 pr-7 shadow-lg">
+            <div className="text-xs text-muted-foreground leading-relaxed">
+              {editSession.status === "opening" && (
+                <>Opening in Word… the file was copied and handed to Word.</>
+              )}
+              {editSession.status === "watching" && (
+                <>
+                  Editing in Word — waiting for save.
+                  {editSession.saveCount > 0 && (
+                    <> Saved back {editSession.saveCount}× so far.</>
+                  )}
+                </>
+              )}
+              {editSession.status === "saving" && (
+                <>Save detected — re-ingesting into the library…</>
+              )}
+              {editSession.status === "saved" && (
+                <>
+                  Saved back to the library ({editSession.saveCount}×).
+                  Keep editing in Word or close the file when done.
+                </>
+              )}
+              {editSession.status === "error" && (
+                <>
+                  Couldn’t hand off to Word:{" "}
+                  <span className="text-destructive">
+                    {editSession.lastError || "unknown error"}
+                  </span>
+                  .{" "}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      downloadOriginal();
+                      dismissEditSession();
+                    }}
+                    className="underline text-primary"
+                  >
+                    download the file instead
+                  </button>
+                  .
+                </>
+              )}
+              {editSession.status === "ended" && (
+                <>
+                  Word closed the file.
+                  {editSession.saveCount > 0
+                    ? ` ${editSession.saveCount} save${editSession.saveCount === 1 ? "" : "s"} were re-ingested into the library.`
+                    : " No changes were saved."}
+                </>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={dismissEditSession}
+              className="absolute top-1 right-1 text-muted-foreground hover:text-foreground"
+              aria-label="Dismiss"
+            >
+              <span className="text-xs">✕</span>
+            </button>
+          </div>
+        )}
+
+        {/* v1.0.7: undo toast for drag-to-update. */}
+        {undoState && (
+          <div className="pointer-events-auto absolute bottom-14 left-1/2 -translate-x-1/2 z-[65] flex items-center gap-3 rounded-lg border border-border bg-background px-3 py-2 shadow-lg">
+            <div className="text-sm">Document updated.</div>
+            <button
+              type="button"
+              onClick={handleUndoReplace}
+              className="text-sm font-medium text-primary hover:underline"
+            >
+              Undo
+            </button>
+            <div className="text-xs text-muted-foreground">
+              {Math.max(0, Math.ceil((undoState.expiresAt - undoNow) / 1000))}s
+            </div>
+            <button
+              type="button"
+              onClick={() => setUndoState(null)}
+              className="text-muted-foreground hover:text-foreground"
+              aria-label="Dismiss"
+            >
+              <span className="text-xs">✕</span>
             </button>
           </div>
         )}

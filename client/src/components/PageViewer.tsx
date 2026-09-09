@@ -104,7 +104,11 @@ interface Props {
 // internally). TXT/MD stay on the v1.0.5 text viewer.
 export function PageViewerDialog(props: Props) {
   const fileName = (props.documentFileName ?? "").toLowerCase();
-  if (fileName.endsWith(".docx")) {
+  // v1.0.7.4: RTF also routes through DocxViewerDialog. It short-circuits
+  // the docx-preview render path for .rtf and shows the reassembled text
+  // instead, while reusing the toolbar (Open in Word, Print), edit-in-place
+  // pill, and drag-to-update infrastructure.
+  if (fileName.endsWith(".docx") || fileName.endsWith(".rtf")) {
     return <DocxViewerDialog {...props} />;
   }
   const isNonPdfText =
@@ -1122,6 +1126,100 @@ function DocumentContentViewerDialog({
   const [searchInput, setSearchInput] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
 
+  // v1.0.8: hidden-iframe print for TXT/MD viewers, mirroring the
+  // pattern DocxViewer uses. srcdoc keeps CSP quiet and the invisible
+  // iframe avoids popup blockers.
+  const printFrameRef = useRef<HTMLIFrameElement | null>(null);
+  useEffect(() => {
+    if (open) return;
+    // Dialog closed -- kill any lingering print iframe.
+    if (printFrameRef.current) {
+      printFrameRef.current.remove();
+      printFrameRef.current = null;
+    }
+  }, [open]);
+
+  const handlePrint = useCallback(() => {
+    if (!payload) return;
+    const safe = (s: string): string =>
+      s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    const safeTitle = safe(documentTitle || documentFileName || "Document");
+    const bodyHtml = safe(payload.markdown);
+    const styles =
+      `@page { margin: 15mm; }\n` +
+      `html, body { margin: 0; padding: 0; background: #fff; color: #000; }\n` +
+      `pre {\n` +
+      `  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;\n` +
+      `  font-size: 12pt;\n` +
+      `  line-height: 1.45;\n` +
+      `  white-space: pre-wrap;\n` +
+      `  word-wrap: break-word;\n` +
+      `  margin: 0;\n` +
+      `}\n`;
+    const srcdoc =
+      `<!doctype html><html><head><meta charset="utf-8">` +
+      `<title>${safeTitle}</title>` +
+      `<style>${styles}</style>` +
+      `</head><body><pre>${bodyHtml}</pre></body></html>`;
+
+    if (printFrameRef.current) {
+      printFrameRef.current.remove();
+      printFrameRef.current = null;
+    }
+    const iframe = document.createElement("iframe");
+    iframe.setAttribute("aria-hidden", "true");
+    iframe.style.position = "fixed";
+    iframe.style.right = "0";
+    iframe.style.bottom = "0";
+    iframe.style.width = "0";
+    iframe.style.height = "0";
+    iframe.style.border = "0";
+    iframe.style.visibility = "hidden";
+    iframe.srcdoc = srcdoc;
+
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      try {
+        iframe.remove();
+      } catch {
+        /* ignore */
+      }
+      if (printFrameRef.current === iframe) printFrameRef.current = null;
+    };
+
+    iframe.addEventListener("load", () => {
+      const win = iframe.contentWindow;
+      if (!win) {
+        cleanup();
+        return;
+      }
+      try {
+        win.addEventListener("afterprint", cleanup);
+      } catch {
+        /* ignore */
+      }
+      win.requestAnimationFrame(() => {
+        try {
+          win.focus();
+          win.print();
+        } catch (err) {
+          console.warn("Print failed:", err);
+          cleanup();
+        }
+      });
+    });
+    window.setTimeout(cleanup, 30_000);
+    document.body.appendChild(iframe);
+    printFrameRef.current = iframe;
+  }, [payload, documentTitle, documentFileName]);
+
   // Reset state whenever the dialog is (re)opened for a fresh document.
   useEffect(() => {
     if (!open) return;
@@ -1208,6 +1306,18 @@ function DocumentContentViewerDialog({
             className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-xs outline-none focus:ring-1 focus:ring-ring"
             data-testid="input-content-highlight"
           />
+          {/* v1.0.8: Print for TXT / MD viewers. Match the PDF + DOCX
+              toolbar button styling (h-7 px-2 + Printer icon + "Print"). */}
+          <button
+            type="button"
+            onClick={handlePrint}
+            disabled={!payload}
+            title="Print"
+            className="inline-flex items-center gap-1 h-7 px-2 rounded hover:bg-muted disabled:opacity-40 text-xs"
+            data-testid="button-print-content"
+          >
+            <Printer className="h-3.5 w-3.5" /> Print
+          </button>
         </div>
 
         <div className="flex-1 min-h-0 overflow-auto px-6 py-5">

@@ -14,7 +14,21 @@ import {
   originalFilePath,
   originalSize,
   retainableExt,
+  isRetainableExtension,
 } from "./originals";
+import {
+  backupBeforeReplace,
+  undoReplace,
+  listTrashForDocument,
+  sweepTrash,
+  TRASH_TTL_SECONDS,
+} from "./trash";
+import { buildDocxSignature, compareSignatures, summarizeResult } from "./similarity";
+import {
+  startEditSession,
+  pollEditStatus,
+  endEditSession,
+} from "./editInbox";
 import { existsSync, createReadStream, statSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join, resolve } from "node:path";
@@ -622,8 +636,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         });
       }
 
-      let format: "docx" | "text" | "markdown" = "markdown";
+      // v1.0.7.4: added "rtf" as a first-class format value. The RTF viewer
+      // reuses the plain-text canvas (like TXT) but gets the DOCX toolbar
+      // (Print, Open in Word, edit-in-place pill, drag-to-update).
+      let format: "docx" | "text" | "markdown" | "rtf" = "markdown";
       if (fileName.endsWith(".docx")) format = "docx";
+      else if (fileName.endsWith(".rtf")) format = "rtf";
       else if (fileName.endsWith(".txt")) format = "text";
       else if (fileName.endsWith(".md") || fileName.endsWith(".markdown")) format = "markdown";
 
@@ -702,6 +720,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const MIME_BY_EXT: Record<string, string> = {
       docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       pdf: "application/pdf",
+      // v1.0.7.4: RTF retained for edit-in-place + "Open in Word" workflow.
+      rtf: "application/rtf",
     };
     try {
       const stat = statSync(filePath);
@@ -730,10 +750,23 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   //    by declared MIME type. Prevents "renamed .exe as .pdf" from making it
   //    into the multer buffer at all.
   //  - fileSize cap unchanged at 150 MB per file.
-  const ALLOWED_EXT = new Set([".pdf", ".docx", ".txt", ".md", ".markdown"]);
+  // v1.0.7.4: added .rtf (application/rtf, text/rtf). Extract worker
+  // routes RTF through the homegrown stripper (server/workers/rtf-stripper.cjs).
+  const ALLOWED_EXT = new Set([".pdf", ".docx", ".txt", ".md", ".markdown", ".rtf"]);
   const ALLOWED_MIME = new Set([
     "application/pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    // v1.0.7.4: RTF ships with a surprising number of MIME variants in the
+    // wild. Word/Windows Explorer typically sends application/rtf; Firefox
+    // has historically sent text/richtext (Netscape-era name); some Windows
+    // registry setups send application/x-rtf; some send nothing at all,
+    // which hits application/octet-stream below. Accept every RTF variant
+    // we've seen; the extension check + magic-byte check in the ingest
+    // worker are the real guardrails.
+    "application/rtf",
+    "text/rtf",
+    "text/richtext",
+    "application/x-rtf",
     "text/plain",
     "text/markdown",
     "text/x-markdown",
@@ -751,7 +784,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const ext = dotIdx >= 0 ? lower.slice(dotIdx) : "";
       const extOk = ALLOWED_EXT.has(ext);
       const mimeOk = ALLOWED_MIME.has(file.mimetype);
-      if (extOk && mimeOk) return cb(null, true);
+      // v1.0.7.4.3 / v1.0.8: accept when EITHER the extension OR the MIME
+      // is on the allow-list. This logic applies uniformly to every
+      // supported extension (.pdf, .docx, .rtf, .txt, .md) -- browsers
+      // routinely disagree with each other on MIME strings for the same
+      // file (Firefox on Windows sends text/richtext for RTF; Word
+      // versions register application/x-rtf; some Chromium builds send
+      // application/octet-stream for DOCX opened from Explorer), and
+      // there is no authoritative list. The extract worker enforces the
+      // actual content type by magic bytes downstream (rtf-stripper.cjs
+      // requires "{\\rtf" as the first 5 bytes; docx unzips as a ZIP;
+      // pdfjs requires %PDF), so a mismatched declared MIME can't smuggle
+      // in a truly unsupported file.
+      if (extOk || mimeOk) return cb(null, true);
+      // Log the rejection so we can see what the browser actually sent --
+      // makes future MIME-variant additions a 30-second fix instead of a
+      // guess-and-check exercise.
+      console.warn(
+        `[upload] rejected file: name="${file.originalname}" ` +
+          `ext="${ext}" mime="${file.mimetype}" ` +
+          `(extOk=${extOk} mimeOk=${mimeOk})`,
+      );
       // Reject without throwing — multer will pass a null file downstream and
       // the route hands back a 415 with a friendly explanation.
       return cb(null, false);
@@ -765,7 +818,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         // rejected the type. The client sends a file field ~always, so a
         // missing file at this point almost certainly means bad MIME/extension.
         return res.status(415).json({
-          message: "unsupported file type \u2014 only PDF, DOCX, TXT, or Markdown files are accepted",
+          // v1.0.7.4.2: message updated to include RTF. Prior wording
+          // predated RTF support and misled users when an RTF drop failed
+          // MIME validation (some Windows/Firefox setups send RTF as
+          // text/richtext or application/x-rtf, which weren't in the
+          // allow-list until now).
+          message: "unsupported file type \u2014 only PDF, DOCX, RTF, TXT, or Markdown files are accepted",
         });
       }
 
@@ -988,6 +1046,448 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       chunks: chunkRows.map(hydrateChunk),
     };
   }
+
+  // ---------------------------------------------------------------------
+  // v1.0.7: replace the chunks + stats + hash for an EXISTING document.
+  //
+  // Shared by the WebDAV PUT save-back path and the drag-to-update path.
+  // The document row keeps its id, all metadata (title, product model,
+  // audience, tags, etc.), and its position in the library ordering.
+  // Only content-derived fields change: file_hash_sha256, total_chunks,
+  // total_tokens, updated_at, and the chunks table for this parent_id.
+  //
+  // Callers are responsible for putting the new original bytes on disk
+  // BEFORE calling this (WebDAV PUT does it inline, drag-to-update does
+  // it in the /api/documents/:id/update handler). We only handle the
+  // DB-side rebuild here.
+  // ---------------------------------------------------------------------
+  async function reingestDocxIntoExisting(
+    documentId: string,
+    bytes: Buffer,
+    fileName: string,
+  ): Promise<void> {
+    const existing = storage.getDocument(documentId);
+    if (!existing) {
+      throw new Error(`reingest: document ${documentId} not found`);
+    }
+
+    // Extract text using the same pipeline as fresh upload.
+    const extracted = await extractTextFromFile(fileName, bytes);
+    const body = extracted.text ?? "";
+    if (!body || body.trim().length < 20) {
+      throw new Error(
+        `reingest: extracted <20 chars from ${fileName} -- refusing to wipe existing chunks`,
+      );
+    }
+
+    // Delete existing chunks in one shot.
+    storage.deleteChunksForDoc(documentId);
+
+    // Recompute chunks + tf-idf against the current corpus (minus our own,
+    // which we just deleted).
+    const drafts = chunkDocument(body, {
+      chunk_size_tokens: 300,
+      chunk_overlap_tokens: 40,
+    });
+    const corpus = storage.allChunks();
+    const df = new Map<string, number>();
+    const totalDocs = corpus.length + drafts.length;
+    for (const c of corpus) {
+      const terms = Object.keys(safeJson<Record<string, number>>(c.embedding_json, {}));
+      for (const t of terms) df.set(t, (df.get(t) ?? 0) + 1);
+    }
+    for (const d of drafts) {
+      const terms = Object.keys(termFrequency(d.content));
+      for (const t of terms) df.set(t, (df.get(t) ?? 0) + 1);
+    }
+
+    const now = new Date().toISOString();
+    // Reuse the existing doc's classifier fields when building chunks; we
+    // preserve those exactly so search filters keep working.
+    const audienceJson = (existing as any).audience_json ?? "[]";
+    const allowedTenantsJson = (existing as any).allowed_tenants_json ?? "[]";
+
+    let carriedPage: number | null = null;
+    let carriedSection: string | null = null;
+    const chunkRows: Chunk[] = drafts.map((d) => {
+      const vec = buildTfIdfVector(d.content, df, totalDocs);
+      const loc = deriveLocation(d.content, carriedPage);
+      carriedPage = loc.page_end ?? carriedPage;
+      const isDefaultSection = !d.section_title || d.section_title === "Body";
+      const finalSection = isDefaultSection
+        ? loc.section_title ?? carriedSection
+        : d.section_title;
+      if (finalSection) carriedSection = finalSection;
+      return {
+        id: newChunkId(),
+        parent_id: documentId,
+        content: d.content,
+        content_type: d.content_type,
+        language: existing.language,
+        section_path_json: JSON.stringify(d.section_path),
+        section_id: d.section_id,
+        section_title: finalSection ?? d.section_title,
+        heading_level: d.heading_level,
+        page_start: d.page_start ?? loc.page_start,
+        page_end: d.page_end ?? loc.page_end,
+        chunk_index: d.chunk_index,
+        document_type: existing.document_type,
+        product_model: existing.product_model,
+        product_version: existing.product_version ?? null,
+        firmware_version: existing.firmware_version ?? null,
+        audience_json: audienceJson,
+        confidentiality: existing.confidentiality,
+        allowed_tenants_json: allowedTenantsJson,
+        lifecycle_status: existing.lifecycle_status,
+        updated_at: now,
+        error_codes_json: JSON.stringify(d.error_codes),
+        cli_commands_json: JSON.stringify(d.cli_commands),
+        ui_paths_json: JSON.stringify(d.ui_paths),
+        tags_json: JSON.stringify(d.extracted_tags),
+        embedding_json: JSON.stringify(vec),
+        token_count: d.token_count,
+      };
+    });
+    storage.insertChunks(chunkRows);
+
+    // Update the parent row: hash, stats, updated_at, file_name if changed.
+    const total_tokens = chunkRows.reduce((a, b) => a + b.token_count, 0);
+    storage.updateDocumentStats(documentId, chunkRows.length, total_tokens);
+    const newHash = createHash("sha256").update(body).digest("hex");
+    storage.updateDocumentMeta(documentId, {
+      file_hash_sha256: newHash,
+      updated_at: now,
+      file_name: fileName,
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // v1.0.7.3: Edit-in-place via local-file + folder watcher.
+  //
+  // Replaces the v1.0.7 WebDAV approach, which Word 2016+ rejects on
+  // loopback URLs regardless of protocol correctness. Server copies
+  // the retained original to <dataDir>/edit-inbox/, launches the OS
+  // default handler (Word), watches for saves, re-ingests through the
+  // same reingestDocxIntoExisting path that drag-to-update uses. See
+  // server/editInbox.ts for the session lifecycle.
+  //
+  //   POST /api/documents/:id/edit-open
+  //     Starts a session, copies the file, launches Word, returns
+  //     { session_id, file_path }.
+  //
+  //   GET  /api/documents/:id/edit-status?session=<id>
+  //     Polling endpoint returning current session state so the client
+  //     can show "watching / saving / saved / error" toasts.
+  //
+  //   POST /api/documents/:id/edit-close  { session_id }
+  //     Explicit close (called on tab-unmount, doc-switch, etc.). The
+  //     server also idle-closes sessions after 30 min of inactivity.
+  // ---------------------------------------------------------------------
+  app.post("/api/documents/:id/edit-open", (req, res) => {
+    const documentId = req.params.id;
+    const doc = storage.getDocument(documentId);
+    if (!doc) return res.status(404).json({ error: "document not found" });
+    const ext = (doc as any).original_ext as string | null;
+    if (!ext) {
+      return res.status(400).json({
+        error:
+          "this document has no retained original; only DOCX uploads from v1.0.6+ can be edited in place",
+      });
+    }
+    try {
+      const result = startEditSession(
+        documentId,
+        ext,
+        (bytes, fileName) => reingestDocxIntoExisting(documentId, bytes, fileName),
+        true,
+      );
+      return res.json({
+        session_id: result.sessionId,
+        file_path: result.filePath,
+        reused: result.reused,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[edit-inbox] start failed for ${documentId}:`, err);
+      return res.status(500).json({ error: message });
+    }
+  });
+
+  app.get("/api/documents/:id/edit-status", (req, res) => {
+    const sessionId = String(req.query.session || "");
+    if (!sessionId) return res.status(400).json({ error: "session query param required" });
+    const status = pollEditStatus(sessionId);
+    if (!status) return res.status(404).json({ error: "session not found or ended" });
+    if (status.document_id !== req.params.id) {
+      return res.status(400).json({ error: "session does not belong to this document" });
+    }
+    return res.json(status);
+  });
+
+  app.post("/api/documents/:id/edit-close", (req, res) => {
+    const sessionId = String((req.body && req.body.session_id) || req.query.session || "");
+    if (!sessionId) return res.status(400).json({ error: "session_id required" });
+    const ended = endEditSession(sessionId);
+    return res.json({ ended });
+  });
+
+  // ---------------------------------------------------------------------
+  // v1.0.7: drag-to-update endpoints.
+  //
+  //   POST /api/documents/:id/similarity-check
+  //     Multipart upload of a candidate replacement .docx. Returns a
+  //     tier verdict + summary metrics so the client can choose the
+  //     right confirmation UI (silent / modal / warning modal).
+  //
+  //   POST /api/documents/:id/update
+  //     Multipart upload of the confirmed replacement. Backs up the
+  //     current original, atomically replaces it, and re-ingests
+  //     synchronously so the response body carries the fresh doc + chunks.
+  //
+  //   GET  /api/documents/:id/trash
+  //     List trashed originals for this doc so the UI can show an
+  //     "Undo replace" affordance.
+  //
+  //   POST /api/documents/:id/undo-replace  { token }
+  //     Restore a trashed original + re-ingest.
+  // ---------------------------------------------------------------------
+  // v1.0.7.4: accept .docx OR .rtf here. Both are "drop an updated original
+  // to replace the retained bytes and re-ingest" -- the pipeline downstream
+  // is extension-agnostic (extract worker routes by extension, reingest
+  // just calls extractTextFromFile). The endpoints below still enforce
+  // that the ext of the incoming file matches the doc's retained ext, so
+  // you can't drop a .docx onto an RTF doc or vice versa.
+  const singleEditableUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 150 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+      const ext = (file.originalname.match(/\.([A-Za-z0-9]+)$/)?.[1] ?? "").toLowerCase();
+      if (ext === "docx" || ext === "rtf") return cb(null, true);
+      cb(null, false);
+    },
+  });
+
+  app.post(
+    "/api/documents/:id/similarity-check",
+    singleEditableUpload.single("file"),
+    async (req: Request, res) => {
+      try {
+        const docId = String(req.params.id);
+        const doc = storage.getDocument(docId);
+        if (!doc) return res.status(404).json({ message: "document not found" });
+        const currentExt = ((doc as any).original_ext ?? null) as string | null;
+        if (!currentExt || !isRetainableExtension(currentExt)) {
+          return res.status(400).json({
+            message: "this document does not have a retained original -- upload a new file instead",
+          });
+        }
+        if (!req.file) {
+          return res.status(415).json({ message: "only .docx and .rtf files are supported for update" });
+        }
+        // v1.0.7.4: enforce that the incoming ext matches the doc's retained
+        // ext. Prevents "drag .docx onto an RTF doc" from silently working.
+        const incomingExt = (req.file.originalname.match(/\.([A-Za-z0-9]+)$/)?.[1] ?? "").toLowerCase();
+        if (incomingExt !== currentExt.toLowerCase().replace(/^\./, "")) {
+          return res.status(415).json({
+            message: `document is .${currentExt} -- cannot replace with .${incomingExt}`,
+          });
+        }
+        const livePath = originalFilePath(docId, currentExt);
+        if (!existsSync(livePath)) {
+          return res.status(404).json({ message: "retained original is missing on disk" });
+        }
+        const [existingSig, incomingSig] = await Promise.all([
+          buildDocxSignature(
+            ((doc as any).file_name as string | null) ?? `${doc.title}.${currentExt}`,
+            readFileSync(livePath),
+          ),
+          buildDocxSignature(req.file.originalname, req.file.buffer),
+        ]);
+        const result = compareSignatures(existingSig, incomingSig);
+        return res.json({
+          document_id: docId,
+          document_title: doc.title,
+          existing_file_name: (doc as any).file_name ?? null,
+          incoming_file_name: req.file.originalname,
+          incoming_size: req.file.size,
+          ...summarizeResult(result),
+        });
+      } catch (err: any) {
+        console.error("[similarity-check] failed:", err);
+        return res.status(500).json({ message: err?.message ?? "similarity check failed" });
+      }
+    },
+  );
+
+  app.post(
+    "/api/documents/:id/update",
+    singleEditableUpload.single("file"),
+    async (req: Request, res) => {
+      try {
+        const docId = String(req.params.id);
+        const doc = storage.getDocument(docId);
+        if (!doc) return res.status(404).json({ message: "document not found" });
+        const currentExt = ((doc as any).original_ext ?? null) as string | null;
+        if (!currentExt || !isRetainableExtension(currentExt)) {
+          return res.status(400).json({
+            message: "this document does not have a retained original -- upload a new file instead",
+          });
+        }
+        if (!req.file) {
+          return res.status(415).json({ message: "only .docx and .rtf files are supported for update" });
+        }
+        // v1.0.7.4: enforce that the incoming ext matches the doc's retained ext.
+        const incomingExt = (req.file.originalname.match(/\.([A-Za-z0-9]+)$/)?.[1] ?? "").toLowerCase();
+        if (incomingExt !== currentExt.toLowerCase().replace(/^\./, "")) {
+          return res.status(415).json({
+            message: `document is .${currentExt} -- cannot replace with .${incomingExt}`,
+          });
+        }
+        const bytes = req.file.buffer;
+
+        // Validate the bytes look like a real .docx or .rtf before we touch
+        // anything. Cheap peek at the first few bytes:
+        //   docx -> zip signature 'PK' (0x50 0x4B)
+        //   rtf  -> ASCII '{\\rtf' magic
+        if (incomingExt === "docx") {
+          if (bytes.length < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4b) {
+            return res.status(415).json({ message: "file is not a valid .docx (missing zip signature)" });
+          }
+        } else if (incomingExt === "rtf") {
+          // "{\\rtf" -- the RTF spec requires this as the first 5 chars.
+          if (bytes.length < 5 || bytes.toString("ascii", 0, 5) !== "{\\rtf") {
+            return res.status(415).json({ message: "file is not a valid .rtf (missing {\\rtf magic)" });
+          }
+        }
+
+        const livePath = originalFilePath(docId, currentExt);
+
+        // Snapshot the current live file into .trash/ so we can undo.
+        const backup = existsSync(livePath) ? backupBeforeReplace(docId, currentExt) : null;
+
+        // Persist new bytes. saveOriginalIfRetainable overwrites at
+        // originalFilePath(id, ext).
+        try {
+          saveOriginalIfRetainable(docId, req.file.originalname, bytes);
+        } catch (err) {
+          console.error("[update] save failed:", err);
+          // If we backed up but the write failed, restore.
+          if (backup) {
+            try {
+              undoReplace(backup.token, currentExt);
+            } catch (restoreErr) {
+              console.error("[update] rollback failed:", restoreErr);
+            }
+          }
+          return res.status(500).json({ message: "failed to save replacement bytes" });
+        }
+
+        // Re-ingest synchronously so the client gets fresh doc/chunks in
+        // the response.
+        try {
+          await reingestDocxIntoExisting(docId, bytes, req.file.originalname);
+        } catch (err: any) {
+          console.error("[update] reingest failed:", err);
+          // Roll back: restore the previous original. The DB chunks are
+          // gone; we return an error and the user will need to reopen.
+          if (backup) {
+            try {
+              undoReplace(backup.token, currentExt);
+            } catch (restoreErr) {
+              console.error("[update] rollback failed:", restoreErr);
+            }
+          }
+          return res.status(500).json({
+            message: `re-ingest failed: ${err?.message ?? "unknown error"}`,
+          });
+        }
+
+        const finalDoc = storage.getDocument(docId)!;
+        return res.json({
+          document: hydrateDocument(finalDoc),
+          undo_token: backup?.token ?? null,
+          undo_expires_seconds: backup ? TRASH_TTL_SECONDS : 0,
+        });
+      } catch (err: any) {
+        console.error("[update] failed:", err);
+        return res.status(500).json({ message: err?.message ?? "update failed" });
+      }
+    },
+  );
+
+  app.get("/api/documents/:id/trash", (req, res) => {
+    const docId = String(req.params.id);
+    const doc = storage.getDocument(docId);
+    if (!doc) return res.status(404).json({ message: "document not found" });
+    const entries = listTrashForDocument(docId).map((e) => ({
+      token: e.token,
+      ext: e.ext,
+      size: e.size,
+      timestamp_ms: e.timestampMs,
+      // Time until this entry is swept, in seconds. Client uses this to
+      // hide the Undo affordance once the safety window has closed.
+      expires_in_seconds: Math.max(
+        0,
+        Math.floor((e.timestampMs + TRASH_TTL_SECONDS * 1000 - Date.now()) / 1000),
+      ),
+    }));
+    res.json({ document_id: req.params.id, entries });
+  });
+
+  app.post("/api/documents/:id/undo-replace", async (req, res) => {
+    try {
+      const docId = String(req.params.id);
+      const doc = storage.getDocument(docId);
+      if (!doc) return res.status(404).json({ message: "document not found" });
+      const currentExt = ((doc as any).original_ext ?? null) as string | null;
+      if (!currentExt || !isRetainableExtension(currentExt)) {
+        return res.status(400).json({ message: "nothing to undo -- no retained original" });
+      }
+      const token = String(req.body?.token || "");
+      if (!token) return res.status(400).json({ message: "missing token" });
+
+      const restored = undoReplace(token, currentExt);
+      if (!restored) {
+        return res.status(410).json({ message: "undo window has expired or token is unknown" });
+      }
+
+      // Re-ingest from the restored bytes so search picks up the reverted
+      // content.
+      const livePath = originalFilePath(docId, currentExt);
+      const bytes = readFileSync(livePath);
+      const fileName =
+        ((doc as any).file_name as string | null) ?? `${doc.title}.${currentExt}`;
+      try {
+        await reingestDocxIntoExisting(docId, bytes, fileName);
+      } catch (err: any) {
+        console.error("[undo-replace] reingest failed:", err);
+        return res.status(500).json({
+          message: `restored the file but re-ingest failed: ${err?.message ?? "unknown"}`,
+        });
+      }
+      const finalDoc = storage.getDocument(docId)!;
+      return res.json({ document: hydrateDocument(finalDoc) });
+    } catch (err: any) {
+      console.error("[undo-replace] failed:", err);
+      return res.status(500).json({ message: err?.message ?? "undo failed" });
+    }
+  });
+
+  // Sweep .trash/ at startup and hourly thereafter.
+  try {
+    const swept = sweepTrash();
+    if (swept > 0) console.log(`[trash] swept ${swept} expired entries at startup`);
+  } catch (err) {
+    console.error("[trash] startup sweep failed:", err);
+  }
+  setInterval(() => {
+    try {
+      const swept = sweepTrash();
+      if (swept > 0) console.log(`[trash] swept ${swept} expired entries`);
+    } catch (err) {
+      console.error("[trash] periodic sweep failed:", err);
+    }
+  }, 60 * 60 * 1000).unref();
 
   // (search follows)
   // -------- Search --------
