@@ -1497,10 +1497,19 @@ function DocDetail({ id }: { id: string }) {
               // had. PDFs still open at the section's page_start when we know
               // it; DOCX has no chunk-level page number, so we just launch the
               // viewer at page 1 and let DocxViewerDialog take over.
+              // v1.0.8.2: also expose the icon for TXT / Markdown documents.
+              // These have no retained original bytes, but PageViewerDialog
+              // still dispatches them to DocumentContentViewerDialog which
+              // renders the reassembled text with the shared Print toolbar.
+              // Without this branch, the small SectionPane icon was missing
+              // for TXT / MD sections while the large "View original pages"
+              // button in the header still worked, which read as a bug.
               onViewPages={
                 activeSection.page_start
                   ? () => openPageViewer(activeSection.page_start!)
                   : data.document.original_ext
+                  ? () => openPageViewer(1)
+                  : /\.(txt|md|markdown)$/i.test(data.document.file_name || "")
                   ? () => openPageViewer(1)
                   : undefined
               }

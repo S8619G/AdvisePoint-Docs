@@ -1306,14 +1306,15 @@ function DocumentContentViewerDialog({
             className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-xs outline-none focus:ring-1 focus:ring-ring"
             data-testid="input-content-highlight"
           />
-          {/* v1.0.8: Print for TXT / MD viewers. Match the PDF + DOCX
-              toolbar button styling (h-7 px-2 + Printer icon + "Print"). */}
+          {/* v1.0.8.2: bordered Print button for TXT / MD viewers so it
+              reads as a control rather than sinking into the toolbar
+              background. Matches the doc-detail "Print" affordance. */}
           <button
             type="button"
             onClick={handlePrint}
             disabled={!payload}
             title="Print"
-            className="inline-flex items-center gap-1 h-7 px-2 rounded hover:bg-muted disabled:opacity-40 text-xs"
+            className="inline-flex items-center gap-1 rounded-md border border-border px-2.5 py-1.5 text-xs transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
             data-testid="button-print-content"
           >
             <Printer className="h-3.5 w-3.5" /> Print
