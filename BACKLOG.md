@@ -4,6 +4,29 @@ Items accepted for a future release but deliberately deferred from the current
 version. Each item should have enough detail that a fresh session can pick it
 up without going back to the source conversation.
 
+## Open work — ordered by estimated processing time (reconciled 2026-09-09)
+
+Every v1.0.4 and v1.0.5 item that was still marked PLANNED has been verified
+against shipped source and flipped to SHIPPED. This is the full remaining
+open list, cheapest first:
+
+| # | Item | Effort | Target |
+|---|---|---|---|
+| 1 | Packager baseline refresh — rebase to v1.0.3.1 | ~1–2 h standalone (~30 min if bundled with ARM64) | v1.1.0 |
+| 2 | node.exe Task Manager visibility — Version Resource + icon embed | ~1–2 h | v1.0.6-or-v1.0.7 candidate |
+| 3 | Extended build smoke test — exercise Backup export endpoint | ~2–3 h (est.) | v1.0.4 or opportunistic |
+| 4 | Library page — "Update available" discoverability banner | ~2–3 h (est.) | v1.0.9 |
+| 5 | Settings → Update — drop-a-zip target for offline in-place upgrade | ~4–6 h (est.) | v1.0.9 |
+| 6 | Windows on ARM — full ARM64 support | ~1–2 days | v1.0.6 (rescheduled) |
+| 7 | System tray icon | multi-day, needs native library | v1.1 candidate |
+| 8 | Render event-loop stalls — worker_threads refactor for pdfjs | multi-day | v1.0.7 candidate |
+
+The v1.0.7 candidate list further down (system tray, ARM64, node.exe rebrand,
+worker_threads refactor) remains valid — the table above collapses it against
+the v1.0.9 provisional scope and the standalone PLANNED items for a single
+effort-ordered view.
+
+
 ## v1.0.9 — release scope summary
 
 **Provisional scope (2026-09-09, added during v1.0.8.1 hotfix):**
@@ -1275,7 +1298,9 @@ worth it as a hard release gate.
 - Keep the smoke test skippable via `SKIP_SMOKE=1` env var for debugging
   edge cases in CI.
 
-## Renderer — per-page timeout, abort, and queue continuation (v1.0.4 — PLANNED)
+## Renderer — per-page timeout, abort, and queue continuation (v1.0.4 — SHIPPED)
+
+**Reconciled 2026-09-09:** shipped in v1.0.5 as `RENDER_PAGE_TIMEOUT_MS` (60s default, env-overridable via `RAG_RENDER_PAGE_TIMEOUT_MS`) and `RENDER_GETPAGE_TIMEOUT_MS` (30s) in `server/pages.ts`, with queue continuation on failure. Original spec preserved below for historical reference.
 
 **Filed:** 2026-09-08
 **Target release:** v1.0.4
@@ -1595,7 +1620,9 @@ reject the one document and move to the next one and notify the
 user." Confirmed by direct code inspection: no timeout wrappers on
 any pdfjs call in `server/pages.ts` today.
 
-## PageViewer — false "still rendering" spinner on non-PDF documents (v1.0.4 — PLANNED)
+## PageViewer — false "still rendering" spinner on non-PDF documents (v1.0.4 — SHIPPED)
+
+**Reconciled 2026-09-09:** shipped in v1.0.5 as the thin router at `PageViewer.tsx` line ~93 that sends DOCX/TXT/MD/RTF documents to the content viewer instead of the per-page render path, so non-PDF viewers no longer hit the "still rendering" fallback. Original spec preserved below.
 
 **Filed:** 2026-09-08
 **Target release:** v1.0.4
@@ -1695,7 +1722,9 @@ upload returned HTTP 200 in 850 ms with 9 chunks / 24,876 tokens
 extracted; `pages/status` returned `"missing"` immediately and stayed
 that way — exactly matching the reported symptom.
 
-## DOCX viewer — render extracted content in the PageViewer dialog (v1.0.5 — PLANNED)
+## DOCX viewer — render extracted content in the PageViewer dialog (v1.0.5 — SHIPPED)
+
+**Reconciled 2026-09-09:** shipped in v1.0.5 as the reassembled-text viewer (chunks joined by `chunk_index`) and superseded in v1.0.6 by the rich `DocxViewer.tsx` component that renders mammoth HTML with a full toolbar. Original spec preserved below.
 
 **Filed:** 2026-09-08
 **Target release:** v1.0.5 (deferred from v1.0.4 on 2026-09-08 for scope + credit budget)
@@ -1850,7 +1879,9 @@ Same reproduction as the PageViewer fix above. Mammoth extracts the
 full 4-page DOCX to 747 KB of markdown in ~200 ms, so the data we
 need to render is already sitting there ready to use.
 
-## Header — background rendering activity indicator (v1.0.4 — PLANNED)
+## Header — background rendering activity indicator (v1.0.4 — SHIPPED)
+
+**Reconciled 2026-09-09:** shipped as `client/src/components/RenderStatusIndicator.tsx`, wired into `App.tsx` in the header between Query and the stats counter. Spinner-when-active + click-to-dismiss failure badge with per-document naming. Original spec preserved below.
 
 **Filed:** 2026-09-08
 **Target release:** v1.0.4
@@ -2025,7 +2056,9 @@ instead of introducing a parallel counter.
 - **System tray notification when a large batch completes.** Would
   compose with the tray-icon idea if we ever add one.
 
-## Backup Settings — show current backup size for storage planning (v1.0.4 — PLANNED)
+## Backup Settings — show current backup size for storage planning (v1.0.4 — SHIPPED)
+
+**Reconciled 2026-09-09:** shipped as `current_backup_size_bytes` + `current_backup_size_estimate_bytes` in the settings payload (`server/routes.ts` ~1890) with a muted disclosure under the retention row in `BackupPanel.tsx` (~509). Original spec preserved below.
 
 **Filed:** 2026-09-08
 **Target release:** v1.0.4
@@ -2126,7 +2159,9 @@ LibraryScanPanel and DiagnosticsPanel.
 ~1–2 hours: ~20 lines server + ~15 lines client + one round of
 visual QA on the Settings panel.
 
-## Render event-loop stalls — raise reconnect threshold and add micro-yields (v1.0.5 — PLANNED)
+## Render event-loop stalls — raise reconnect threshold and add micro-yields (v1.0.5 — SHIPPED)
+
+**Reconciled 2026-09-09:** shipped as `RECONNECT_THRESHOLD = 3` in `BackendDownOverlay.tsx` (~6s of sustained failure before the banner) and `setImmediate` yields bracketing the WebP encoder in `server/pages.ts` (~395). Worker_threads refactor remains a v1.0.7 candidate. Original spec preserved below.
 
 **Filed:** 2026-09-08
 **Target release:** v1.0.5
@@ -2299,7 +2334,9 @@ Rough size: ~150 lines new render-worker CJS + ~80 lines refactored
 `pages.ts` + 3 manual tests. Medium risk. Only pursue if v1.0.5's
 cheap fix proves insufficient in field testing.
 
-## Install-location guidance and cloud-sync detection (v1.0.5 — PLANNED)
+## Install-location guidance and cloud-sync detection (v1.0.5 — SHIPPED)
+
+**Reconciled 2026-09-09:** shipped as `server/install-location.ts` (OneDrive / Dropbox / Google Drive / iCloud / Box / UNC detection with tenant masking), `install_location` on the settings payload (`server/routes.ts` ~126), the `InstallLocationBanner.tsx` header banner, and the boot-time `[boot] warn install_location=...` log line. Original spec preserved below.
 
 **Filed:** 2026-09-08
 **Target release:** v1.0.5
