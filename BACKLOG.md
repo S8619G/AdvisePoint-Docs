@@ -35,6 +35,7 @@ effort-ordered view.
 
 1. [Settings → Update — drop-a-zip target for offline in-place upgrade](#settings--update--drop-a-zip-target-for-offline-in-place-upgrade-v109--planned) — accept a manually-downloaded `AdvisePoint-Docs-vX.Y.Z.zip` dropped onto the Update panel and hand it to the existing updater path so users can upgrade without an internet round-trip and without unzipping by hand.
 2. [Library page — "Update available" discoverability banner](#library-page--update-available-discoverability-banner-v109--planned) — surface newer-release detection at the top of the library page with a link that scrolls to Settings → Update. Rides along naturally with item 1 since both live in the same UI area.
+3. [PDF viewer — continuous scroll with page breaks in Fit mode](#pdf-viewer--continuous-scroll-with-page-breaks-in-fit-mode-v109--planned) — replace the current snap-to-next-page behavior in Fit mode with a windowed vertical stack of pages plus subtle inter-page separators, so scrolling through a multi-page PDF feels smooth and lands where the user aimed instead of bouncing past.
 
 ### Feature specs
 
@@ -75,6 +76,34 @@ effort-ordered view.
 - Do NOT show the banner if the in-app updater has just been launched (`launch.phase` machinery from `UpdateCheckPanel` — reuse the same signal).
 
 **Why this belongs with the drop-zip target work:** both edits live in the update-flow surface area, both share the `UpdateCheck` module, and both benefit from the same regression-test pass. Landing them together saves a build/test cycle.
+
+#### PDF viewer — continuous scroll with page breaks in Fit mode (v1.0.9 — planned)
+
+**Problem.** In `PageViewer.tsx` today, Fit mode renders exactly one page at a time. Navigating to page N+1 swaps the `<img>` source and anchors scroll to the top of the new page. Users report the transition is jarring and, when they scroll aggressively past the bottom of the current page, the viewer jumps a full page instead of continuing a few hundred pixels into the next one. On a multi-page manual this means constantly overshooting the spot they were trying to reach.
+
+**Design.**
+
+- Introduce a **continuous mode** that only applies when the viewer's zoom mode is `fit-page` (Fit). Fit-Width and Actual-Size stay on the current single-page swap model because they already scroll smoothly within a single page and the continuous stack would multiply their memory footprint without a matching UX win.
+- Replace the single-page `<img>` in Fit mode with a **windowed vertical stack**: keep pages `[N-2, N-1, N, N+1, N+2]` hydrated as separate `<img>` elements inside one scrollable container. Pages outside the window unmount and their DOM nodes are released; approaching a window edge triggers hydration of the next page in that direction. Cap total hydrated pages at 5 so a 300-page manual doesn't blow past a hundred megabytes of image cache.
+- Between adjacent pages, render a **thin horizontal separator** (`1px` top/bottom `border-t border-b` in `border-neutral-200` / `dark:border-neutral-800`) with a centered muted-color chip reading **"Page N"** in the app's existing muted-caption style. This is the visual cue the user asked for: unambiguous page boundary without a heavy visual break. No page thumbnails, no page numbers on the pages themselves — chip only.
+- Apply `scroll-behavior: smooth` to the container so keyboard PageUp/PageDown, arrow keys, and clicks on the goto-page input glide instead of teleporting. Mouse-wheel and touchpad scroll are unaffected — they already scroll continuously once the pages are stacked.
+- **Current page tracking.** Attach an `IntersectionObserver` to each hydrated page image with `rootMargin: '-50% 0px -50% 0px'` (page whose midpoint is closest to viewport center becomes "current"). Update the header `Page N of M` badge and the goto-page input to reflect that page. This means the badge changes as the user scrolls past the halfway mark of each page, which matches user expectation better than the current "changes only when you press Next" behavior.
+- **Prev/Next button behavior.** Continue to work — Next scrolls the container so the top of page N+1 aligns with the viewport top (using `element.scrollIntoView({ behavior: 'smooth', block: 'start' })`). Because the target page is already hydrated in the window, the transition is a smooth glide instead of a swap.
+- **Search-result deep links.** The existing `?page=N#result-K` deep-link flow must still land the user on the right page and highlight the right hit. On mount, hydrate the target page + its two neighbors first, then scroll it into view. Highlight state comes from the same code path as today — don't fork the highlight logic.
+- **Non-PDF documents.** Continuous mode is PDF-only. DOCX/PPTX/XLSX viewers already scroll continuously within their single rendered surface; adding a windowed stack there would be a regression.
+
+**Server side.** No changes needed. The page-image renderer already emits per-page images at `/pages/<doc-id>/<page>.png`; continuous mode just requests up to 5 of them at once instead of 1. Preload cost is bounded and stays inside the existing render cache.
+
+**Testing.**
+
+- Playwright: scroll through a 50-page PDF in Fit mode, assert the current-page badge tracks the viewport midpoint (±1 page), assert no more than 5 `<img>` elements exist in the container at any time.
+- Playwright: click Next 10 times in a row rapidly and assert the container ends up scrolled to the top of page 11 without visual glitches.
+- Manual smoke: open a 300-page manual, scroll top-to-bottom on a slow-CPU test box, watch DevTools memory tab to confirm image-cache doesn't grow unboundedly.
+- Manual smoke: keyboard PageDown from page 1 to page 20 — transition should be smooth glides, not snap jumps.
+
+**Non-goals for this release.** No thumbnail sidebar (that's a separate v1.1 candidate). No two-page "book" layout. No independent zoom per page — zoom-in still switches to Fit-Width / Actual-Size like today. No user-configurable window size (the 5-page window is an implementation detail).
+
+**Why this belongs in v1.0.9.** The drop-zip and update-banner items above are both scoped to `UpdateCheckPanel` and library page. The continuous-scroll change is scoped to `PageViewer.tsx`, so they don't touch the same code and don't fight over the same regression-test pass. All three ship in the same window because v1.0.9 is already the viewer-and-update-flow release.
 
 ## v1.0.4 — release scope summary
 
