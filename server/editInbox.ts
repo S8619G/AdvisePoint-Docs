@@ -368,6 +368,14 @@ export function startEditSession(
   sessions.set(session.sessionId, session);
   attachWatcher(session);
 
+  // v1.0.8.1 HOTFIX: start the lock-release poller immediately so a
+  // no-save session (user opens in Word, closes without saving) still
+  // gets torn down when Word releases the file. Previously this was
+  // only scheduled after the first successful save (see tryReingest),
+  // which meant a no-save session sat in "watching" forever until an
+  // idle sweep, and the client's edit-status pill never cleared.
+  scheduleLockReleaseCleanup(session);
+
   if (openInDefault) launchDefaultOpener(filePath);
 
   console.log(
@@ -402,9 +410,25 @@ export function pollEditStatus(sessionId: string): EditStatusPayload | null {
   };
 }
 
+// v1.0.8.1 HOTFIX: how long to keep an ended session in the Map so
+// the client's edit-status poller is guaranteed to observe the "ended"
+// state at least once before it 404s. Prior to this the session was
+// deleted from the Map synchronously with s.status = "ended", so the
+// client's next poll got 404 -> setEditSession(null) IMMEDIATELY, and
+// the 5s auto-dismiss useEffect that keys off status === "ended" never
+// had a chance to run its "Word closed the file. N saves were
+// re-ingested." copy. The pill appeared to "never dismiss" because the
+// last-seen status was often "watching" -> then nothing.
+// 10s is well over the 2s client poll cadence + one retry.
+const ENDED_SESSION_TTL_MS = 10_000;
+
 export function endEditSession(sessionId: string, options?: { deleteFile?: boolean }): boolean {
   const s = sessions.get(sessionId);
   if (!s) return false;
+  // Idempotent: if already ended, just refresh the TTL and no-op.
+  if (s.status === "ended") {
+    return true;
+  }
   s.status = "ended";
   if (s.settleTimer) {
     clearTimeout(s.settleTimer);
@@ -429,8 +453,18 @@ export function endEditSession(sessionId: string, options?: { deleteFile?: boole
   if (shouldDelete) {
     safeDeleteInboxFile(s.filePath, s.documentId);
   }
-  sessions.delete(sessionId);
   console.log(`[edit-inbox] ended session ${sessionId}`);
+  // v1.0.8.1: keep in Map briefly so pollEditStatus can still return
+  // status:"ended" on the client's next tick. See ENDED_SESSION_TTL_MS.
+  setTimeout(() => {
+    // Only delete if still marked ended (defensive: another call could
+    // theoretically have transitioned the session out of ended, though
+    // no code path today does).
+    const current = sessions.get(sessionId);
+    if (current && current.status === "ended") {
+      sessions.delete(sessionId);
+    }
+  }, ENDED_SESSION_TTL_MS);
   return true;
 }
 

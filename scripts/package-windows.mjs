@@ -3,6 +3,7 @@ import {
   cpSync,
   existsSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -17,20 +18,20 @@ import { spawnSync } from "node:child_process";
 // packager will copy the repo's packaging/Start AdvisePoint Docs.bat over
 // the baseline's copy.
 //
-// v1.0.0 baseline: AdvisePoint-Docs-baseline-v1.0.0.zip, derived from the
-// v0.9.36.4 portable zip with the top folder and launcher filename renamed
-// (bytes preserved). Launcher bytes match the v0.9.34+ [launcher] framing
-// version, hash 524235b3…016211ed.
+// v1.0.8.1 baseline: AdvisePoint-Docs-v1.0.8.zip. Launcher bytes
+// unchanged since v1.0.0 ("Start AdvisePoint Docs.bat" with the
+// v0.9.34+ [launcher] framing plus the v1.0.0 rebrand of REM comments
+// and APD_ env vars). Bookkeeping catch-up: prior v1.0.0..v1.0.8
+// releases still pinned the pre-rename v0.9.36 hash (524235b3…) in
+// EXPECTED, so re-packaging against the shipped v1.0.8 baseline was
+// blocked. No launcher behavior change.
 const EXPECTED_LAUNCHER_SHA256 =
-  "524235b353e16dc98f3bebd44fa548c236b1484654d9eb03e5effbac016211ed";
-// v0.9.34: launcher gained additive [launcher] framing lines around the node
-// invocation so pre/post-node context lands in server.log alongside the
-// server's own output. Set to null to keep the baseline launcher unchanged.
-// v1.0.0: launcher renamed to "Start AdvisePoint Docs.bat"; internal REM
-// comments and env-var names rebranded to the new app name and APD_ prefix.
-// Hash recomputed from the renamed repo launcher.
-const NEW_LAUNCHER_SHA256 =
   "7ac72e45fdaf2ad2ca366ecbd651f6f13e1854b73f78017720914f551fa75c98";
+// Set NEW_LAUNCHER_SHA256 to a hash string when a release intentionally
+// changes the launcher; the packager then overwrites the baseline's
+// launcher with the repo's copy and re-verifies. null = ship the
+// baseline launcher as-is (v1.0.8.1 does not change the launcher).
+const NEW_LAUNCHER_SHA256 = null;
 const APP_FOLDER = "AdvisePoint Docs";
 
 function usage() {
@@ -58,6 +59,59 @@ function run(command, args, cwd) {
   const result = spawnSync(command, args, { cwd, encoding: "utf8" });
   if (result.status !== 0) {
     throw new Error(`${command} failed: ${result.stderr || result.stdout}`);
+  }
+}
+
+// v1.0.8.1: guard against a future worker `require("X")` slipping past
+// WORKER_RUNTIME_DEPS. Scans every dist/workers/*.cjs for bare-name
+// require() calls, filters out node: builtins and workers' own
+// worker_threads/util/etc, and fails the build if any package name is
+// not in either the copy list or the set of deps the baseline
+// node_modules already ships (better-sqlite3, mammoth, pdf-parse, ...).
+const NODE_BUILTINS = new Set([
+  "assert", "buffer", "child_process", "cluster", "console", "constants",
+  "crypto", "dgram", "dns", "domain", "events", "fs", "http", "http2",
+  "https", "module", "net", "os", "path", "perf_hooks", "process",
+  "punycode", "querystring", "readline", "repl", "stream", "string_decoder",
+  "sys", "timers", "tls", "tty", "url", "util", "v8", "vm", "worker_threads",
+  "zlib",
+]);
+// Present in the v1.0.0 baseline node_modules -- workers can safely
+// require these without an explicit WORKER_RUNTIME_DEPS entry.
+const BASELINE_NODE_MODULES = new Set([
+  "better-sqlite3", "mammoth", "pdf-parse", "pdfjs-dist",
+  "@napi-rs/canvas", "dotenv",
+]);
+function assertWorkerDeps(workersDir, extraDeps) {
+  const allowed = new Set([...BASELINE_NODE_MODULES, ...extraDeps]);
+  const bareRequire = /require\(\s*["']([^"'./][^"']*)["']\s*\)/g;
+  const missing = new Set();
+  for (const file of readdirSync(workersDir)) {
+    if (!file.endsWith(".cjs")) continue;
+    const src = readFileSync(join(workersDir, file), "utf8");
+    let match;
+    while ((match = bareRequire.exec(src)) !== null) {
+      const raw = match[1];
+      // Strip node: prefix and scoped-package subpaths -> package name.
+      const noNodePrefix = raw.startsWith("node:") ? raw.slice(5) : raw;
+      const pkg = noNodePrefix.startsWith("@")
+        ? noNodePrefix.split("/").slice(0, 2).join("/")
+        : noNodePrefix.split("/")[0];
+      if (NODE_BUILTINS.has(pkg)) continue;
+      if (allowed.has(pkg)) continue;
+      missing.add(`${file}: require("${pkg}")`);
+    }
+  }
+  if (missing.size > 0) {
+    throw new Error(
+      `Worker dep guard failed. dist/workers/ has require() calls to packages ` +
+      `not in WORKER_RUNTIME_DEPS or the baseline node_modules:\n` +
+      `  ${[...missing].join("\n  ")}\n` +
+      `Add the package to WORKER_RUNTIME_DEPS in scripts/package-windows.mjs ` +
+      `(if it's a new dep) or BASELINE_NODE_MODULES (if it ships in the ` +
+      `v1.0.0 baseline). See v1.0.8.1 hotfix notes for the RTF regression ` +
+      `this catches.`,
+    );
   }
 }
 
@@ -121,6 +175,37 @@ try {
   // fails the build if a direct dep isn't categorized, so the class of
   // bug this list existed to catch (v1.0.7.4.1 MODULE_NOT_FOUND at
   // startup) can no longer happen silently.
+  //
+  // v1.0.8.1 HOTFIX: the retirement of EXTRA_RUNTIME_DEPS above was
+  // premature. dist/index.cjs is the *main-thread* server bundle, but
+  // hand-written worker scripts in dist/workers/*.cjs (rtf-stripper.cjs,
+  // extract-worker.cjs) are NOT bundled -- they run in worker_threads
+  // and resolve their `require("...")` calls through node_modules at
+  // runtime. Bundling iconv-lite into the main server broke RTF upload
+  // because the worker still needs iconv-lite present on disk. Restore
+  // a per-worker allowlist so worker deps are copied into the shipped
+  // node_modules alongside the baseline deps. See assertWorkerDeps()
+  // below for the guard that prevents this regression from recurring.
+  const WORKER_RUNTIME_DEPS = [
+    // rtf-stripper.cjs
+    "iconv-lite",
+    "safer-buffer",
+  ];
+  const workerNodeModules = join(repoRoot, "node_modules");
+  const appNodeModules = join(appRoot, "node_modules");
+  for (const dep of WORKER_RUNTIME_DEPS) {
+    const src = join(workerNodeModules, dep);
+    const dst = join(appNodeModules, dep);
+    if (!existsSync(src)) {
+      throw new Error(
+        `Worker runtime dep '${dep}' missing from repo node_modules (${src}). ` +
+        `Run 'npm install' before packaging.`,
+      );
+    }
+    rmSync(dst, { recursive: true, force: true });
+    cpSync(src, dst, { recursive: true });
+  }
+  assertWorkerDeps(join(appRoot, "dist", "workers"), WORKER_RUNTIME_DEPS);
   cpSync(
     join(repoRoot, "packaging", "Update AdvisePoint Docs.bat"),
     join(appRoot, "Update AdvisePoint Docs.bat"),

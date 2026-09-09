@@ -514,6 +514,15 @@ export function DocxViewerDialog({
           keepalive: true,
         }).catch(() => {});
       }
+      // v1.0.8.1 HOTFIX: also clear the pill state locally. Radix's
+      // <DialogContent> unmounts on close, so state normally dies with
+      // the component -- but this cleanup is the safe belt-and-suspenders
+      // for the case where the same component instance is reused (e.g.
+      // the parent keeps the viewer mounted and toggles `open`). Without
+      // this, a stale ended-status pill could survive a close/reopen
+      // cycle and lead the user to believe an edit session is still
+      // active.
+      setEditSession(null);
     };
   // Intentionally only re-run when the viewer closes / doc changes; the
   // sessionId is captured through the ref above.
@@ -946,7 +955,7 @@ export function DocxViewerDialog({
                 would replace. */}
             {meta?.has_original && (
               <div className="shrink-0 text-[11px] text-muted-foreground/80 whitespace-nowrap">
-                Drop a {isRtf ? ".rtf" : ".docx"} here to update
+                Drag updated revisions into the viewer window
               </div>
             )}
           </div>

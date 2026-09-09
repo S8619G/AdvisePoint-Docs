@@ -4,6 +4,55 @@ Items accepted for a future release but deliberately deferred from the current
 version. Each item should have enough detail that a fresh session can pick it
 up without going back to the source conversation.
 
+## v1.0.9 — release scope summary
+
+**Provisional scope (2026-09-09, added during v1.0.8.1 hotfix):**
+
+**Feature additions**
+
+1. [Settings → Update — drop-a-zip target for offline in-place upgrade](#settings--update--drop-a-zip-target-for-offline-in-place-upgrade-v109--planned) — accept a manually-downloaded `AdvisePoint-Docs-vX.Y.Z.zip` dropped onto the Update panel and hand it to the existing updater path so users can upgrade without an internet round-trip and without unzipping by hand.
+2. [Library page — "Update available" discoverability banner](#library-page--update-available-discoverability-banner-v109--planned) — surface newer-release detection at the top of the library page with a link that scrolls to Settings → Update. Rides along naturally with item 1 since both live in the same UI area.
+
+### Feature specs
+
+#### Settings → Update — drop-a-zip target for offline in-place upgrade (v1.0.9 — planned)
+
+**Problem.** The in-app Update Now button is a great one-click upgrade path, but it always fetches from GitHub. For users on restricted networks, air-gapped test environments, or when GitHub is slow/down, the only fallback today is: download the zip from GitHub in a browser, close the app, unzip on top of the install folder by hand, relaunch. That's exactly the workflow the existing `updater.cjs` was written to eliminate — it just doesn't have a way to be pointed at a local zip.
+
+**Design.**
+
+- Add a bordered drop zone inside `UpdateCheckPanel.tsx`, visually distinct from the existing Check / Update Now buttons, labeled clearly: **"Drop an AdvisePoint-Docs-vX.Y.Z.zip here to upgrade in place from a local file."** Include one line of muted helper text: *"Use this when you already have the release zip and don't want the app to download it."*
+- On drop: POST the zip to a new server endpoint `POST /api/update/upload-zip`. Server writes the bytes to a temp path (validated: `.zip` extension, size < `MAX_ARCHIVE_BYTES` from updater.cjs, magic-bytes PK header check), then verifies:
+  1. Zip contains an `AdvisePoint Docs/` top-level folder (mirror the packager's `APP_FOLDER` layout).
+  2. `AdvisePoint Docs/VERSION` file parses as a valid version.
+  3. Version is **not older** than the installed version (block accidental downgrades; surface a confirm-to-force UI on a semver-lower zip rather than silently accepting).
+  4. `AdvisePoint Docs/dist/index.cjs` exists (crude but effective sanity check that this really is an AdvisePoint Docs release zip and not, e.g., a Kyo Info Explorer zip or an arbitrary archive).
+- After validation, the endpoint returns `{ ok: true, temp_path, version }`. The client shows a confirm dialog with the detected version and a single **"Upgrade to vX.Y.Z now"** button.
+- On confirm, spawn the existing `Update AdvisePoint Docs.bat` with a new `--local-zip <temp_path>` argument. Extend `updater.cjs`:
+  - When `--local-zip` is passed, skip the GitHub API fetch entirely, skip the checksum download, skip the release-notes fetch. Read the zip from the given path and jump straight into the existing extract-and-swap code path.
+  - Emit a distinct log line: `[updater] using local zip <path> (skipping GitHub fetch)`.
+  - Preserve every safety check the online path has: max-entries, max-expanded-bytes, path-traversal guards, `%LOCALAPPDATA%\AdvisePoint Docs\` untouched.
+- Failure modes to surface in the UI: invalid zip format, wrong app, older version (with force-override), permission denied on temp write, server disk full.
+
+**Why not just document "unzip by hand"?** Because we already own the atomic-swap code path in `updater.cjs`, and every user who does a manual unzip has to figure out which folders to preserve (`data/`, `%LOCALAPPDATA%\AdvisePoint Docs\`), whether to delete `dist/` first, whether to keep their `Setup Icon (run once).bat` output, etc. The updater already handles all of this correctly for the online path — routing a local zip through the same code costs one endpoint + one `updater.cjs` branch and eliminates a whole class of hand-unzip mistakes.
+
+**Non-goals for this release:** no signature verification on the dropped zip (the app already downloads unsigned zips from GitHub, so this doesn't reduce the trust baseline); no support for point-releases via drag-and-drop as a *distribution* channel (GitHub Releases remains the source of truth; this is strictly a bring-your-own-zip fallback).
+
+#### Library page — "Update available" discoverability banner (v1.0.9 — planned)
+
+**Problem.** In v1.0.8 we shipped a working in-app updater, a Settings → Update panel with one-click Update Now, and a 24h GitHub Releases poll — but users don't know it's there. The v1.0.8.1 hotfix conversation surfaced that even a hands-on user was pushing for a GitHub upload workflow because they hadn't discovered the Settings panel. Discoverability is the missing piece.
+
+**Design.**
+
+- On the library page (`pages/schema.tsx` or wherever the library is rooted), on mount, call `UpdateCheck.getLatestRelease()` (cache-first — no extra network cost, hydrates from the same 24h cache the Settings panel uses).
+- If a newer release is available and the user hasn't dismissed the banner for that specific version, render a slim single-line banner above the library grid: **"AdvisePoint Docs vX.Y.Z is available. Get it now →"** with the arrow linking to Settings → Update and auto-scrolling the panel into view.
+- Persist per-version dismissal in `localStorage` under `apd.updateBanner.dismissed.<version>` so "Not now" doesn't nag once a day for the same release.
+- Style: use the existing banner styling in the app (whatever install-location and OneDrive banners use in v1.0.5) — do not invent a new visual language.
+- Do NOT show the banner while the user is on the Settings page (they're already there).
+- Do NOT show the banner if the in-app updater has just been launched (`launch.phase` machinery from `UpdateCheckPanel` — reuse the same signal).
+
+**Why this belongs with the drop-zip target work:** both edits live in the update-flow surface area, both share the `UpdateCheck` module, and both benefit from the same regression-test pass. Landing them together saves a build/test cycle.
+
 ## v1.0.4 — release scope summary
 
 **Committed scope (2026-09-08):** 4 items — reliability drop.
