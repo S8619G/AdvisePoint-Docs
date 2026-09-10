@@ -112,7 +112,26 @@ REM   * From the hidden VBS wrapper: this whole process is invisible, so
 REM     we spawn a NEW visible cmd window that shows the error + log path.
 REM   * From a minimized cmd (double-clicked .bat): restore + pause here.
 REM Clean shutdowns (exit code 0) close silently either way.
-if not "%APD_EXIT%"=="0" (
+REM
+REM v1.0.8.3: suppress the crash surface when the in-app updater is the one
+REM taking us down. The updater drops ".updating" in %LOCALAPPDATA%\AdvisePoint
+REM Docs\ before requesting /shutdown and removes it after relaunch succeeds.
+REM When that sentinel is present, a non-zero exit is expected (PowerShell's
+REM Tee-Object pipeline reports a non-zero $LASTEXITCODE when node exits mid-
+REM stream during a coordinated shutdown) and MUST NOT pop the "AdvisePoint
+REM Docs - crashed" window on the user. If the sentinel is stale (older than
+REM 1 day), fall through to the normal crash surface so real crashes during
+REM an abandoned update attempt are still visible. Windows forfiles /d only
+REM supports day granularity, which is fine here: the updater cleans up the
+REM sentinel in its normal path, so a stale one means the update abandoned
+REM and any crash after 24h is unrelated to that abandoned attempt.
+set "APD_UPDATE_SENTINEL=%LOCALAPPDATA%\AdvisePoint Docs\.updating"
+set "APD_SUPPRESS_CRASH="
+if not "%APD_EXIT%"=="0" if exist "%APD_UPDATE_SENTINEL%" (
+    forfiles /p "%LOCALAPPDATA%\AdvisePoint Docs" /m ".updating" /d -1 >nul 2>&1
+    if errorlevel 1 set "APD_SUPPRESS_CRASH=1"
+)
+if not "%APD_EXIT%"=="0" if not defined APD_SUPPRESS_CRASH (
     if defined APD_HIDDEN (
         start "AdvisePoint Docs - crashed" cmd /k "echo. & echo ===================================================================== & echo  AdvisePoint Docs exited with error code %APD_EXIT%. & echo  Full log: %APD_LOG% & echo ===================================================================== & echo."
     ) else (
