@@ -13,18 +13,30 @@ open list, cheapest first:
 | # | Item | Effort | Target |
 |---|---|---|---|
 | 1 | Packager baseline refresh — rebase to v1.0.3.1 | ~1–2 h standalone (~30 min if bundled with ARM64) | v1.1.0 |
-| 2 | node.exe Task Manager visibility — Version Resource + icon embed | ~1–2 h | v1.0.6-or-v1.0.7 candidate |
-| 3 | Extended build smoke test — exercise Backup export endpoint | ~2–3 h (est.) | v1.0.4 or opportunistic |
-| 4 | Library page — "Update available" discoverability banner | ~2–3 h (est.) | v1.0.9 |
-| 5 | Settings → Update — drop-a-zip target for offline in-place upgrade | ~4–6 h (est.) | v1.0.9 |
-| 6 | Windows on ARM — full ARM64 support | ~1–2 days | v1.0.6 (rescheduled) |
-| 7 | System tray icon | multi-day, needs native library | v1.1 candidate |
-| 8 | Render event-loop stalls — worker_threads refactor for pdfjs | multi-day | v1.0.7 candidate |
+| 2 | Extended build smoke test — exercise Backup export endpoint | ~2–3 h (est.) | v1.0.4 or opportunistic |
+| 3 | Settings → Update — drop-a-zip target for offline in-place upgrade | ~4–6 h (est.) | v1.0.9 |
+| 4 | PDF viewer — continuous scroll with page breaks in Fit mode | ~1 day | v1.0.9 |
+| 5 | Windows on ARM — full ARM64 support | ~1–2 days | v1.1.0 |
+| 6 | System tray icon | multi-day, needs native library | v1.1 candidate |
+| 7 | Render event-loop stalls — worker_threads refactor for pdfjs | multi-day | v1.0.7 candidate |
 
-The v1.0.7 candidate list further down (system tray, ARM64, node.exe rebrand,
-worker_threads refactor) remains valid — the table above collapses it against
-the v1.0.9 provisional scope and the standalone PLANNED items for a single
-effort-ordered view.
+The v1.0.7 candidate list further down (system tray, worker_threads refactor)
+remains valid — the table above collapses it against the v1.0.9 committed
+scope and the standalone PLANNED items for a single effort-ordered view.
+
+**Permanently dropped (2026-09-09):**
+
+- **Library page — "Update available" discoverability banner.** Considered
+  for v1.0.9 and rejected as not carrying long-term product value; the
+  Settings → Update panel plus the drop-a-zip target cover the discoverability
+  and offline-upgrade gaps without adding a persistent library-page surface
+  to maintain. Full spec removed from this document.
+- **node.exe Task Manager visibility — Version Resource + icon embed.**
+  Considered as a small polish item and dropped. Task Manager appearance is
+  not worth the packager complexity (wine + rcedit-x64.exe path, stripped
+  Authenticode signature, extra build step); documenting the bundled
+  `node.exe` file location in user-facing docs is sufficient for anyone who
+  needs to identify the process. Full spec removed from this document.
 
 
 ## v1.0.9 — release scope summary
@@ -33,9 +45,18 @@ effort-ordered view.
 
 **Feature additions**
 
-1. [Settings → Update — drop-a-zip target for offline in-place upgrade](#settings--update--drop-a-zip-target-for-offline-in-place-upgrade-v109--planned) — accept a manually-downloaded `AdvisePoint-Docs-vX.Y.Z.zip` dropped onto the Update panel and hand it to the existing updater path so users can upgrade without an internet round-trip and without unzipping by hand.
-2. [Library page — "Update available" discoverability banner](#library-page--update-available-discoverability-banner-v109--planned) — surface newer-release detection at the top of the library page with a link that scrolls to Settings → Update. Rides along naturally with item 1 since both live in the same UI area.
-3. [PDF viewer — continuous scroll with page breaks in Fit mode](#pdf-viewer--continuous-scroll-with-page-breaks-in-fit-mode-v109--planned) — replace the current snap-to-next-page behavior in Fit mode with a windowed vertical stack of pages plus subtle inter-page separators, so scrolling through a multi-page PDF feels smooth and lands where the user aimed instead of bouncing past.
+1. [PDF viewer — continuous scroll with page breaks in Fit mode](#pdf-viewer--continuous-scroll-with-page-breaks-in-fit-mode-v109--planned) — replace the current snap-to-next-page behavior in Fit mode with a windowed vertical stack of pages plus subtle inter-page separators, so scrolling through a multi-page PDF feels smooth and lands where the user aimed instead of bouncing past.
+2. [Settings → Update — drop-a-zip target for offline in-place upgrade](#settings--update--drop-a-zip-target-for-offline-in-place-upgrade-v109--planned) — accept a manually-downloaded `AdvisePoint-Docs-vX.Y.Z.zip` dropped onto the Update panel and hand it to the existing updater path so users can upgrade without an internet round-trip and without unzipping by hand.
+3. [`.updating` sentinel — surface as a diagnostic on Settings → Update](#updating-sentinel--surface-as-a-diagnostic-on-settings--update-v109--planned) — when the launcher-side sentinel from v1.0.8.3 is present at app launch and older than a few minutes, show a one-line notice on the Update panel pointing users at `%LOCALAPPDATA%\AdvisePoint Docs\update.log` and auto-clear the sentinel. Small follow-through on the v1.0.8.3 hotfix.
+
+**Permanently dropped from v1.0.9 (2026-09-09):**
+
+- Library page "Update available" banner — not enough long-term value to
+  justify the persistent library-page surface. Settings → Update + drop-a-zip
+  cover the same discoverability and offline-upgrade needs.
+- node.exe Task Manager rebrand — Task Manager appearance is not worth the
+  packager complexity. User-facing docs will name the bundled `node.exe`
+  file location instead.
 
 ### Feature specs
 
@@ -62,20 +83,23 @@ effort-ordered view.
 
 **Non-goals for this release:** no signature verification on the dropped zip (the app already downloads unsigned zips from GitHub, so this doesn't reduce the trust baseline); no support for point-releases via drag-and-drop as a *distribution* channel (GitHub Releases remains the source of truth; this is strictly a bring-your-own-zip fallback).
 
-#### Library page — "Update available" discoverability banner (v1.0.9 — planned)
+**Why this belongs in v1.0.9:** the update-flow surface area is where the hotfix conversations converge (v1.0.8.3 sentinel + this offline path); both changes share the `updater.cjs` code path and share the same regression-test pass.
 
-**Problem.** In v1.0.8 we shipped a working in-app updater, a Settings → Update panel with one-click Update Now, and a 24h GitHub Releases poll — but users don't know it's there. The v1.0.8.1 hotfix conversation surfaced that even a hands-on user was pushing for a GitHub upload workflow because they hadn't discovered the Settings panel. Discoverability is the missing piece.
+#### `.updating` sentinel — surface as a diagnostic on Settings → Update (v1.0.9 — planned)
+
+**Problem.** The v1.0.8.3 hotfix added a `.updating` sentinel in `%LOCALAPPDATA%\AdvisePoint Docs\` that the launcher uses to suppress the spurious crash window during an in-place upgrade. `updater.cjs` writes the sentinel before requesting shutdown and clears it after relaunch (both on success and error paths). If the updater process is killed mid-flight — user closes the update terminal, laptop sleeps and loses the child process, antivirus quarantines the zip mid-download — the sentinel is left on disk. The launcher self-heals after 24 h, but the user has no visibility that an update attempt was abandoned, and `update.log` sits there unread.
 
 **Design.**
 
-- On the library page (`pages/schema.tsx` or wherever the library is rooted), on mount, call `UpdateCheck.getLatestRelease()` (cache-first — no extra network cost, hydrates from the same 24h cache the Settings panel uses).
-- If a newer release is available and the user hasn't dismissed the banner for that specific version, render a slim single-line banner above the library grid: **"AdvisePoint Docs vX.Y.Z is available. Get it now →"** with the arrow linking to Settings → Update and auto-scrolling the panel into view.
-- Persist per-version dismissal in `localStorage` under `apd.updateBanner.dismissed.<version>` so "Not now" doesn't nag once a day for the same release.
-- Style: use the existing banner styling in the app (whatever install-location and OneDrive banners use in v1.0.5) — do not invent a new visual language.
-- Do NOT show the banner while the user is on the Settings page (they're already there).
-- Do NOT show the banner if the in-app updater has just been launched (`launch.phase` machinery from `UpdateCheckPanel` — reuse the same signal).
+- On app boot, `server/routes.ts` (or wherever the Settings → Update endpoint lives) checks for `%LOCALAPPDATA%\AdvisePoint Docs\.updating`. If present AND older than 5 minutes AND newer than 24 h, it exposes a one-time diagnostic flag via `GET /api/updater/health` (existing endpoint if there is one, otherwise a new `GET /api/updater/last-attempt`).
+- `UpdateCheckPanel.tsx` reads that flag on mount. When set, renders a slim muted notice above the Update Now button: **"A previous update attempt didn't complete. See `%LOCALAPPDATA%\AdvisePoint Docs\update.log` for details."** with a small "Dismiss" button.
+- On dismiss, the server clears the sentinel and the notice disappears. The next update attempt then starts from a clean slate.
+- The 5-minute floor prevents the notice from flashing on-screen during a normal update where the browser reloads faster than the updater relaunches the app.
+- The 24 h ceiling matches the launcher's self-heal window (`forfiles /d -1` in `Start AdvisePoint Docs.bat`).
 
-**Why this belongs with the drop-zip target work:** both edits live in the update-flow surface area, both share the `UpdateCheck` module, and both benefit from the same regression-test pass. Landing them together saves a build/test cycle.
+**Why this is worth doing now.** It's cheap (~30 min), it makes the v1.0.8.3 sentinel machinery observable instead of silent, and it turns "my update didn't work and I don't know why" into "the app already told me where to look." No new dependencies.
+
+**Non-goals.** No auto-parsing `update.log` and showing the last error in the UI (that's separate feature territory). No telemetry, no reporting home. Just point the user at the log file.
 
 #### PDF viewer — continuous scroll with page breaks in Fit mode (v1.0.9 — planned)
 
@@ -156,7 +180,9 @@ v1.0.6 (or v1.0.7 if v1.0.6 stays ARM64-only).
 
 **Deferred out of v1.0.5 during 2026-09-08 pre-build review:**
 
-- [node.exe Task Manager visibility — Version Resource + icon embed](#nodeexe-task-manager-visibility--version-resource--icon-embed-v106-or-v107--candidate) — needs a Linux-runnable rcedit path (electron/rcedit's `rcedit-x64.exe` under `wine`) or a Windows build step. Revisit alongside ARM64 packaging work or as a standalone v1.0.7 item.
+- node.exe Task Manager visibility — Version Resource + icon embed. Later
+  permanently dropped on 2026-09-09 as not worth the packager complexity;
+  see the "Permanently dropped" note at the top of this document.
 
 ### Suggested implementation order
 
@@ -215,9 +241,11 @@ future release (see v1.0.7 candidates).
    `rg -i kyocera` gate at zero hits across shipped surfaces.
 
 **Explicitly deferred out of v1.0.6:** Windows on ARM (multi-arch
-packaging + native-module rebuilds), node.exe rebrand via VersionInfo,
-worker_threads refactor for the pdfjs render loop. See v1.0.7
-candidates below.
+packaging + native-module rebuilds; later rescheduled to v1.1.0) and
+worker_threads refactor for the pdfjs render loop. The node.exe rebrand
+was also deferred here originally and later permanently dropped on
+2026-09-09 — see the "Permanently dropped" note at the top of this
+document. See v1.0.7 candidates below for the remaining items.
 
 **Baseline used:** `AdvisePoint-Docs-baseline-v1.0.0.zip` (launcher
 SHA-256 `7ac72e45fdaf2ad2ca366ecbd651f6f13e1854b73f78017720914f551fa75c98`,
@@ -493,11 +521,6 @@ headline once v1.0.6 has one field-cycle of soak.
   packager, native module rebuilds (`better-sqlite3`,
   `@napi-rs/canvas`), launcher arch detection, in-app updater arch
   matching. Ships two portable zips per release.
-- **node.exe Task Manager visibility — Version Resource + icon
-  embed** — stamp `AdvisePoint Docs` product name + version + icon
-  onto the bundled `node.exe` so it doesn't show as "Node.js" in
-  Task Manager. Needs a Linux-runnable rcedit path (electron/rcedit
-  under `wine`) or a Windows build step.
 - **worker_threads refactor for pdfjs render loop** — full fix for
   the event-loop stalls that v1.0.5 mitigated with a reconnect
   threshold + micro-yields. Move `pdfjs.getDocument` +
@@ -2493,85 +2516,15 @@ similar structures and recommend a root folder setup.
 client (banner + Settings note), ~80 lines README. One focused sprint,
 test across three scenarios (clean install, OneDrive, Dropbox).
 
-## node.exe Task Manager visibility — Version Resource + icon embed (v1.0.6-or-v1.0.7 — CANDIDATE)
+## node.exe Task Manager visibility — DROPPED 2026-09-09
 
-**Filed:** 2026-09-08
-**Target release:** deferred from v1.0.5 on 2026-09-08 during pre-build review. Candidate for v1.0.6 (alongside ARM64 packaging work) or v1.0.7 as a standalone item.
-**Status:** planned. Option A chosen (rewrite Windows Version Resource,
-keep filename `node.exe` so launcher stays untouched).
-
-**Deferral reason (2026-09-08):** the plan below calls for
-`rcedit-linux` as a devDependency. That npm package does not
-exist. The real `rcedit` package is a Node wrapper around a
-Windows `.exe` that does not run natively under Linux. To keep
-our Linux build sandbox self-sufficient we need `wine` +
-electron/rcedit's `rcedit-x64.exe` binary (~1MB), or a Windows
-build step. Neither was ready in time for v1.0.5. When we
-pick this back up, spec update needed: replace "add rcedit-linux
-as a devDependency" with the wine + rcedit-x64.exe pattern.
-**Ask:** In Task Manager today the app's Node process shows up as
-generic `node.exe` with description "Node.js JavaScript Runtime" and
-the Node hexagon icon. Users can't tell which running Node process is
-AdvisePoint Docs vs. any other Node app they might have. Rewrite the
-bundled `node.exe`'s Windows Version Resource block so Task Manager
-shows it as an AdvisePoint Docs process without renaming the file.
-
-### Deliverables
-
-1. **Add `rcedit-linux` (or equivalent cross-platform rcedit wrapper)
-   as a devDependency.** MIT-licensed, ~1MB, runs on Linux — needed
-   because our packaging runs from a Linux sandbox.
-
-2. **Modify `scripts/package-windows.mjs`** to, after extracting the
-   baseline zip and before rezipping, run rcedit on
-   `AdvisePoint Docs/node/node.exe` with:
-   - `--set-file-version` → current app version (e.g. 1.0.4)
-   - `--set-product-version` → current app version
-   - `--set-version-string ProductName "AdvisePoint Docs"`
-   - `--set-version-string FileDescription "AdvisePoint Docs Server"`
-   - `--set-version-string CompanyName "AdvisePoint"`
-   - `--set-version-string OriginalFilename "node.exe"` (kept as-is
-     so any deep tooling that inspects it still works)
-   - `--set-icon packaging/launcher/AdvisePointDocs.ico`
-
-3. **Do NOT touch the launcher.** Filename stays `node.exe`; the
-   launcher's `.\node\node.exe` path reference is unchanged. This
-   preserves the launcher hash-pin rule.
-
-### Why Option A over Option B (full filename rename)
-
-- Preserves the launcher-baseline rule (no new SHA-256 pin needed)
-- Task Manager's Details tab shows Description + Icon prominently —
-  "AdvisePoint Docs" + our icon jumps out even with filename
-  `node.exe`
-- Zero risk to updater, backup, or any code path
-- If we later want the filename rename too (Option B), Option A costs
-  nothing to keep in place alongside
-
-### Known side effect
-
-Rewriting the Version Resource strips Microsoft's Authenticode
-signature on `node.exe` ("Verified publisher: OpenJS Foundation"
-disappears from file properties). Non-issue for us because we don't
-code-sign our own builds today — the launcher itself is already
-unsigned. Windows SmartScreen behavior doesn't change.
-
-### Testing checklist
-
-- Package a build; extract; run `powershell -c "(Get-Item .\node\node.exe).VersionInfo | Format-List"`
-  on Windows to confirm ProductName / FileDescription / CompanyName /
-  version numbers are set as expected.
-- Launch the app; open Task Manager → Details tab; confirm
-  Description column shows "AdvisePoint Docs Server" and the icon
-  column shows the AdvisePoint Docs mark instead of the Node hexagon.
-- Confirm launch smoke test still passes (Version Resource edits
-  should have no runtime effect).
-- Confirm launcher .bat still runs without changes.
-
-### Effort estimate
-
-~1–2 hours: install rcedit-linux, add ~10 lines to
-`package-windows.mjs`, one round of Windows verification.
+Spec removed. Task Manager appearance for the bundled `node.exe` was
+considered as small polish and permanently dropped: the packager complexity
+(wine + electron/rcedit's `rcedit-x64.exe` in the Linux build sandbox, plus
+a stripped Authenticode signature as a side effect) is not worth the payoff.
+User-facing documentation should instead name the bundled node.exe location
+(`AdvisePoint Docs/node/node.exe`) so anyone who needs to identify the
+process in Task Manager can do so by working directory or command line.
 
 ## Windows on ARM — full ARM64 support (v1.0.6 — PLANNED)
 
