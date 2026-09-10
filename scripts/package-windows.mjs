@@ -24,14 +24,24 @@ import { spawnSync } from "node:child_process";
 // and APD_ env vars). Bookkeeping catch-up: prior v1.0.0..v1.0.8
 // releases still pinned the pre-rename v0.9.36 hash (524235b3…) in
 // EXPECTED, so re-packaging against the shipped v1.0.8 baseline was
-// blocked. No launcher behavior change.
+// blocked. No launcher behavior change through v1.0.8.2.
+//
+// v1.0.8.3: launcher intentionally changes for the first time since
+// v1.0.0. New behavior: suppress the "AdvisePoint Docs - crashed"
+// window when %LOCALAPPDATA%\AdvisePoint Docs\.updating is present
+// (coordinated with updater.cjs so an in-place upgrade no longer leaves
+// a stray crash popup for the user to dismiss). EXPECTED is bumped to
+// the shipped v1.0.8.2 baseline hash (still 7ac72e45… — v1.0.8.2 did
+// not change the launcher). NEW_LAUNCHER_SHA256 is set to the v1.0.8.3
+// hash so the packager overwrites the baseline copy with the repo copy.
 const EXPECTED_LAUNCHER_SHA256 =
   "7ac72e45fdaf2ad2ca366ecbd651f6f13e1854b73f78017720914f551fa75c98";
 // Set NEW_LAUNCHER_SHA256 to a hash string when a release intentionally
 // changes the launcher; the packager then overwrites the baseline's
 // launcher with the repo's copy and re-verifies. null = ship the
-// baseline launcher as-is (v1.0.8.1 does not change the launcher).
-const NEW_LAUNCHER_SHA256 = null;
+// baseline launcher as-is.
+const NEW_LAUNCHER_SHA256 =
+  "e6fd614e19549a0d79c654d5334c14073b225936e68a3529bd2eb267654b5967";
 const APP_FOLDER = "AdvisePoint Docs";
 
 function usage() {
