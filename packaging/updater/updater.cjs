@@ -43,7 +43,34 @@ const logDir = path.join(localAppData, "AdvisePoint Docs");
 const logPath = path.join(logDir, "update.log");
 const apiUrl = process.env.APD_UPDATE_API_URL || DEFAULT_API_URL;
 
+// v1.0.8.3: Coordinate with Start AdvisePoint Docs.bat so a mid-update
+// shutdown of the running server does not trigger the launcher's crash
+// surface. We drop this sentinel BEFORE requesting /shutdown and remove it
+// AFTER we've relaunched (or after any error path). While the sentinel is
+// present the launcher suppresses its non-zero-exit crash window.
+const updateSentinelPath = path.join(logDir, ".updating");
+
 fs.mkdirSync(logDir, { recursive: true });
+
+function writeUpdateSentinel() {
+  try {
+    fs.writeFileSync(updateSentinelPath, `${new Date().toISOString()} pid=${process.pid}\n`, "utf8");
+    log(`Update sentinel written: ${updateSentinelPath}`);
+  } catch (err) {
+    log(`WARN could not write update sentinel: ${err && err.message}`);
+  }
+}
+
+function clearUpdateSentinel() {
+  try {
+    if (fs.existsSync(updateSentinelPath)) {
+      fs.unlinkSync(updateSentinelPath);
+      log("Update sentinel cleared.");
+    }
+  } catch (err) {
+    log(`WARN could not clear update sentinel: ${err && err.message}`);
+  }
+}
 
 function timestamp() {
   return new Date().toISOString();
@@ -536,6 +563,9 @@ async function main() {
       return 2;
     }
     try {
+      // v1.0.8.3: drop the sentinel BEFORE requesting shutdown so the launcher's
+      // crash-window branch is suppressed the moment node exits.
+      writeUpdateSentinel();
       log("Requesting a clean shutdown from AdvisePoint Docs.");
       console.log("Requesting a clean shutdown from AdvisePoint Docs (waiting up to 30 seconds)...");
       await requestServerShutdown();
@@ -636,8 +666,9 @@ async function main() {
 
 if (require.main === module) {
   main().then(
-    (code) => { process.exitCode = code; },
+    (code) => { clearUpdateSentinel(); process.exitCode = code; },
     (error) => {
+      clearUpdateSentinel();
       try {
         fail("Unexpected updater failure", error);
       } catch {
