@@ -5,8 +5,85 @@ A local search tool for technical manuals and admin guides.
 Everything runs on your own laptop. No internet connection required
 after install.
 
-The library starts empty. Upload your own PDFs, DOCX, TXT, or Markdown
-files from the Upload tab and they're indexed locally on your machine.
+The library starts empty. Upload your own PDFs, DOCX, RTF, TXT, or
+Markdown files from the Upload tab and they're indexed locally on
+your machine.
+
+
+SYSTEM REQUIREMENTS
+-------------------
+
+Check these before you install so nothing surprises you later.
+
+Operating system
+
+  * Windows 10 (64-bit) or Windows 11 (64-bit) on an Intel or AMD
+    x64 processor. This build is x64 only.
+
+Disk space
+
+  * About 500 MB free for the app folder itself.
+  * Additional room in %LOCALAPPDATA%\AdvisePoint Docs\ for your
+    library. A rough guide: budget 3-4x the total size of the
+    documents you plan to upload, which covers the SQLite database,
+    rendered page images, and the original files kept for viewing.
+  * If you use Scheduled Backups, budget extra room for the
+    backup destination folder as well - retention keeps N ZIPs on
+    disk, each roughly the size of your current library.
+
+Memory
+
+  * 4 GB RAM minimum, 8 GB recommended if you plan to upload large
+    PDFs (500+ pages) or work with several hundred documents.
+
+Display
+
+  * 1366 x 768 or larger. The Library, Query, and Settings pages
+    are designed for a laptop-class screen; smaller windows still
+    work but the filter rail may compress.
+
+Browser
+
+  * The app runs in your default web browser at
+    http://127.0.0.1:5000 . Modern Chromium-based browsers
+    (Chrome, Microsoft Edge) and Firefox are supported. The
+    in-app PDF viewer and the Ctrl+F in-document search need a
+    current browser build; Internet Explorer is not supported.
+
+Network
+
+  * No internet connection is required after install. All
+    parsing, indexing, and searching happen locally on the same
+    machine.
+  * Optional outbound access to github.com is used only when you
+    open Settings > System to check for a newer release, or when
+    you install one via the built-in updater.
+
+Permissions
+
+  * A regular Windows user account is enough. No administrator
+    rights are required to run the app or to install updates - the
+    updater writes into the app folder you extracted, and the
+    library lives under your own %LOCALAPPDATA% .
+  * You need normal write access to the folder you extracted the
+    app into and to your %LOCALAPPDATA% . Shared or read-only
+    locations are not suitable install targets.
+
+What's bundled - nothing extra to install
+
+  * The Node.js 20 LTS runtime the server needs is shipped inside
+    the app folder. There is no separate Node.js install to
+    manage.
+  * The SQLite database engine, PDF extractor, and DOCX/RTF
+    parsers are all included. The app does not download runtime
+    components at first launch.
+
+Optional: SmartScreen and antivirus
+
+  * See "Setup Icon (run once).bat" in Chapter 2 and the
+    Troubleshooting chapter for the one-time SmartScreen prompt
+    and antivirus exclusion notes. Neither is a hard requirement
+    but both make the first launch smoother.
 
 
 QUICK START
@@ -20,16 +97,16 @@ QUICK START
      a) Clears Windows' "downloaded from the internet" flag from
         every file in the folder. This removes the SmartScreen
         popups you'd otherwise see every time the app launches.
-     b) Creates a "AdvisePoint Docs" shortcut with the AdvisePoint Docs
-        icon that launches the app with no command window.
+     b) Creates an "AdvisePoint Docs" shortcut with the app icon
+        that launches the app with no command window.
    You may see ONE "Windows protected your PC" popup for this
    .bat itself - click "More info" then "Run anyway". After it
    finishes you shouldn't see the popup again.
 
-   NEW IN v0.9.29: even if you skip step 2 and launch the app
-   directly, "Start AdvisePoint Docs.bat" will now self-unblock
-   the folder on first run so the SmartScreen popup only shows
-   up once instead of on every launch.
+   Even if you skip step 2 and launch the app directly, "Start
+   AdvisePoint Docs.bat" will self-unblock the folder on first run
+   so the SmartScreen popup only shows up once instead of on every
+   launch.
 
 3. Double-click the new "AdvisePoint Docs" shortcut. Your browser
    opens at http://127.0.0.1:5000 with the app already loaded.
@@ -54,19 +131,146 @@ documents you upload stick around between sessions.
 UPDATING
 --------
 
-Double-click "Update AdvisePoint Docs.bat" in this folder. The updater
-checks GitHub for the latest release, verifies the download, and replaces
-the application files. If the browser tab is closed but the background
-server is still running, the updater identifies it and offers to shut it
-down cleanly before continuing. It never stops an unrelated process that
-happens to use port 5000.
+You have two ways to install a new build:
 
-Your database, uploaded documents, settings, and history remain under
-%LOCALAPPDATA%\AdvisePoint Docs\ and are never replaced by the updater.
-The previous application build is retained temporarily as dist.bak so
-the updater can restore it automatically if an update fails. Each later
-successful update replaces the prior dist.bak; backup folders do not
-accumulate.
+  * IN-APP UPDATER (recommended for point releases)
+    Open Settings > System. If a newer release is on GitHub the
+    panel shows the version and release notes. Click "Install and
+    restart" and the app fetches, verifies, and swaps in the new
+    build for you. If a background server is still running from an
+    old launch, the updater identifies it and offers to shut it
+    down cleanly first; it never touches an unrelated process that
+    happens to use port 5000. When the swap is complete the updater
+    relaunches the app automatically - no extra window to close, no
+    manual restart.
+
+    You can also drag-and-drop a downloaded ZIP directly onto the
+    Updates panel to install it without going to GitHub. Handy for
+    a hotfix build that isn't a public release, or for machines
+    that can't reach github.com.
+
+  * COMMAND-LINE UPDATER
+    Double-click "Update AdvisePoint Docs.bat" in the app folder.
+    Same fetch, verify, and swap as the in-app path, run from a
+    console window instead. Useful if the app won't start at all.
+
+Whichever path you use, your database, uploaded documents, saved
+searches, and settings under %LOCALAPPDATA%\AdvisePoint Docs\ are
+never replaced. The previous application build is retained
+temporarily as dist.bak so the updater can restore it automatically
+if the swap fails. Each successful update replaces the prior
+dist.bak; backup folders do not accumulate.
+
+POST-RESTORE GUIDANCE (new in 1.2.3)
+
+When a restore finishes, the app now shows a completion dialog that
+spells out what happened, where the pre-restore snapshot lives (for a
+Wipe & Replace restore), and how the Recovery panel's "Delete all"
+action interacts with the restore. Delete all in Recovery operates on
+the library that exists AFTER the restore, so it removes what the
+restore just added -- it does not undo the restore or return you to
+the pre-restore state. To roll back, close AdvisePoint Docs, rename
+the timestamped .bak folder next to your data directory over the
+current data folder, and restart.
+
+The same information is preserved to a small file next to your data
+directory (AdvisePoint Docs.last-op.json) so that if the app is
+force-closed before you dismiss the dialog, the next time you open
+the Settings > System tab, a banner surfaces the same message. The
+banner appears at most once per restore and is removed as soon as
+you see it.
+
+UPDATER --allow-same-version FLAG (new in 1.2.3)
+
+The command-line updater accepts --allow-same-version to permit
+reinstalling the same version that is already installed. Downgrades
+remain refused. Intended for developer repairs of a corrupted install
+and for reproducing a build during testing without having to bump
+the version number.
+
+Example:
+
+  "C:\Program Files\AdvisePoint Docs\update.exe" --local-zip C:\Path\To\AdvisePoint-Docs-1.2.3.zip --allow-same-version
+
+LOCAL-ZIP INTEGRITY CHECK (new in 1.2.2)
+
+When you drop a downloaded update zip onto the Updates panel or
+point the command-line updater at one, the updater now verifies the
+file before touching your installation:
+
+  * If a companion hash file (<zipname>.sha256 or SHA256SUMS.txt)
+    sits in the same folder as the update zip, the updater hashes
+    the zip and refuses to install on mismatch.
+  * If no companion hash file exists, the updater walks the entire
+    zip once and verifies every entry without writing anything.
+    Any corrupt entry stops the install cleanly before your app
+    folder is touched.
+
+On failure the updater prints an explicit "the update file on your
+disk is damaged" message with the mismatched hashes (or the failing
+entry name), and instructs you to redownload rather than retry
+against the same corrupt copy. This addresses the failure pattern
+where an in-flight file corruption -- from a bad USB thumbdrive,
+network share, or interrupted download -- surfaced only after the
+updater had begun extracting, and read to users as a generic "try
+again" prompt.
+
+TRANSFERRING THE UPDATE ZIP TO AN OFFLINE MACHINE
+
+If you need to move the update ZIP from one machine to another --
+for example, because the target laptop can't reach the internet
+during the install -- treat the transfer as untrusted and verify
+the copy before you install.
+
+Good transfer methods, most reliable first:
+
+  * Direct download on the target machine. Skips every intermediate
+    step. Preferred whenever the target can reach the download page.
+  * Cloud drop (OneDrive, Dropbox, Google Drive, iCloud Drive).
+    Upload from the source machine, download on the target. These
+    services verify bytes end-to-end on both transfers.
+  * SMB network share between the two machines on the same trusted
+    network.
+
+Acceptable, but verify afterwards:
+
+  * USB thumbdrive formatted as exFAT or NTFS with a full format
+    (not a quick format). Cheap or old thumbdrives can silently
+    return bad bytes on the largest files inside the ZIP, and the
+    updater will refuse to install a damaged file rather than write
+    a broken binary to your app folder. Ejecting the drive properly
+    is required but not sufficient - the stick itself has to be
+    healthy.
+
+Avoid:
+
+  * USB thumbdrives formatted as FAT32. FAT32 has no journaling
+    and no per-block integrity, and the observed failure mode of a
+    corrupt ZIP arriving at the target machine has always traced
+    back to a FAT32 stick when USB was involved.
+
+How to verify the copy is intact (recommended for any USB transfer):
+
+  1. On the SOURCE machine, right after downloading, open PowerShell
+     and run:
+         Get-FileHash "<path-to-zip>" -Algorithm SHA256
+     Copy the 64-character hash somewhere.
+  2. On the TARGET machine, after the copy arrives, run the same
+     command against the copy. Compare the two hashes character
+     for character.
+  3. If the two hashes match, install with confidence. If they
+     differ, the file was corrupted somewhere in the transfer -
+     do NOT run the updater against the damaged file. Redownload
+     or use a different transfer method.
+
+A <zipname>.sha256 file shipped alongside each release makes step 2
+trivial: run Get-FileHash on the target machine and compare it to
+the one line inside the .sha256 file.
+
+If you install without verifying and the updater refuses the ZIP
+with the "update file on your disk is damaged" message, the
+transfer is the first place to look - not the build. The same
+shipped build has already installed successfully on other machines.
 
 
 INSTALL LOCATION - RECOMMENDED FOLDER SETUP
@@ -101,9 +305,9 @@ Why this matters:
   * Files inherit the Mark-of-the-Web from the sync source, so
     SmartScreen popups keep coming back even after Setup Icon.
 
-Starting in v1.0.5 the app auto-detects the most common problem paths
-and shows an amber banner at the top of the window when it's running
-from one of them. The banner links back here and can be dismissed per
+The app auto-detects the most common problem paths and shows an
+amber banner at the top of the window when it's running from one
+of them. The banner links back here and can be dismissed per
 location. It reappears if you later move the app to a different
 problem folder.
 
@@ -124,19 +328,59 @@ ADDING YOUR OWN DOCUMENTS
 --------------------------
 
 1. Click the Upload tab.
-2. Drag a PDF, DOCX, TXT, or Markdown file onto the drop zone
+2. Drag a PDF, DOCX, RTF, TXT, or Markdown file onto the drop zone
    (or click the drop zone to browse for one).
-3. Fill in the Product model field (required). This is what makes
+3. Check the Product model field. AdvisePoint Docs suggests one
+   from the filename; correct it if needed, or leave it blank for
+   documents that aren't model-specific. This is what makes
    filtered searches work later.
-4. Fill in whatever other metadata is useful - product family, firmware
-   version, document type, confidentiality level, audience, tags.
+4. Fill in whatever other metadata is useful - product family,
+   firmware version, document type, confidentiality level,
+   audience, tags.
 5. Click Upload.
 
-The file is parsed, split into searchable excerpts, and indexed locally.
-Nothing is uploaded anywhere. Max file size is 150 MB.
+The file is parsed, split into searchable excerpts, and indexed
+locally. Nothing is uploaded anywhere. Max file size is 150 MB.
 
 Tip: the Tags field autocompletes from tags you've used before, so
 similar documents end up with consistent labels.
+
+Use Select folder... to choose a whole folder, or drag a folder onto
+Upload. Both paths gather PDF, DOCX, RTF, TXT, MD, and MARKDOWN files
+from its subfolders, up to 150 MB per file. Unsupported and oversized
+files are listed in a summary; hidden files and OS bookkeeping entries
+are ignored. Files are staged for review before upload.
+
+Fix Title is available beside Title on Upload and in the Library's
+Edit document dialog. It suggests a readable title from the original
+filename, never from the current title. If the title was hand-edited,
+compare the current and proposed wording before choosing Replace.
+The button remains available after use, and repeated clicks give the
+same suggestion. Older documents without a stored filename do not
+show the button. In Library, Save commits the edited title; Cancel
+leaves the document unchanged.
+
+Joined task words such as CloudPrintandScan become Cloud Print and Scan.
+This uses conservative matching for "and"; unfamiliar compounds may still
+need manual spacing rather than risking changes to ordinary words.
+
+
+SETTINGS
+--------
+
+Settings has four tabs, in this order:
+
+  * System - installed version and updates, viewer preferences,
+    Welcome Guide and Manage values side by side on wide windows,
+    Library scan, and diagnostics. A pending restore notice appears
+    first when present.
+  * Formats - Document types, Filename codes, and Filename phrases.
+  * Backup / Restore - backup controls, Recovery (including pre-restore
+    snapshots), duplicates, and interrupted or failed renders.
+  * Developer - Fields, Filter mapping, and Examples on one page.
+
+System opens by default. This organization changes where controls
+appear, not the saved settings or library data.
 
 
 SEARCHING
@@ -147,29 +391,322 @@ SEARCHING
       "How do I configure LDAP authentication?"
       "What are the paper size limits on the MZ9500ci?"
       "Steps to reset the fuser count"
-3. Use the filter panel on the left to narrow by product model,
-   firmware, document type, or confidentiality level.
-4. Toggle Hybrid on for combined vector + keyword search (recommended).
+3. Use the filter panel on the left to narrow results.
+4. Match mode:
+      Smart    - blended keyword + semantic (default; recommended)
+      Phrase   - exact-phrase match
+      Semantic - meaning-based match only
 
-Each result shows a relevance score, the excerpt of text that matched,
-and the source document. Your search terms are highlighted in amber
-in the result text so you can spot them at a glance. Click "Show
-metadata" to see the full record.
+Filters available on the left rail:
+
+  * Product family  - the top-level product line the document
+    belongs to. Independent from Product model, so you can pick
+    any family/model combination. Documents that don't have a
+    family recorded are always included when a family is picked,
+    so older uploads that pre-date the field don't drop out. The
+    filter is hidden when no document in your library has a
+    family recorded.
+  * Product model
+  * Document type   - Service Guide, Admin Guide, Release Notes, etc.
+  * Confidentiality - public / internal / restricted ceiling
+  * Tags            - free-form labels you set at upload time
+
+Each result shows a relevance score, the excerpt of text that
+matched, and the source document. Your search terms are
+highlighted in amber in the result text so you can spot them at a
+glance. Click "Show metadata" to see the full record.
+
+DOCUMENT VIEWER (in-document search):
+   Click a result to open the source document in the viewer. A
+   small badge in the top-right of the viewer tells you the file
+   type (PDF / DOCX / RTF / TXT / MD). Use Ctrl+F to search
+   inside the open document; matches are highlighted the same way
+   as query results.
+
+
+LIBRARY MANAGEMENT
+------------------
+
+Click the Library tab to see everything you've uploaded.
+
+  * Edit metadata           - click any document to edit its title,
+                              tags, confidentiality, and other
+                              fields.
+  * Delete a document       - moved to Recovery (see below), never
+                              hard-deleted until you say so.
+  * Find duplicates         - the "Find duplicates" button scans
+                              the library for documents with the
+                              same SHA-256 file hash. Groups are
+                              shown side-by-side; you pick which
+                              copy to keep.
+  * Manage values           - the "Manage values" button lists every
+                              product model and product family in
+                              use, with how many documents use each.
+                              Rename one to fix a misspelling
+                              everywhere at once, or rename it onto
+                              an existing value to merge the two.
+                              You are shown how many documents will
+                              change before anything happens.
+
+The Library list refreshes on its own whenever another panel
+changes what's in the library (a restore from Recovery, a merge
+restore, an auto-cleanup sweep). No manual reload needed.
+
+
+DOCUMENT TYPES
+--------------
+
+Settings > Formats contains the Document types list you can tag a document
+with. Each row can be renamed, given an accent color, reordered,
+merged, or deleted.
+
+  * Renaming             - fixes the name everywhere at once. Any
+                           filename code pointing at that type follows
+                           the rename automatically.
+  * Merging              - the merge button folds one type into
+                           another and re-tags every document that
+                           used it. Use this for near-duplicates such
+                           as "User Manual" and "User Guide".
+  * Deleting             - removes the type and puts its documents
+                           back on the plain "Document" type. If you
+                           want to keep the tagging, merge instead.
+
+New type names are capitalized for you, so typing "technical
+bulletin" stores "Technical Bulletin". Acronyms such as API, MFP and
+PDF keep their capitals, and names with deliberate mixed case such as
+HyPAS or MZ9500ci are stored exactly as you type them.
+
+BELOW the Document types list you'll find two editors that teach the
+uploader to guess a Document type from the filename:
+
+  * Filename codes   - short letter/digit codes such as OG, SB, or
+                       TB1 that map to a Document type. Matched on
+                       whole tokens.
+  * Filename phrases - full phrases such as "user guide" or "release
+                       notes" that map to a Document type. Matched
+                       on whole words after normalizing case and
+                       punctuation. Longest matching phrase wins.
+
+Codes are checked first. Phrases run only when no code matches, so a
+code you added won't be second-guessed by a phrase. Neither one ever
+overwrites a Document type you already picked yourself; both only
+run when the Document type is still blank or on the "Document"
+fallback. A fresh install ships with seven default phrases (User
+Guide, Admin Guide, Installation Guide, Quick Start, Release Notes,
+Troubleshooting Guide, Security Guide) that you can edit or delete
+any time from Settings > Formats > Filename phrases.
+
+
+MANAGING VALUES
+---------------
+
+Product model and Product family are free-text fields on each document,
+so near-duplicates like "PA6000x" and "PA6000x Series" can silently
+split your filter results. Manage values gives you one place to fix
+them: Settings > System > Manage values.
+
+  * Rename         - typing a NEW name renames the value on every
+                     document using it.
+  * Merge          - typing an EXISTING name folds the two values
+                     together, so "PA6000x" and "PA6000x Series"
+                     become one.
+  * Delete         - opens a small reassign dialog. Pick another
+                     existing value to merge into, or clear the
+                     field on the documents that used it. A delete
+                     never loses a document -- it just moves the
+                     value in a way you explicitly chose.
+
+Every change updates every affected document at once. There is no
+undo step, so export a backup first from Settings > Backup /
+Restore if you want a restore point.
+
+
+MANAGING DUPLICATES
+-------------------
+
+Uploading the same PDF twice, or merging in a backup that
+overlaps with your current library, both leave duplicates around.
+AdvisePoint Docs handles them non-destructively:
+
+  1. FINDING - the Library "Find duplicates" scan groups files by
+     SHA-256 hash. When there are no groups to show, the panel
+     stays hidden so it doesn't take up space in the sidebar.
+
+  2. CHOOSING A KEEPER - every group lists its copies newest first,
+     with the date each one was added, whether it has rendered
+     pages, and how many chunks it holds. One is pre-selected as
+     the "keeper" (typically the one you can actually view - the
+     original file still on disk with its rendered pages intact),
+     and the newest copy is labeled so it is easy to spot. Select
+     any other copy to keep that one instead; the KEEP and
+     QUARANTINE labels update as you choose, so you can see the
+     outcome before anything moves. The files in a group are
+     byte-for-byte identical, so this is really a choice about
+     which record to keep - its title, document type, tags,
+     product values, and date added. If you re-uploaded a file
+     after correcting its details, keep the newer copy. The other
+     copies are removed from the library but not destroyed.
+
+  3. WHERE THE REMOVED COPIES GO - every removed duplicate is moved
+     into %LOCALAPPDATA%\AdvisePoint Docs\deleted\<timestamp>-<id>\
+     with a manifest and the original file. Everything stays on
+     disk under a name you can find.
+
+  4. GETTING ONE BACK - open Settings > Backup / Restore > Recovery. The "Removed
+     documents" list shows every quarantined document with its
+     size and when it was removed. Click Restore to bring one back
+     into the live library. Restore is a stage-verify-swap: the
+     server unpacks the copy alongside the live data, verifies
+     everything is intact, and only then puts it back. If a
+     document with the same id is already in the library, the
+     restore refuses instead of overwriting.
+
+  5. PERMANENTLY DELETING - the Recovery panel also has a per-item
+     Delete button for a quarantined document you're sure you
+     don't need. It asks for a confirmation and then frees the
+     disk space.
+
+  6. OPT-IN AUTO-CLEANUP - the Recovery panel has a toggle labeled
+     "Auto-cleanup quarantined duplicates". Off by default. When
+     on, the app periodically sweeps ONLY quarantined DUPLICATES
+     whose keeper is still present in the library, still matches
+     by SHA-256, and is still viewable. Non-duplicate quarantined
+     documents are never touched by the sweep. There's also a
+     "Run cleanup now" button when the toggle is on.
+
+Nothing about this pipeline is destructive: every step keeps the
+original bytes on disk until you explicitly say "delete
+permanently" or turn on the opt-in sweep.
+
+
+BACKUP AND RECOVERY
+-------------------
+
+Backups live under Settings > Backup / Restore, laid out as three cards
+side-by-side.
+
+QUICK BACKUP (Column 1)
+   Pick a folder and click "Backup Now" - the whole library
+   (database + rendered pages + originals) is packed into a
+   timestamped ZIP written to that folder.
+
+   The folder input has a Browse button that opens the native
+   Windows folder picker (the same one you get from Save As in
+   other apps). If a folder is already typed, the picker opens
+   there; otherwise it uses the last folder you picked for Quick
+   Backup, then falls back to Documents. You can still paste or
+   type a path directly if you prefer.
+
+   A live preflight strip under the input tells you at a glance:
+     * whether the folder exists and is writable
+     * how much free space is there vs how much the backup needs
+     * whether the folder lives inside OneDrive / Dropbox /
+       Google Drive / iCloud / Box - if so you get a plain-language
+       warning and a checkbox to acknowledge you understand the
+       risk (sync clients can lock files mid-write).
+
+   "Download a copy" is a secondary button that sends the ZIP
+   through the browser to its default download location, without
+   writing to the folder above. Handy for grabbing a copy on a
+   machine where you don't have write access to the chosen folder.
+
+SCHEDULED BACKUPS (Column 2)
+   Pick a destination folder, a cadence (daily / weekly), a time
+   of day, a weekday (weekly only), and a retention count (how
+   many backups to keep before the oldest is deleted). The folder
+   picker works identically to Quick Backup, with its own
+   "last folder picked" memory so the two Browse buttons don't
+   share a starting point.
+
+   Click "Save schedule" to activate it. The bottom of the card
+   shows the last run's time, status, and size, plus an estimated
+   next-run time. If the last scheduled run failed, a persistent
+   amber banner appears above the card with plain-language failure
+   details and a Try again button.
+
+   "Backup now" on the scheduled card runs an immediate scheduled-
+   style backup against the scheduled folder - so if you turn on
+   scheduled backups for the first time you can get a baseline
+   without waiting for 2 AM.
+
+   Retention prunes only after a NEWER backup has been written
+   AND verified. If the new run fails, the previous backups stay
+   put - you're never left with only a broken one.
+
+   Scheduled runs write their own log at
+   %LOCALAPPDATA%\AdvisePoint Docs\backups.log so you can look
+   back at what ran when even after several rotations.
+
+RESTORE FROM BACKUP (Column 3)
+   Click "Choose file" (native OS file picker), pick a
+   previously-created backup ZIP, then pick a restore mode:
+
+     * Wipe - replaces the live library with the backup. Asks for
+       a typed confirmation. Uses stage-verify-swap under the
+       hood: the backup is unpacked into a temporary directory
+       alongside the live data, verified, THEN the swap happens.
+       If verification fails, nothing is replaced. A pre-restore
+       snapshot of the previous data set is kept as
+       %LOCALAPPDATA%\AdvisePoint Docs.bak-<timestamp>\ so you
+       can put things back if the restore was a mistake.
+
+     * Merge - adds documents from the backup that aren't in the
+       live library. Documents already present in the live
+       library (matched by id) are skipped, not overwritten.
+
+   Library, Recovery, and the header counters all refresh on their
+   own when the restore completes - no manual page reload.
+
+   Restores work across machines, Windows accounts, and
+   architectures. From 1.2.1 on, a backup taken on one PC can be
+   restored on any other supported Windows PC, under any Windows
+   account, on either x64 or ARM64, and every document's page
+   images will display correctly after the restore. Backups made
+   by earlier versions restore correctly on 1.2.1 as well; a
+   library restored on 1.2.1 or later self-heals its internal
+   page-image references on the next launch, so no additional
+   action is required.
+
+PRE-RESTORE SNAPSHOTS
+   Every wipe restore keeps a snapshot of what was replaced,
+   under the parent of the data directory (usually
+   %LOCALAPPDATA%\AdvisePoint Docs.bak-<timestamp>\). Recovery
+   lists these snapshots so you can see their size and free the
+   space when you're sure you don't need them.
+
+   Swapping a snapshot BACK IN is deliberately not offered from
+   the Recovery panel - restoring a whole data directory is
+   safest done with the app closed. The snapshot folder is a
+   full copy you can restore manually with the app closed if you
+   ever need to.
 
 
 WHERE YOUR DATA LIVES
 ---------------------
 
-Every document you upload is stored under:
+Everything is stored under:
 
    %LOCALAPPDATA%\AdvisePoint Docs\
      advisepoint.db          <- the SQLite database
-     pages\          <- rendered page images for the manual viewer
-     server.log      <- rolling log for diagnosing crashes
+     pages\                  <- rendered page images for the viewer
+     originals\              <- the source files you uploaded
+     deleted\                <- quarantined documents (see Managing
+                                Duplicates). Each subfolder has
+                                the manifest + original + pages
+                                needed to restore it, or you can
+                                just delete the folder in File
+                                Explorer to free the space.
+     server.log              <- rolling log for diagnosing crashes
+     backups.log             <- rolling log for scheduled backups
 
-That folder survives reinstalls and updates. If you ever want a truly
-fresh start, close the app and delete that folder - the next launch
-will recreate an empty database.
+Snapshots created by a wipe restore live one level up:
+
+   %LOCALAPPDATA%\AdvisePoint Docs.bak-<timestamp>\
+
+That data folder survives reinstalls and updates. If you ever want
+a truly fresh start, close the app and delete
+%LOCALAPPDATA%\AdvisePoint Docs\ - the next launch recreates an
+empty database.
 
 
 TROUBLESHOOTING
@@ -209,28 +746,59 @@ TROUBLESHOOTING
   Large PDFs (500+ pages) can take 30-60 seconds. This is normal.
   Look at the console window for progress.
 
+* "Reconnecting..." banner during a long operation:
+  Backups, restores, and large uploads can hold the loopback
+  connection open long enough for the reconnect probe to blink.
+  The banner is suppressed during known-busy operations so you
+  shouldn't see it in normal use. If it does appear, wait for the
+  op to finish; the app reconnects automatically.
+
+* Library counter doesn't match what I see in the list:
+  If you're on a build older than 1.0.14 you may need to refresh
+  the page after a delete/restore. From 1.0.14 on, the list and
+  header counters refresh automatically after Recovery restores,
+  Library deletes, backup restores, and auto-cleanup sweeps.
+
+* An update failed / the app won't start after updating:
+  The updater keeps the previous build as dist.bak next to the new
+  dist folder. To roll back manually: close the app, rename dist
+  to dist.broken, rename dist.bak to dist, and relaunch.
+
+* Restore says "id already in use":
+  The Recovery panel refuses to overwrite a live document with a
+  quarantined one that has the same id. This is deliberate - it
+  keeps a mistaken Restore click from stomping on a document you
+  edited after removing the earlier copy. Delete or export the
+  live document first if you want the quarantined version back.
+
 
 TECHNICAL DETAILS
 -----------------
 
 * Runtime: Portable Node.js 20 LTS (bundled - no install required)
 * Database: SQLite via better-sqlite3
-* Extraction: pdf-parse for PDFs, mammoth for DOCX, pdf.js for
-  page rendering (with cMap and standard font support so
-  PowerPoint-exported PDFs render correctly)
+* Extraction: pdf-parse for PDFs, mammoth for DOCX, native RTF
+  parser, pdf.js for page rendering (with cMap and standard font
+  support so PowerPoint-exported PDFs render correctly)
 * Search: TF-IDF hybrid retrieval (vector + keyword)
-* All processing happens locally. No network calls are made.
+* Integrity: SHA-256 hashes on uploaded files (duplicate detection)
+  and on backup ZIP contents (restore verification)
+* All processing happens locally. No network calls are made
+  except the update check to GitHub and the update download itself
+  when you use the built-in updater.
 
 
 REMOVING THE APP
 ----------------
 
 Delete the "AdvisePoint Docs" folder. To also remove your uploaded
-documents, delete the %LOCALAPPDATA%\AdvisePoint Docs\ folder.
+documents, delete the %LOCALAPPDATA%\AdvisePoint Docs\ folder and
+any %LOCALAPPDATA%\AdvisePoint Docs.bak-* snapshot folders left by
+past restores.
 
 
 VERSION
 -------
 
-AdvisePoint Docs 1.0.0
+AdvisePoint Docs 1.2.6
 Bundled Node.js: 20.18.1

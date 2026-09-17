@@ -27,18 +27,27 @@ import { tmpdir } from "node:os";
 import { pipeline } from "node:stream/promises";
 import type { Writable } from "node:stream";
 import Database from "better-sqlite3";
-// archiver's typings expose it as a callable module. Under
-// esModuleInterop, `import archiver from "archiver"` works at runtime
-// but the CJS module has no default export in its .d.ts, so we import
-// the namespace and re-alias to a callable. This yields the correct
-// return type without needing @ts-ignore.
+// archiver is a CommonJS module whose module.exports IS the factory
+// function. `import * as archiverNs from "archiver"` asks esbuild for
+// a namespace object, and esbuild's __toESM wrapper produces
+// { default: factory, ...spreadOfExports } -- an object, not a callable.
+// Calling that object at runtime throws "is not a function", which is
+// exactly what shipped in every packaged build prior to this one.
+// The `as unknown as (...)` cast in earlier versions silenced the type
+// error, so the defect was invisible to the TypeScript compiler and
+// only surfaced against a packaged bundle -- never under tsx.
+//
+// Fix: pick the callable off .default when the interop wrapper put it
+// there, and fall back to the namespace itself when it is already the
+// factory (e.g. a future migration to a real ESM archiver build, or a
+// bundler that doesn't wrap CJS defaults).
 import * as archiverNs from "archiver";
-const archiver = archiverNs as unknown as (
+const archiver = (((archiverNs as unknown) as { default?: unknown }).default ?? archiverNs) as (
   format: "zip" | "tar",
   options?: archiverNs.ArchiverOptions,
 ) => archiverNs.Archiver;
 
-import { DB_FILE_PATH, getPagesDirForBackup, getDataDirForBackup, rawDb } from "./storage";
+import { DB_FILE_PATH, getPagesDirForBackup, getDataDirForBackup, rawDb, closeDbForRestore } from "./storage";
 import { getOriginalsDir } from "./originals";
 import { APP_VERSION } from "../client/src/version";
 
@@ -74,6 +83,198 @@ export interface ImportStats {
   // Wipe-mode only: the .bak folder we set aside. Kept for one cycle so a
   // bad import is recoverable from disk.
   bak_dir?: string;
+}
+
+// -------- Plain-language error translator --------
+//
+// Every path that writes a backup (manual export, scheduled run, run-now,
+// scheduled-run-now) routes its caught exception through this function
+// before showing anything to the user. The goal is that no packaged
+// build ever surfaces raw `error.message` -- users get a plain-language
+// cause and a suggested next action; support still gets the raw text in
+// server.log and in the diagnostics zip.
+//
+// The translator is intentionally conservative: if none of the patterns
+// match, it returns a generic "Something went wrong writing the backup"
+// message plus a request to send diagnostics, rather than falling
+// through to the raw exception.
+export interface FriendlyBackupError {
+  // Short, user-facing headline. Never contains a raw exception message.
+  title: string;
+  // One-sentence description of the likely cause.
+  cause: string;
+  // Concrete thing the user can do next. Empty when there is no useful
+  // action (rare; only for internal-defect matches).
+  next_action: string;
+  // Underlying category, so the client can pick an icon / call-to-action.
+  //   "drive-missing"   -- path or drive not there
+  //   "permission"      -- writable check or EACCES/EPERM
+  //   "disk-full"       -- ENOSPC
+  //   "low-space"       -- preflight said not enough headroom
+  //   "internal-defect" -- looks like an app bug; ask for diagnostics
+  //   "verification-failed"  -- v1.0.12.3: refused before any data was touched
+  //   "restore-rolled-back"  -- v1.0.12.3: swap failed; previous data restored
+  //   "unknown"         -- fell through every pattern
+  kind:
+    | "drive-missing"
+    | "permission"
+    | "disk-full"
+    | "low-space"
+    | "internal-defect"
+    | "verification-failed"
+    | "restore-rolled-back"
+    | "unknown";
+  // Original message. Kept for the log / diagnostics only, never for the
+  // primary UI surface. Truncated so it can't blow the settings row.
+  raw: string;
+}
+
+export function translateBackupError(err: unknown): FriendlyBackupError {
+  const raw = truncate(errorMessage(err), 400);
+  const code = errorCode(err);
+
+  // v1.0.12.3: a deliberate safety refusal or rollback already carries a
+  // precise, user-facing explanation. Passing it through the generic
+  // translator below turned "the backup failed verification" into
+  // "something went wrong writing the backup", which is both wrong and
+  // hides the reason. Surface the real message instead.
+  const message = errorMessage(err);
+  if (/^Refusing to (restore|merge):/.test(message)) {
+    return {
+      title: "That backup did not pass verification",
+      cause: truncate(
+        message
+          .replace(/^Refusing to (restore|merge):\s*/, "")
+          .replace(/^the backup did not pass verification\.\s*/, ""),
+        400,
+      ),
+      next_action:
+        "Your library was not modified. Try a different backup file; if every backup " +
+        "reports this, the backups themselves are damaged.",
+      kind: "verification-failed",
+      raw,
+    };
+  }
+  if (/^Restore failed and your previous library was put back:/.test(message)) {
+    return {
+      title: "Restore failed and was rolled back",
+      cause: truncate(message, 400),
+      next_action: "Restart AdvisePoint Docs, then send a diagnostics bundle from Settings.",
+      kind: "restore-rolled-back",
+      raw,
+    };
+  }
+
+  // Node fs errors surface a `.code` property we can key off.
+  if (code === "ENOENT") {
+    return {
+      title: "Backup folder isn't there right now",
+      cause: "The folder you picked for backups can't be found. If it's on an external drive, the drive may not be connected.",
+      next_action: "Reconnect the drive, or pick a different folder in Backup settings.",
+      kind: "drive-missing",
+      raw,
+    };
+  }
+  if (code === "EACCES" || code === "EPERM") {
+    return {
+      title: "AdvisePoint Docs can't write to that folder",
+      cause: "The chosen backup folder is read-only for this Windows account, or another program is holding the folder open.",
+      next_action: "Pick a folder you have write access to, or close the program that has it open and try again.",
+      kind: "permission",
+      raw,
+    };
+  }
+  if (code === "ENOSPC") {
+    return {
+      title: "That drive is full",
+      cause: "There isn't enough free space on the target drive to finish writing the backup file.",
+      next_action: "Free up space on the drive, or pick a drive with more room.",
+      kind: "disk-full",
+      raw,
+    };
+  }
+
+  // Preflight rejections carry a synthetic tag we set in the settings
+  // endpoint, so the translator recognizes them without looking at the
+  // raw exception message.
+  if (code === "E_LOW_SPACE") {
+    return {
+      title: "Not enough free space on that drive",
+      cause: "The next backup is expected to be larger than the free space on the chosen drive.",
+      next_action: "Free up space or pick a drive with more room.",
+      kind: "low-space",
+      raw,
+    };
+  }
+  if (code === "E_NOT_WRITABLE") {
+    return {
+      title: "That folder isn't writable",
+      cause: "AdvisePoint Docs tried to write a small test file in the folder and Windows refused.",
+      next_action: "Pick a folder you have write access to.",
+      kind: "permission",
+      raw,
+    };
+  }
+  if (code === "E_DRIVE_MISSING") {
+    return {
+      title: "Drive isn't connected",
+      cause: "The drive letter for that folder isn't currently plugged in.",
+      next_action: "Reconnect the drive, or pick a different folder in Backup settings.",
+      kind: "drive-missing",
+      raw,
+    };
+  }
+
+  // The archiver interop defect shipped in every packaged release prior
+  // to this one. If a future regression puts it back, catch it here so
+  // the user sees an app-defect message rather than the raw TypeError.
+  if (/\bis not a function\b/i.test(raw)) {
+    return {
+      title: "Backup couldn't start",
+      cause: "This looks like a defect inside AdvisePoint Docs, not something with the drive or folder.",
+      next_action: "Send a diagnostics bundle from Settings so it can be fixed.",
+      kind: "internal-defect",
+      raw,
+    };
+  }
+
+  return {
+    title: "Something went wrong writing the backup",
+    cause: "AdvisePoint Docs hit an unexpected error while writing the backup file.",
+    next_action: "Try again. If it keeps failing, send a diagnostics bundle from Settings.",
+    kind: "unknown",
+    raw,
+  };
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try { return JSON.stringify(err); } catch { return String(err); }
+}
+function errorCode(err: unknown): string | null {
+  if (err && typeof err === "object" && "code" in err) {
+    const c = (err as { code?: unknown }).code;
+    if (typeof c === "string") return c;
+  }
+  return null;
+}
+function truncate(s: string, n: number): string {
+  return s.length <= n ? s : s.slice(0, n - 1) + "\u2026";
+}
+
+// Small typed error class so preflight and settings paths can attach a
+// stable `code` the translator recognizes.
+export class BackupPreflightError extends Error {
+  code:
+    | "E_DRIVE_MISSING"
+    | "E_NOT_WRITABLE"
+    | "E_LOW_SPACE";
+  constructor(code: BackupPreflightError["code"], message: string) {
+    super(message);
+    this.name = "BackupPreflightError";
+    this.code = code;
+  }
 }
 
 // -------- Helpers --------
@@ -267,13 +468,19 @@ export async function writeBackupTo(
 }
 
 /**
- * Write a backup to a target file on disk. Used by the scheduled backup
- * runner. Returns the resulting size and manifest.
+ * Write a backup to a target file on disk. Used by both the scheduled
+ * backup runner and the manual "Back up now to folder" endpoint. The
+ * optional `opts.localStorageJson` is included in the archive the same
+ * way `writeBackupTo` includes it for the streaming HTTP export.
+ * Returns the resulting size and manifest.
  */
-export async function writeBackupToFile(outPath: string): Promise<BackupResult> {
+export async function writeBackupToFile(
+  outPath: string,
+  opts: { localStorageJson?: string | null } = {},
+): Promise<BackupResult> {
   ensureDir(dirname(outPath));
   const ws = createWriteStream(outPath);
-  const manifest = await writeBackupTo(ws);
+  const manifest = await writeBackupTo(ws, { localStorageJson: opts.localStorageJson ?? null });
   const bytes = statSync(outPath).size;
   return { bytes, manifest, path: outPath };
 }
@@ -353,69 +560,317 @@ export function cleanupStaged(staged: StagedImport): void {
  * closed the DB connection before invoking this so Windows can rename
  * the .db file.
  */
-export function importWipeReplace(staged: StagedImport): { bak_dir: string } {
+export interface VerifyResult {
+  ok: boolean;
+  problems: string[];
+  documents: number;
+  chunks: number;
+  page_files: number;
+}
+
+/** Recursive file count, used to prove a page tree copied completely. */
+function countFiles(dir: string): number {
+  if (!existsSync(dir)) return 0;
+  let n = 0;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) n += countFiles(join(dir, entry.name));
+    else n += 1;
+  }
+  return n;
+}
+
+/**
+ * v1.0.12.3 — prove a database file is intact and plausible BEFORE it is
+ * allowed to replace live data.
+ *
+ * Opens the file read-only in its own connection and runs a full
+ * integrity_check, then confirms the expected tables exist and reads the row
+ * counts. When a manifest is available the counts must match it, which catches
+ * a truncated or partially written archive that still happens to open.
+ */
+export function verifyDatabaseFile(dbPath: string, manifest: BackupManifest | null): VerifyResult {
+  const problems: string[] = [];
+  let documents = -1;
+  let chunks = -1;
+
+  if (!existsSync(dbPath)) {
+    return { ok: false, problems: ["database file is missing"], documents, chunks, page_files: 0 };
+  }
+  try {
+    const size = statSync(dbPath).size;
+    if (size === 0) problems.push("database file is empty");
+  } catch {
+    problems.push("database file could not be read");
+  }
+
+  let probe: import("better-sqlite3").Database | null = null;
+  try {
+    probe = new Database(dbPath, { readonly: true, fileMustExist: true });
+    const integrity = probe.pragma("integrity_check") as Array<{ integrity_check: string }>;
+    const verdict = integrity?.[0]?.integrity_check ?? "unknown";
+    if (verdict !== "ok") problems.push(`database failed integrity check: ${verdict}`);
+
+    const tables = new Set(
+      (probe.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>)
+        .map((r) => r.name),
+    );
+    for (const required of ["documents", "chunks"]) {
+      if (!tables.has(required)) problems.push(`database is missing the ${required} table`);
+    }
+    if (tables.has("documents")) {
+      documents = (probe.prepare("SELECT COUNT(*) AS n FROM documents").get() as { n: number }).n;
+    }
+    if (tables.has("chunks")) {
+      chunks = (probe.prepare("SELECT COUNT(*) AS n FROM chunks").get() as { n: number }).n;
+    }
+  } catch (err) {
+    problems.push(`database could not be opened: ${(err as Error).message || String(err)}`);
+  } finally {
+    try { probe?.close(); } catch { /* ignore */ }
+  }
+
+  if (manifest) {
+    if (typeof manifest.document_count === "number" && documents >= 0 && manifest.document_count !== documents) {
+      problems.push(`document count mismatch: backup says ${manifest.document_count}, file contains ${documents}`);
+    }
+    if (typeof manifest.chunk_count === "number" && chunks >= 0 && manifest.chunk_count !== chunks) {
+      problems.push(`chunk count mismatch: backup says ${manifest.chunk_count}, file contains ${chunks}`);
+    }
+  }
+
+  return { ok: problems.length === 0, problems, documents, chunks, page_files: 0 };
+}
+
+/**
+ * v1.0.12.3 — wipe-and-replace restore, rebuilt so live data is never
+ * overwritten by anything unverified.
+ *
+ * The previous version moved the live database aside and copied the staged
+ * file over the top with no verification of either side, and without closing
+ * the database first -- so on Windows the very first rename failed and the
+ * restore could not succeed at all.
+ *
+ * Order of operations now:
+ *   1. Verify the staged database (integrity_check + counts vs manifest).
+ *      Refuse before touching anything if it fails.
+ *   2. Assemble the complete new data set in a temp folder beside the live
+ *      data, then verify the ASSEMBLED copy -- this catches a copy that was
+ *      truncated on the way in, and the page file count must match.
+ *   3. Close the database so the file can be moved on Windows.
+ *   4. Move the current data into a timestamped .bak folder, which is never
+ *      deleted or reused.
+ *   5. Move the verified temp folder into place.
+ *   6. Verify the now-live database again. If anything failed after step 4,
+ *      roll the .bak contents back and report failure.
+ */
+/**
+ * v1.0.12.3 — is this backup archive provably restorable?
+ *
+ * Retention used to delete older backups purely by count and date. If the
+ * newest archives were damaged, that quietly destroyed the last good copy the
+ * user had. Nothing is pruned now unless a newer archive passes the same
+ * verification a restore would demand, so an unverifiable backup can only
+ * ever accumulate, never displace a known-good one.
+ */
+export async function verifyBackupArchiveFile(zipPath: string): Promise<VerifyResult> {
+  let staged: StagedImport | null = null;
+  try {
+    staged = await stageImport(zipPath);
+    return verifyDatabaseFile(staged.dbPath, staged.manifest);
+  } catch (err) {
+    return {
+      ok: false,
+      problems: [`archive could not be read: ${(err as Error).message}`],
+      documents: -1,
+      chunks: -1,
+      page_files: 0,
+    };
+  } finally {
+    if (staged) {
+      try { cleanupStaged(staged); } catch { /* best effort */ }
+    }
+  }
+}
+
+export function importWipeReplace(staged: StagedImport): { bak_dir: string; verified: VerifyResult } {
   if (!staged.dbPath) throw new Error("Backup is missing db/data.db");
 
   const dataDir = getDataDirForBackup();
   const currentDb = DB_FILE_PATH;
   const currentPages = getPagesDirForBackup();
-
-  const bakSuffix = `.bak-${tsForFilename()}`;
-  const bakDir = `${dataDir}${bakSuffix}`;
-
-  // Move current data folder wholesale to a sibling .bak-* directory. On
-  // Windows a rename fails across filesystems, but data.db and pages/ are
-  // colocated by default so a single parent-rename does it in one hop.
-  //
-  // NOTE: We cannot rename the *parent* data dir because the DB file was
-  // just closed; the folder may still contain server logs, WAL/SHM etc.
-  // So we move file-by-file, DB + pages only, into a sibling folder.
-  ensureDir(bakDir);
-
-  if (existsSync(currentDb)) {
-    renameSync(currentDb, join(bakDir, basename(currentDb)));
-    // Also move sidecar WAL/SHM if they were present.
-    for (const sfx of ["-wal", "-shm"]) {
-      const p = `${currentDb}${sfx}`;
-      if (existsSync(p)) renameSync(p, join(bakDir, `${basename(currentDb)}${sfx}`));
-    }
-  }
-  if (existsSync(currentPages)) {
-    renameSync(currentPages, join(bakDir, "pages"));
-  }
-  // v1.0.6: preserve current originals alongside DB + pages so a restore
-  // is reversible.
   const currentOriginals = getOriginalsDir();
-  if (existsSync(currentOriginals)) {
-    renameSync(currentOriginals, join(bakDir, "originals"));
+
+  // ---- 1. Verify what arrived, before anything is at risk. --------------
+  const incoming = verifyDatabaseFile(staged.dbPath, staged.manifest ?? null);
+  if (!incoming.ok) {
+    throw new Error(
+      `Refusing to restore: the backup did not pass verification. ${incoming.problems.join("; ")}. ` +
+      `Your current library has not been modified.`,
+    );
   }
 
-  // Move staged content into place.
-  copyFileSync(staged.dbPath, currentDb);
-  if (staged.pagesDir) {
-    copyDirRecursive(staged.pagesDir, currentPages);
-  }
-  // v1.0.6: restore originals if present in the backup. Pre-v1.0.6
-  // backups leave staged.originalsDir empty and this becomes a no-op.
-  if (staged.originalsDir) {
-    copyDirRecursive(staged.originalsDir, currentOriginals);
+  const ts = tsForFilename();
+  const bakDir = `${dataDir}${`.bak-${ts}`}`;
+  const newDir = join(dataDir, `.restore-verify-${ts}`);
+  const stagedPageCount = staged.pagesDir ? countFiles(staged.pagesDir) : 0;
+
+  // ---- 2. Assemble and verify the new data set off to one side. ---------
+  try {
+    if (existsSync(newDir)) rmSync(newDir, { recursive: true, force: true });
+    ensureDir(newDir);
+    const newDb = join(newDir, basename(currentDb));
+    copyFileSync(staged.dbPath, newDb);
+    if (staged.pagesDir) copyDirRecursive(staged.pagesDir, join(newDir, "pages"));
+    if (staged.originalsDir) copyDirRecursive(staged.originalsDir, join(newDir, "originals"));
+
+    const assembled = verifyDatabaseFile(newDb, staged.manifest ?? null);
+    const assembledPages = countFiles(join(newDir, "pages"));
+    if (!assembled.ok) {
+      throw new Error(
+        `the staged copy did not verify (${assembled.problems.join("; ")})`,
+      );
+    }
+    if (assembledPages !== stagedPageCount) {
+      throw new Error(
+        `page images did not copy completely (expected ${stagedPageCount}, got ${assembledPages})`,
+      );
+    }
+    if (
+      staged.manifest &&
+      typeof staged.manifest.pages_file_count === "number" &&
+      staged.manifest.pages_file_count !== assembledPages
+    ) {
+      throw new Error(
+        `page image count mismatch: backup says ${staged.manifest.pages_file_count}, found ${assembledPages}`,
+      );
+    }
+    incoming.page_files = assembledPages;
+  } catch (err) {
+    try { rmSync(newDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    throw new Error(
+      `Refusing to restore: ${(err as Error).message || String(err)}. ` +
+      `Your current library has not been modified.`,
+    );
   }
 
-  return { bak_dir: bakDir };
+  // ---- 3. Close the database so the live file can be moved. -------------
+  // Past this point the process must not query the DB; the caller reports
+  // restart_required.
+  closeDbForRestore();
+
+  // ---- 4. Set the current data aside. ----------------------------------
+  ensureDir(bakDir);
+  const movedBack: Array<[string, string]> = [];
+  const moveAside = (src: string, destName: string) => {
+    if (!existsSync(src)) return;
+    const dest = join(bakDir, destName);
+    renameSync(src, dest);
+    movedBack.push([dest, src]);
+  };
+
+  const rollback = (why: string): never => {
+    // Put the original data back exactly where it came from. The .bak folder
+    // is left in place either way; it is never deleted.
+    for (const [from, to] of movedBack) {
+      try {
+        if (existsSync(to)) rmSync(to, { recursive: true, force: true });
+        renameSync(from, to);
+      } catch (err) {
+        console.error(`[BACKUP] rollback could not restore ${to}:`, err);
+      }
+    }
+    throw new Error(
+      `Restore failed and your previous library was put back: ${why}. ` +
+      `A copy of everything involved is in ${bakDir}. Restart the application.`,
+    );
+  };
+
+  try {
+    moveAside(currentDb, basename(currentDb));
+    for (const sfx of ["-wal", "-shm"]) {
+      moveAside(`${currentDb}${sfx}`, `${basename(currentDb)}${sfx}`);
+    }
+    moveAside(currentPages, "pages");
+    moveAside(currentOriginals, "originals");
+  } catch (err) {
+    rollback(`the current library could not be set aside (${(err as Error).message || String(err)})`);
+  }
+
+  // ---- 5. Move the verified data into place. ----------------------------
+  try {
+    renameSync(join(newDir, basename(currentDb)), currentDb);
+    if (existsSync(join(newDir, "pages"))) renameSync(join(newDir, "pages"), currentPages);
+    if (existsSync(join(newDir, "originals"))) renameSync(join(newDir, "originals"), currentOriginals);
+  } catch (err) {
+    rollback(`the verified data could not be moved into place (${(err as Error).message || String(err)})`);
+  }
+
+  // ---- 6. Verify what is now live. --------------------------------------
+  const live = verifyDatabaseFile(currentDb, staged.manifest ?? null);
+  const livePages = countFiles(currentPages);
+  if (!live.ok) {
+    rollback(`the restored database did not verify in place (${live.problems.join("; ")})`);
+  }
+  if (livePages !== incoming.page_files) {
+    rollback(`page images are incomplete after the swap (expected ${incoming.page_files}, found ${livePages})`);
+  }
+  live.page_files = livePages;
+
+  try { rmSync(newDir, { recursive: true, force: true }); } catch { /* ignore */ }
+
+  return { bak_dir: bakDir, verified: live };
 }
 
 /**
- * Merge: additive. Attach the staged DB as a second connection, INSERT
- * ... SELECT into every table we know about, then copy any pages/**
- * files that the current install doesn't already have.
+ * Merge: additive with skip-on-collision. Attach the staged DB as a
+ * second connection and INSERT ... SELECT any documents whose id is
+ * NOT already present in the live database. Chunks, page rows, and
+ * page/original files follow the same rule: if their parent document
+ * id already exists in live, they are skipped entirely because the
+ * live copy is authoritative.
  *
- * ID collisions are resolved by remapping the imported row to a fresh
- * UUID; the corresponding page files get renamed too.
+ * v1.0.11.4: prior releases did the opposite -- they detected an id
+ * collision and remapped the incoming row to a fresh UUID, which
+ * meant restoring a backup on top of its own live database produced
+ * a duplicate of every single document. That is not what "merge"
+ * means; it should skip anything that already exists.
  *
- * Duplicate detection is deliberately NOT performed (per user spec).
+ * Content-hash-based dedupe for documents that legitimately have
+ * different ids but identical content is intentionally NOT performed
+ * here; that would need a separate content hash and is deferred to a
+ * future release.
  */
-export function importMerge(staged: StagedImport): { documents_imported: number; chunks_imported: number; pages_files_copied: number } {
+export function importMerge(staged: StagedImport): { documents_imported: number; chunks_imported: number; pages_files_copied: number; snapshot: string | null } {
   if (!staged.dbPath) throw new Error("Backup is missing db/data.db");
+
+  // v1.0.12.3 - verify before attaching. A corrupt backup attached to the
+  // live connection can fail mid-transaction, and a merge writes directly
+  // into the live database, so the check has to happen first.
+  const incoming = verifyDatabaseFile(staged.dbPath, staged.manifest ?? null);
+  if (!incoming.ok) {
+    throw new Error(
+      `Refusing to merge: the backup did not pass verification. ${incoming.problems.join("; ")}. ` +
+      `Your current library has not been modified.`,
+    );
+  }
+
+  // v1.0.12.3 - snapshot the live database first so a merge is reversible.
+  // VACUUM INTO writes a consistent copy without closing the connection.
+  let snapshot: string | null = null;
+  try {
+    const snapDir = join(getDataDirForBackup(), `.pre-merge-${tsForFilename()}`);
+    ensureDir(snapDir);
+    const snapPath = join(snapDir, basename(DB_FILE_PATH));
+    rawDb.exec(`VACUUM INTO '${snapPath.replace(/'/g, "''")}'`);
+    snapshot = snapPath;
+  } catch (err) {
+    // A merge only ever adds rows, but without a snapshot there is no undo,
+    // so refuse rather than proceed unprotected.
+    throw new Error(
+      `Refusing to merge: could not snapshot the current library first ` +
+      `(${(err as Error).message || String(err)}). Nothing has been modified.`,
+    );
+  }
 
   // Attach the staged DB to the live connection as `bkp`.
   const staged_escaped = staged.dbPath.replace(/'/g, "''");
@@ -423,21 +878,27 @@ export function importMerge(staged: StagedImport): { documents_imported: number;
 
   let documents_imported = 0;
   let chunks_imported = 0;
-  const idRemap = new Map<string, string>();
+  // Set of backup document ids we actually imported this run. Chunks,
+  // page rows, and file copies below are only applied for docs in
+  // this set -- if a doc was skipped because it already exists live,
+  // its associated rows and files must be skipped too so we do not
+  // touch or overwrite anything on the live side.
+  const importedDocIds = new Set<string>();
 
   try {
     const tx = rawDb.transaction(() => {
-      // Read every doc from bkp; if the id already exists in live, remap.
-      const bkpDocs = rawDb.prepare("SELECT id FROM bkp.documents").all() as { id: string }[];
+      // 1. Decide which backup docs to import: only those whose id is
+      //    NOT already present in the live database.
+      const bkpDocIds = rawDb.prepare("SELECT id FROM bkp.documents").all() as { id: string }[];
       const liveHasDoc = rawDb.prepare("SELECT 1 FROM documents WHERE id = ?");
-      for (const d of bkpDocs) {
+      for (const d of bkpDocIds) {
         const collides = liveHasDoc.get(d.id) as unknown;
-        if (collides) idRemap.set(d.id, cryptoRandomId());
+        if (!collides) importedDocIds.add(String(d.id));
       }
 
-      // Insert documents (remap id where needed). Column list must match
-      // the live schema; SELECT * would fail on any schema drift so we
-      // enumerate columns explicitly from the live table.
+      // 2. Insert only new documents. Column list must match the live
+      //    schema; SELECT * would fail on any schema drift so we
+      //    enumerate columns explicitly from the live table.
       const docCols = tableColumns("documents");
       const bkpDocCols = tableColumns("bkp.documents");
       const sharedDocCols = docCols.filter((c) => bkpDocCols.includes(c));
@@ -449,44 +910,56 @@ export function importMerge(staged: StagedImport): { documents_imported: number;
         `VALUES (${sharedDocCols.map(() => "?").join(", ")})`,
       );
       for (const row of bkpDocRows) {
-        const newId = idRemap.get(String(row.id)) ?? row.id;
-        row.id = newId;
+        if (!importedDocIds.has(String(row.id))) continue;
         const vals = sharedDocCols.map((c) => row[c] as any);
         insDoc.run(...vals);
         documents_imported += 1;
       }
 
-      // Chunks reference document_id; remap alongside.
+      // 3. Chunks: import only rows whose document_id is in the
+      //    just-imported set. Chunks whose parent doc already existed
+      //    in live are skipped entirely; live's chunks are authoritative.
       const chunkCols = tableColumns("chunks");
       const bkpChunkCols = tableColumns("bkp.chunks");
       const sharedChunkCols = chunkCols.filter((c) => bkpChunkCols.includes(c));
-      const hasDocFk = sharedChunkCols.includes("document_id");
-      const bkpChunkRows = rawDb.prepare(
-        `SELECT ${sharedChunkCols.map((c) => `"${c}"`).join(", ")} FROM bkp.chunks`,
-      ).all() as Record<string, unknown>[];
+      // Chunks link to documents via one of two column names depending
+      // on how old the schema is: legacy "document_id" or current
+      // "parent_id". Pick whichever this build actually uses so we
+      // filter correctly. If neither is present, the schema is
+      // unrecognised and we skip chunk import entirely -- inserting
+      // chunks with no FK to filter on could smuggle orphans onto live.
+      const chunkFk = sharedChunkCols.includes("parent_id")
+        ? "parent_id"
+        : (sharedChunkCols.includes("document_id") ? "document_id" : null);
+      const bkpChunkRows = chunkFk
+        ? rawDb.prepare(
+            `SELECT ${sharedChunkCols.map((c) => `"${c}"`).join(", ")} FROM bkp.chunks`,
+          ).all() as Record<string, unknown>[]
+        : [];
       const insChunk = rawDb.prepare(
         `INSERT OR IGNORE INTO chunks (${sharedChunkCols.map((c) => `"${c}"`).join(", ")}) ` +
         `VALUES (${sharedChunkCols.map(() => "?").join(", ")})`,
       );
       for (const row of bkpChunkRows) {
-        if (hasDocFk) {
-          const oldDocId = String(row.document_id);
-          const remapped = idRemap.get(oldDocId);
-          if (remapped) row.document_id = remapped;
-        }
+        const parent = String(row[chunkFk!]);
+        if (!importedDocIds.has(parent)) continue;
         const vals = sharedChunkCols.map((c) => row[c] as any);
         insChunk.run(...vals);
         chunks_imported += 1;
       }
 
-      // Optional: document_pages, document_render_status if they exist.
+      // 4. Optional companion tables. Same rule: only rows whose
+      //    parent doc was actually imported this run.
       for (const table of ["document_pages", "document_render_status"]) {
         if (!tableExists(table) || !tableExists(`bkp.${table}`)) continue;
         const cols = tableColumns(table);
         const bkpCols = tableColumns(`bkp.${table}`);
         const shared = cols.filter((c) => bkpCols.includes(c));
         if (shared.length === 0) continue;
-        const hasFk = shared.includes("document_id");
+        const fk = shared.includes("document_id")
+          ? "document_id"
+          : (shared.includes("parent_id") ? "parent_id" : null);
+        if (!fk) continue;
         const rows = rawDb.prepare(
           `SELECT ${shared.map((c) => `"${c}"`).join(", ")} FROM bkp.${table}`,
         ).all() as Record<string, unknown>[];
@@ -495,11 +968,8 @@ export function importMerge(staged: StagedImport): { documents_imported: number;
           `VALUES (${shared.map(() => "?").join(", ")})`,
         );
         for (const row of rows) {
-          if (hasFk) {
-            const oldDocId = String(row.document_id);
-            const remapped = idRemap.get(oldDocId);
-            if (remapped) row.document_id = remapped;
-          }
+          const parent = String(row[fk]);
+          if (!importedDocIds.has(parent)) continue;
           const vals = shared.map((c) => row[c] as any);
           ins.run(...vals);
         }
@@ -510,10 +980,8 @@ export function importMerge(staged: StagedImport): { documents_imported: number;
     try { rawDb.exec("DETACH DATABASE bkp"); } catch { /* ignore */ }
   }
 
-  // Copy page files. For remapped docs, rename their parent directory.
-  // v1.0.6: also copy retained-original files, keying by document id and
-  // applying the same idRemap so a merged import doesn't clobber an
-  // existing doc's original with a colliding-uuid source file.
+  // 5. Copy retained originals ONLY for docs we just imported. Docs
+  //    that already existed on live keep their own original file.
   if (staged.originalsDir && existsSync(staged.originalsDir)) {
     const liveOriginals = getOriginalsDir();
     ensureDir(liveOriginals);
@@ -523,15 +991,16 @@ export function importMerge(staged: StagedImport): { documents_imported: number;
       if (!m) continue;
       const srcDocId = m[1];
       const ext = m[2];
-      const dstDocId = idRemap.get(srcDocId) ?? srcDocId;
+      if (!importedDocIds.has(srcDocId)) continue;
       const s = join(staged.originalsDir, entry.name);
-      const d = join(liveOriginals, `${dstDocId}.${ext}`);
+      const d = join(liveOriginals, `${srcDocId}.${ext}`);
       try {
         copyFileSync(s, d);
       } catch { /* skip individual failures */ }
     }
   }
 
+  // 6. Copy page images ONLY for docs we just imported. Same rule.
   let pages_files_copied = 0;
   if (staged.pagesDir && existsSync(staged.pagesDir)) {
     const livePages = getPagesDirForBackup();
@@ -539,9 +1008,9 @@ export function importMerge(staged: StagedImport): { documents_imported: number;
     for (const docDir of readdirSync(staged.pagesDir, { withFileTypes: true })) {
       if (!docDir.isDirectory()) continue;
       const srcDocId = docDir.name;
-      const dstDocId = idRemap.get(srcDocId) ?? srcDocId;
+      if (!importedDocIds.has(srcDocId)) continue;
       const src = join(staged.pagesDir, srcDocId);
-      const dst = join(livePages, dstDocId);
+      const dst = join(livePages, srcDocId);
       ensureDir(dst);
       for (const entry of readdirSync(src, { withFileTypes: true })) {
         if (!entry.isFile()) continue;
@@ -555,13 +1024,66 @@ export function importMerge(staged: StagedImport): { documents_imported: number;
     }
   }
 
-  return { documents_imported, chunks_imported, pages_files_copied };
+  // 7. v1.2.1: normalize document_pages.image_path for the docs we just
+  // imported. The backup DB carries the exporter's absolute paths (e.g.
+  // C:\Users\<other-user>\AppData\Roaming\AdvisePoint Docs\pages\...);
+  // rewrite them to point at this machine's pages directory so the read
+  // path serves images without waiting for the next boot heal. Uses the
+  // filename in the stored path so legacy .jpg renders keep their
+  // extension. Docs whose parent was skipped keep their existing rows.
+  if (importedDocIds.size > 0) {
+    const livePages = getPagesDirForBackup();
+    const rows = rawDb
+      .prepare(
+        `SELECT rowid, document_id, page_number, image_path
+           FROM document_pages`,
+      )
+      .all() as {
+      rowid: number;
+      document_id: string;
+      page_number: number;
+      image_path: string;
+    }[];
+    const upd = rawDb.prepare(
+      "UPDATE document_pages SET image_path = ? WHERE rowid = ?",
+    );
+    const tx = rawDb.transaction(
+      (batch: { rowid: number; newPath: string }[]) => {
+        for (const b of batch) upd.run(b.newPath, b.rowid);
+      },
+    );
+    const updates: { rowid: number; newPath: string }[] = [];
+    for (const r of rows) {
+      if (!importedDocIds.has(r.document_id)) continue;
+      const base = basename(r.image_path);
+      if (!base) continue;
+      const newPath = join(livePages, r.document_id, base);
+      if (newPath === r.image_path) continue;
+      updates.push({ rowid: r.rowid, newPath });
+    }
+    if (updates.length > 0) tx(updates);
+  }
+
+  return { documents_imported, chunks_imported, pages_files_copied, snapshot };
 }
 
 // -------- Small helpers --------
 
 function tableColumns(qualified: string): string[] {
-  const rows = rawDb.prepare(`PRAGMA table_info(${qualified})`).all() as { name: string }[];
+  // v1.0.11.3: SQLite rejects `PRAGMA table_info(schema.table)` with
+  // `near ".": syntax error`. The correct form for a non-main schema
+  // is `PRAGMA <schema>.table_info(<table>)`. Prior releases emitted
+  // the invalid syntax, which broke merge restore in every published
+  // build (wipe-replace was unaffected because it never called this
+  // for the attached `bkp` schema).
+  let sql: string;
+  if (qualified.includes(".")) {
+    const [schema, name] = qualified.split(".");
+    sql = `PRAGMA "${schema}".table_info("${name}")`;
+  } else {
+    sql = `PRAGMA table_info("${qualified}")`;
+  }
+  const rows = rawDb.prepare(sql).all() as { name: string }[];
   return rows.map((r) => r.name);
 }
 
@@ -605,11 +1127,26 @@ function copyDirRecursive(src: string, dst: string): void {
 // subset of ZIP produced by `archiver`: STORE and DEFLATE, standard and
 // ZIP64 central-directory records.
 
+// v1.0.11.2: extractZipTo previously ran fully synchronously --
+// readSync + inflateRawSync + writeFileSync for every entry in the
+// backup ZIP. On a large backup the loop was blocked for seconds at a
+// time, which made /api/health miss its 3.5s poll deadline and
+// tripped the reconnecting banner during Restore. The rewrite below
+// keeps the same pure-JS ZIP parser (no new dependency, no worker
+// thread) but yields the event loop between entries, uses async fs
+// I/O, and offloads deflate to zlib's async form. This lets
+// /api/health stay responsive while a restore is running.
 async function extractZipTo(zipPath: string, outDir: string): Promise<void> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { openSync, readSync, closeSync, statSync: st } = require("node:fs");
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const zlib = require("node:zlib");
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const fsp = require("node:fs/promises");
+  const { promisify } = require("node:util");
+  const inflateRaw: (buf: Buffer) => Promise<Buffer> = promisify(zlib.inflateRaw);
+  // Yield the loop between entries so health polls can slip in.
+  const yieldLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
   const fd = openSync(zipPath, "r");
   try {
@@ -701,7 +1238,7 @@ async function extractZipTo(zipPath: string, outDir: string): Promise<void> {
 
       let raw: Buffer;
       if (method === 0) raw = compBuf;
-      else if (method === 8) raw = zlib.inflateRawSync(compBuf);
+      else if (method === 8) raw = await inflateRaw(compBuf);
       else throw new Error(`Unsupported compression method ${method} for ${name}`);
 
       // Path traversal guard.
@@ -711,7 +1248,10 @@ async function extractZipTo(zipPath: string, outDir: string): Promise<void> {
 
       const outPath = join(outDir, name);
       ensureDir(dirname(outPath));
-      writeFileSync(outPath, raw);
+      // Async write + a setImmediate yield so /api/health can be
+      // serviced between entries even inside a tight per-file loop.
+      await fsp.writeFile(outPath, raw);
+      await yieldLoop();
     }
   } finally {
     closeSync(fd);

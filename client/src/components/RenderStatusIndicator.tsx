@@ -146,16 +146,32 @@ export function RenderStatusIndicator() {
             Render errors ({failCount})
           </div>
           <ul className="space-y-1 text-xs">
-            {liveFailures.slice(0, 6).map((f) => (
-              <li key={`${f.document_id}:${f.failed_at}`} className="leading-snug">
-                <div className="font-medium">{f.title}</div>
-                <div className="text-muted-foreground">
-                  {f.first_failed_page
-                    ? `Page ${f.first_failed_page}: ${f.error}`
-                    : f.error}
-                </div>
-              </li>
-            ))}
+            {liveFailures.slice(0, 6).map((f) => {
+              // v1.1.7: the boot reconciler writes an `interrupted:` prefix
+              // on the error string for docs whose render was cut short by
+              // a shutdown, upgrade, or crash. Strip the prefix and label
+              // the row so "failed to render" is not shown for docs that
+              // simply weren't allowed to finish.
+              const isInterrupted = typeof f.error === "string" && f.error.startsWith("interrupted:");
+              const errText = isInterrupted ? f.error.slice("interrupted:".length).trim() : f.error;
+              return (
+                <li key={`${f.document_id}:${f.failed_at}`} className="leading-snug">
+                  <div className="font-medium">
+                    {f.title}
+                    {isInterrupted && (
+                      <span className="ml-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+                        interrupted
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-muted-foreground">
+                    {f.first_failed_page
+                      ? `Page ${f.first_failed_page}: ${errText}`
+                      : errText}
+                  </div>
+                </li>
+              );
+            })}
             {liveFailures.length > 6 && (
               <li className="text-muted-foreground">
                 ... and {liveFailures.length - 6} more

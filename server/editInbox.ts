@@ -160,6 +160,8 @@ interface EditSession {
   settleTimer: NodeJS.Timeout | null;
   lockCheckTimer: NodeJS.Timeout | null;
   lockCheckStartedAt: number | null;
+  // v1.0.10: poll counter for the lock-release diagnostics log.
+  lockCheckAttempts: number;
   reingestInFlight: boolean;
   lastKnownMtimeMs: number;
   reingest: (bytes: Buffer, fileName: string) => Promise<void>;
@@ -361,6 +363,7 @@ export function startEditSession(
     settleTimer: null,
     lockCheckTimer: null,
     lockCheckStartedAt: null,
+    lockCheckAttempts: 0,
     reingestInFlight: false,
     lastKnownMtimeMs: st.mtimeMs,
     reingest,
@@ -487,6 +490,29 @@ function isFileUnlocked(filePath: string): boolean {
   }
 }
 
+// v1.0.10: same probe as isFileUnlocked, but it distinguishes "Word still
+// holds the lock" from "the probe itself failed for an unexpected reason".
+// Only used for the lock-poll diagnostics log -- callers that just need a
+// boolean keep using isFileUnlocked, and "error" is treated as NOT unlocked
+// so the cleanup behavior is byte-for-byte what it was before.
+type LockProbeResult = "unlocked" | "locked" | "error";
+
+function probeFileLock(filePath: string): LockProbeResult {
+  if (!existsSync(filePath)) return "unlocked";
+  try {
+    const fd = openSync(filePath, fsConstants.O_RDWR);
+    closeSync(fd);
+    return "unlocked";
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // The lock-contention codes Windows reports while Word holds the file.
+    if (code === "EBUSY" || code === "EACCES" || code === "EPERM") {
+      return "locked";
+    }
+    return "error";
+  }
+}
+
 function safeDeleteInboxFile(filePath: string, documentId: string): boolean {
   if (!existsSync(filePath)) return true;
   if (!isFileUnlocked(filePath)) {
@@ -514,21 +540,26 @@ function scheduleLockReleaseCleanup(session: EditSession): void {
     clearTimeout(session.lockCheckTimer);
   }
   session.lockCheckStartedAt = Date.now();
+  session.lockCheckAttempts = 0;
 
   const tick = (): void => {
     session.lockCheckTimer = null;
     if (session.status === "ended") return;
 
-    const unlocked = isFileUnlocked(session.filePath);
-    // v1.0.8: per-tick log so a diagnostics zip can confirm whether the
-    // openSync(O_RDWR) probe actually flips to unlocked for the user's
-    // Word version. If the probe never says unlocked in the field, the
-    // server never ends the session and the client pill never clears.
+    // v1.0.10: per-poll log with an attempt counter and a three-state
+    // status, so a diagnostics zip can confirm the loop is actually firing
+    // in the field and show whether the probe ever flips to unlocked for
+    // the user's Word version. If it never does, the server never ends the
+    // session and the client pill never clears.
+    const probe = probeFileLock(session.filePath);
+    const unlocked = probe === "unlocked";
+    const attempt = (session.lockCheckAttempts ?? 0) + 1;
+    session.lockCheckAttempts = attempt;
     const startedAt = session.lockCheckStartedAt ?? Date.now();
     const waited = Date.now() - startedAt;
     console.log(
-      `[edit-inbox] lock-poll doc=${session.documentId} ` +
-        `unlocked=${unlocked} waited_ms=${waited}`,
+      `[edit-inbox] lock-poll ${session.documentId} attempt=${attempt} ` +
+        `status=${probe} waited_ms=${waited}`,
     );
 
     // Word is closed -> delete + end.

@@ -7,20 +7,27 @@ import { z } from "zod";
 // v0.9.23.2: "document" moved to the top of the list and is the new default
 // on the Upload page. Prior default was "user_manual", which silently mis-
 // tagged non-manual uploads for users who forgot to change it.
+// v1.1.4: cleaned up the seeded defaults.
+//   * "user_manual" removed -- the UG filename code seeds "User Guide", and
+//     carrying both produced two near-identical types on every fresh install.
+//   * "bulletin" removed -- same collision against the TB code's
+//     "Technical Bulletin".
+//   * "api_reference" and "kb_article" removed -- generic software-docs
+//     leftovers with no use in this product's document set.
+// These are SEED defaults only. Removing a key here never deletes an existing
+// row: an install that already has one keeps it, and the historical backfill
+// below still re-creates a row for any key a document or chunk references.
+// Existing installs are reconciled by scripts/align-doc-types.mjs.
 export const DOCUMENT_TYPES = [
   "document",
   "brochures",
-  "user_manual",
   "admin_guide",
   "installation_guide",
   "quick_start",
   "release_notes",
-  "api_reference",
   "troubleshooting_guide",
   "security_guide",
   "procedures",
-  "kb_article",
-  "bulletin",
   "pricing",
   "misc",
 ] as const;
@@ -260,6 +267,11 @@ export const searchRequestSchema = z.object({
   filters: z
     .object({
       product_model: z.array(z.string()).optional(),
+      // v1.0.14: Product family filter on the Query page. Independent from
+      // product_model (no cross-narrowing). When a specific family is
+      // selected, documents that have NO recorded family are included as
+      // well -- forgiving for older uploads that pre-date the family field.
+      product_family: z.string().optional(),
       product_version: z.array(z.string()).optional(),
       firmware_version: z.array(z.string()).optional(),
       document_type: z.array(z.string().trim().min(1).max(80)).optional(),

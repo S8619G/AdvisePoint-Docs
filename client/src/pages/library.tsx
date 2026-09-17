@@ -5,9 +5,12 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+// v1.2.4: `Tags` icon dropped from this import -- Manage Values moved out of
+// the Library toolbar into Settings > About (see ManageValuesPanel).
 import { Trash2, Boxes, Book, Layers, Copy, Printer, BookOpen, FileText, Pencil, ChevronDown, ChevronUp, ArrowUpDown, Search as SearchIcon, X as XIcon, Loader2, RotateCcw } from "lucide-react";
 import { Highlight } from "@/lib/highlight";
 import { Input } from "@/components/ui/input";
+import { FixTitleButton } from "@/components/FixTitleButton";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -29,7 +32,13 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { useToast } from "@/hooks/use-toast";
 import { JsonBlock } from "./upload";
 import { TagsCombobox } from "@/components/TagsCombobox";
-import { ProductModelCombobox, RequiredField } from "@/components/ProductModelCombobox";
+import { ProductModelCombobox } from "@/components/ProductModelCombobox";
+import { ProductFamilyCombobox } from "@/components/ProductFamilyCombobox";
+// v1.2.4: ProductValuesDialog moved to Settings > About via ManageValuesPanel.
+// The import is deliberately removed here so the Library page no longer owns
+// dialog state or the Tags icon; the dialog is now opened from the Settings
+// panel instead. See client/src/components/ManageValuesPanel.tsx.
+import { Checkbox } from "@/components/ui/checkbox";
 import { TitleColorPicker } from "@/components/TitleColorPicker";
 import { useDocumentTypes, documentTypeColor } from "@/lib/documentTypes";
 import { DocTypeDot } from "@/components/DocTypeDot";
@@ -126,6 +135,9 @@ function DocList() {
   // users mean when they say "remember my work".
   const [expandTick, setExpandTick] = useState<number | null>(null);
   const [collapseTick, setCollapseTick] = useState<number | null>(null);
+  // v1.1.3: bulk rename/merge for product model + family values.
+  // v1.2.4: valuesOpen removed -- Manage Values now lives in Settings > About
+  // and manages its own dialog state (see ManageValuesPanel).
   const [filterType, setFilterType] = useStoreField(libraryTabStore, "filterType");
   const [filterModel, setFilterModel] = useStoreField(libraryTabStore, "filterModel");
   // v0.9.36: Product Family filter, symmetric with Product Model.
@@ -209,6 +221,9 @@ function DocList() {
 
   return (
     <div className="space-y-6">
+      {/* v1.2.4: ProductValuesDialog rendered here was moved to Settings >
+          About via ManageValuesPanel. Users looked for "manage values" as a
+          config surface; the sort/filter toolbar was the wrong home. */}
       <div>
         <h1 className="text-xl font-semibold tracking-tight">Library</h1>
         <p className="text-sm text-muted-foreground">All uploaded documents. Click a title to browse sections, or the pencil to edit any field.</p>
@@ -291,6 +306,10 @@ function DocList() {
           <RotateCcw className="h-3.5 w-3.5" />
           Reset
         </Button>
+        {/* v1.2.4: Manage values button removed from this toolbar. It now
+            lives on Settings > About next to the Welcome Guide reinstall
+            panel, where users looking for a config surface actually find it.
+            See client/src/components/ManageValuesPanel.tsx. */}
         {/* v0.9.30: Expand All / Collapse All broadcast buttons. Only render
             when there's actually something to fold, and put them right before
             the count so they don't push the sort/filter controls around. */}
@@ -361,6 +380,64 @@ interface EditDraft {
   allowed_tenants: string; // comma-separated
   // v0.9.30: optional accent color for the rendered title. null = default.
   title_color: string | null;
+}
+
+// v1.1.3 -- opt-in "apply this to the other documents too" prompt.
+// Rendered under Product family / Product model inside the edit dialog, and
+// only when BOTH are true: the value actually changed, and the old value is
+// shared with at least one other document. Unchecked by default, always.
+function PropagateOption({
+  show,
+  count,
+  oldValue,
+  checked,
+  onChange,
+  testId,
+}: {
+  show: boolean;
+  count: number;
+  oldValue: string;
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  testId: string;
+}) {
+  if (!show || count < 1) return null;
+  return (
+    <label className="mt-1.5 flex cursor-pointer items-start gap-2 text-xs text-muted-foreground">
+      <Checkbox
+        checked={checked}
+        onCheckedChange={(v) => onChange(v === true)}
+        className="mt-0.5"
+        data-testid={testId}
+      />
+      <span>
+        {count} other {count === 1 ? "document uses" : "documents use"} “{oldValue}”. Update{" "}
+        {count === 1 ? "it" : "them"} too?
+      </span>
+    </label>
+  );
+}
+
+// v1.1.3 -- DISPLAY-ONLY suppression of a duplicated Family row.
+//
+// Auto-population stores the family twice on purpose: `product_family` stays a
+// clean filter dimension ("ECOSYS") while `product_model` reads properly on its
+// own ("ECOSYS PA5000x"). On the card that renders as "Family: ECOSYS" directly
+// above "Model: ECOSYS PA5000x", which is just noise.
+//
+// This hides the redundant ROW only. The stored value is untouched -- stripping
+// it would drop the document out of the Family filter. The edit dialog always
+// shows both fields, because hiding an editable field makes it unreachable.
+//
+// Matched case-insensitively and on a WORD BOUNDARY, so family "ECOSYS" hides
+// against model "ECOSYS PA5000x" but not against a model that merely happens to
+// start with the same letters.
+function modelRepeatsFamily(model: string | null | undefined, family: string | null | undefined): boolean {
+  const m = (model ?? "").trim().toLowerCase();
+  const f = (family ?? "").trim().toLowerCase();
+  if (!m || !f) return false;
+  if (m === f) return true;
+  return m.startsWith(f + " ");
 }
 
 function draftFromDoc(doc: Doc): EditDraft {
@@ -437,6 +514,23 @@ function DocCard({
   const [expanded, setExpanded] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
   const [draft, setDraft] = useState<EditDraft>(() => draftFromDoc(doc));
+  // v1.1.3: when the edited document's OLD product model/family is shared with
+  // other documents, offer to apply the same change to them. Opt-in only --
+  // never a default. Both intents are legitimate and common: this one document
+  // was mistagged, or the value is misspelled everywhere. Defaulting to "all"
+  // would silently rewrite documents the user is not looking at.
+  const [propagateModel, setPropagateModel] = useState(false);
+  const [propagateFamily, setPropagateFamily] = useState(false);
+  // Only fetched while the edit dialog is open, and it is the same cached
+  // query the Manage values panel uses, so this costs nothing extra.
+  const { data: valueUsage } = useQuery<{ models: { value: string; count: number }[]; families: { value: string; count: number }[] }>({
+    queryKey: ["/api/product-values"],
+    enabled: editOpen,
+  });
+  const othersUsing = (list: { value: string; count: number }[] | undefined, value: string) => {
+    if (!value) return 0;
+    return Math.max(0, (list?.find((e) => e.value === value)?.count ?? 0) - 1);
+  };
   const qc = useQueryClient();
   const { toast } = useToast();
 
@@ -455,12 +549,35 @@ function DocCard({
   const save = useMutation({
     mutationFn: async (patch: Record<string, any>) => {
       const res = await apiRequest("PATCH", `/api/documents/${doc.id}`, patch);
-      return res.json();
+      const updated = await res.json();
+      // v1.1.3: optional propagation to the other documents that shared the
+      // OLD value. Order matters: this document is already patched above, so
+      // the bulk rename below only touches the OTHERS -- which is exactly the
+      // count the checkbox promised.
+      let propagated = 0;
+      const propagate = async (field: "product_model" | "product_family", from: string, to: string) => {
+        if (!from || from === to) return;
+        const r = await apiRequest("POST", "/api/product-values/rename", { field, from, to });
+        propagated += ((await r.json())?.affected as number) ?? 0;
+      };
+      if (propagateModel && "product_model" in patch) {
+        await propagate("product_model", doc.product_model, patch.product_model);
+      }
+      if (propagateFamily && "product_family" in patch) {
+        await propagate("product_family", doc.product_family ?? "", patch.product_family);
+      }
+      return { updated, propagated };
     },
-    onSuccess: () => {
+    onSuccess: (result: any) => {
       qc.invalidateQueries({ queryKey: ["/api/documents"] });
       qc.invalidateQueries({ queryKey: ["/api/documents", doc.id] });
-      toast({ title: "Document updated" });
+      qc.invalidateQueries({ queryKey: ["/api/product-values"] });
+      qc.invalidateQueries({ queryKey: ["/api/facets"] });
+      const extra = result?.propagated ?? 0;
+      toast({
+        title: "Document updated",
+        description: extra > 0 ? `Also updated ${extra} other ${extra === 1 ? "document" : "documents"}.` : undefined,
+      });
       setEditOpen(false);
     },
     onError: (e: any) => toast({ title: "Update failed", description: e?.message ?? String(e), variant: "destructive" }),
@@ -548,7 +665,7 @@ function DocCard({
                         variant="ghost"
                         size="icon"
                         className="h-6 w-6 text-muted-foreground hover:text-foreground"
-                        onClick={(e) => { stop(e); setDraft(draftFromDoc(doc)); setEditOpen(true); }}
+                        onClick={(e) => { stop(e); setDraft(draftFromDoc(doc)); setPropagateModel(false); setPropagateFamily(false); setEditOpen(true); }}
                         data-testid={`button-rename-${doc.id}`}
                         aria-label="Edit document"
                       >
@@ -584,22 +701,17 @@ function DocCard({
                 grid with the metadata a field tech actually looks at when
                 scanning the library. Empty fields hide so sparse metadata
                 docs don't leave giant gaps.
-                v0.9.21 (retained): batch uploads can leave product_model
-                blank on purpose; flag blank models in-place so field techs
-                know to fill them.
+                Product model is optional as of this change, so a blank model
+                simply hides its row like every other empty field above. The
+                former amber "Not set" call-to-action was removed: blank is a
+                legitimate state for documents with no model (pricing lists,
+                software notes), not a deficiency to flag.
               */}
               <div className="grid grid-cols-2 gap-x-3 gap-y-1">
-                {doc.product_model ? (
-                  <MetaRow k="Model" v={doc.product_model} />
-                ) : (
-                  <div className="flex items-baseline justify-between gap-2">
-                    <span className="text-muted-foreground">Model</span>
-                    <span className="text-right text-amber-700 dark:text-amber-400">
-                      Not set
-                    </span>
-                  </div>
+                {doc.product_model && <MetaRow k="Model" v={doc.product_model} />}
+                {doc.product_family && !modelRepeatsFamily(doc.product_model, doc.product_family) && (
+                  <MetaRow k="Family" v={doc.product_family} />
                 )}
-                {doc.product_family && <MetaRow k="Family" v={doc.product_family} />}
                 {doc.product_version && <MetaRow k="Version" v={doc.product_version} />}
                 {/* v0.9.35: label renamed from "Firmware" to "Revision" — the
                     underlying firmware_version column is retained as internal
@@ -656,12 +768,21 @@ function DocCard({
           */}
           <div className="space-y-4 py-2">
             <EditField label="Title">
-              <Input
-                value={draft.title}
-                onChange={(e) => setDraft({ ...draft, title: e.target.value })}
-                maxLength={200}
-                data-testid="input-edit-title"
-              />
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <Input
+                  value={draft.title}
+                  onChange={(e) => setDraft({ ...draft, title: e.target.value })}
+                  maxLength={200}
+                  data-testid="input-edit-title"
+                />
+                {doc.file_name && (
+                  <FixTitleButton
+                    originalFilename={doc.file_name}
+                    currentTitle={draft.title}
+                    onApply={(next) => setDraft({ ...draft, title: next })}
+                  />
+                )}
+              </div>
             </EditField>
             <EditField label="Subtitle">
               <Input
@@ -675,20 +796,38 @@ function DocCard({
 
             <div className="grid grid-cols-2 gap-3">
               <EditField label="Product family">
-                <Input
+                {/* v1.0.15: autocomplete for known families (see
+                    ProductFamilyCombobox). Field remains optional, so no
+                    RequiredField wrapper. */}
+                <ProductFamilyCombobox
                   value={draft.product_family}
-                  onChange={(e) => setDraft({ ...draft, product_family: e.target.value })}
-                  placeholder="Optional"
-                  data-testid="input-edit-family"
+                  onChange={(v) => setDraft({ ...draft, product_family: v })}
+                  testId="combobox-edit-product-family"
+                />
+                <PropagateOption
+                  show={draft.product_family.trim() !== (doc.product_family ?? "")}
+                  count={othersUsing(valueUsage?.families, doc.product_family ?? "")}
+                  oldValue={doc.product_family ?? ""}
+                  checked={propagateFamily}
+                  onChange={setPropagateFamily}
+                  testId="checkbox-propagate-family"
                 />
               </EditField>
-              <RequiredField label="Product model">
+              <EditField label="Product model">
                 <ProductModelCombobox
                   value={draft.product_model}
                   onChange={(v) => setDraft({ ...draft, product_model: v })}
                   testId="combobox-edit-product-model"
                 />
-              </RequiredField>
+                <PropagateOption
+                  show={draft.product_model.trim() !== doc.product_model}
+                  count={othersUsing(valueUsage?.models, doc.product_model)}
+                  oldValue={doc.product_model}
+                  checked={propagateModel}
+                  onChange={setPropagateModel}
+                  testId="checkbox-propagate-model"
+                />
+              </EditField>
 
               <EditField label="Product version">
                 <Input
@@ -828,7 +967,7 @@ function DocCard({
             <Button variant="outline" onClick={() => setEditOpen(false)} data-testid="button-edit-cancel">Cancel</Button>
             <Button
               onClick={() => save.mutate(patch)}
-              disabled={!hasChanges || !draft.title.trim() || !draft.product_model.trim() || save.isPending}
+              disabled={!hasChanges || !draft.title.trim() || save.isPending}
               data-testid="button-edit-save"
             >
               {save.isPending ? "Saving…" : hasChanges ? `Save ${Object.keys(patch).length} change${Object.keys(patch).length === 1 ? "" : "s"}` : "No changes"}
@@ -1268,6 +1407,10 @@ function DocDetail({ id }: { id: string }) {
       qc.invalidateQueries({ queryKey: ["/api/documents"] });
       qc.invalidateQueries({ queryKey: ["/api/stats"] });
       qc.invalidateQueries({ queryKey: ["/api/facets"] });
+      // v1.1.0: deleting a document purges its rendered pages and can drain
+      // queued render work, so refresh the render status rather than letting the
+      // indicator show a stale count for up to ~10s.
+      qc.invalidateQueries({ queryKey: ["/api/render/status"] });
       toast({ title: "Document deleted" });
       window.location.hash = "/library";
     },

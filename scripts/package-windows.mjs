@@ -34,20 +34,34 @@ import { spawnSync } from "node:child_process";
 // the shipped v1.0.8.2 baseline hash (still 7ac72e45… — v1.0.8.2 did
 // not change the launcher). NEW_LAUNCHER_SHA256 is set to the v1.0.8.3
 // hash so the packager overwrites the baseline copy with the repo copy.
+//
+// v1.0.9: baseline advances to AdvisePoint-Docs-v1.0.8.3.zip, so
+// EXPECTED is bumped to the v1.0.8.3 launcher hash (e6fd614e…). The
+// launcher itself did NOT change again in v1.0.9 — only the sibling
+// "Update AdvisePoint Docs.bat" gained a new APD_LOCAL_ZIP forwarding
+// branch, and that file is unconditionally copied from the repo (no
+// hash gate). Therefore NEW_LAUNCHER_SHA256 is null and we ship the
+// baseline's copy of Start AdvisePoint Docs.bat as-is.
+// v1.0.11.1: baseline is now v1.0.11, which already shipped the
+// post-v1.0.9.23 rewritten launcher. The hash it expects to see in the
+// baseline advances accordingly, and NEW_LAUNCHER_SHA256 goes back to
+// null so we ship the baseline copy byte-identical -- the v1.0.11.1
+// hotfix does not touch packaging/Start AdvisePoint Docs.bat.
 const EXPECTED_LAUNCHER_SHA256 =
-  "7ac72e45fdaf2ad2ca366ecbd651f6f13e1854b73f78017720914f551fa75c98";
+  "f488c598bf5c80dcb4c1ba5ff445372196c210bc40a9f7f282b8e6d47e175799";
 // Set NEW_LAUNCHER_SHA256 to a hash string when a release intentionally
 // changes the launcher; the packager then overwrites the baseline's
 // launcher with the repo's copy and re-verifies. null = ship the
 // baseline launcher as-is.
-const NEW_LAUNCHER_SHA256 =
-  "e6fd614e19549a0d79c654d5334c14073b225936e68a3529bd2eb267654b5967";
+const NEW_LAUNCHER_SHA256 = null;
 const APP_FOLDER = "AdvisePoint Docs";
 
 function usage() {
   console.error(
     "Usage: npm run package:windows -- --baseline <v0.9.31.2.zip> " +
-    "--output <release.zip> [--node-version 20.18.1]",
+    "--output <release.zip> [--node-version 20.18.1] [--arch x64|arm64] " +
+    "[--arm64-node <node.exe>] [--arm64-modules <node_modules>] " +
+    "[--x64-modules <node_modules>]",
   );
 }
 
@@ -64,6 +78,13 @@ function parseArgs(argv) {
   }
   return result;
 }
+
+// v1.2.0: allowed target architectures for the shipped Windows portable
+// zip. x64 is the historical target; arm64 is introduced in v1.2.0 as a
+// separate zip alongside the x64 zip. Neither the launcher nor the
+// updater try to auto-detect at runtime -- each install is single-arch and
+// the ARCH sentinel file (below) enforces that on upgrade.
+const SUPPORTED_ARCHES = new Set(["x64", "arm64"]);
 
 function run(command, args, cwd) {
   const result = spawnSync(command, args, { cwd, encoding: "utf8" });
@@ -133,6 +154,37 @@ const args = parseArgs(process.argv.slice(2));
 if (!args.baseline || !args.output) {
   usage();
   process.exit(2);
+}
+const targetArch = (args.arch || "x64").toLowerCase();
+if (!SUPPORTED_ARCHES.has(targetArch)) {
+  console.error(
+    `Unsupported --arch value: ${targetArch}. Use one of: ${[...SUPPORTED_ARCHES].join(", ")}`,
+  );
+  process.exit(2);
+}
+if (targetArch === "arm64") {
+  // The arm64 build cannot be assembled from the x64 baseline alone: the
+  // baseline ships x64 copies of node.exe and every native .node file. We
+  // require an arm64 node.exe on disk and an arm64 node_modules tree that
+  // was installed with `npm install --os=win32 --cpu=arm64 --ignore-scripts`
+  // -- the packager only copies the two native module folders that ship in
+  // the end-user zip (see dependency-audit.md in the project files).
+  if (!args["arm64-node"] || !args["arm64-modules"]) {
+    console.error(
+      "--arch arm64 requires --arm64-node <path-to-arm64-node.exe> and " +
+      "--arm64-modules <path-to-arm64-node_modules>. See " +
+      "wip/v1.2.0-arm64/dependency-audit.md for how to prepare them.",
+    );
+    process.exit(2);
+  }
+  if (!existsSync(resolve(args["arm64-node"]))) {
+    console.error(`--arm64-node path does not exist: ${args["arm64-node"]}`);
+    process.exit(2);
+  }
+  if (!existsSync(resolve(args["arm64-modules"]))) {
+    console.error(`--arm64-modules path does not exist: ${args["arm64-modules"]}`);
+    process.exit(2);
+  }
 }
 
 const repoRoot = resolve(import.meta.dirname, "..");
@@ -254,8 +306,184 @@ try {
   );
   cpSync(join(repoRoot, "packaging", "README.txt"), join(appRoot, "README.txt"));
 
+  // v1.1.4 shipped a one-time tools/ folder containing the Align Document
+  // Types utility, used to reconcile a library created before the document
+  // type cleanup. That alignment has been run, so the tool is no longer
+  // packaged. It remains in the repo at packaging/tools/ and can be run
+  // directly with the bundled node if it is ever needed again:
+  //   node "packaging/tools/align-doc-types.cjs" --db "<advisepoint.db>"
+
+  // v1.0.15: ship the pre-rendered Welcome Guide PDF alongside README.txt.
+  // The server's first-boot seeder (server/seed-welcome-guide.ts + the
+  // seedWelcomeGuideIfNeeded() call in server/routes.ts) locates this file
+  // via <APP>/welcome-guide/*.pdf and ingests it as a document with the
+  // fixed id "seed-readme-v1". If the folder is missing from the repo
+  // (e.g. the render step was skipped) the packager warns loudly but does
+  // not fail; the server will still boot and log a warning.
+  const welcomeSrc = join(repoRoot, "packaging", "welcome-guide");
+  const welcomeDst = join(appRoot, "welcome-guide");
+  rmSync(welcomeDst, { recursive: true, force: true });
+
+  // v1.2.4 (item 4 fix): always REGENERATE the Welcome Guide PDF from the
+  // current packaging/README.txt before packaging. Previous releases relied
+  // on someone running scripts/render-welcome-guide.py by hand and copying
+  // the output into packaging/welcome-guide/. That step was skipped for
+  // v1.2.2 and v1.2.3 -- both shipped a PDF whose cover, running header,
+  // and metadata still read "v1.2.1", because the source PDF in
+  // packaging/welcome-guide/ was never re-rendered. The updater is not the
+  // culprit; syncAppRoot() overwrites the shipped PDF just fine. The
+  // shipped PDF was stale at packaging time.
+  //
+  // Regenerating here guarantees the PDF that lands in the zip has the
+  // same version as README.txt (and therefore VERSION / client/src/version.ts,
+  // which the release process keeps in lockstep). The render script is
+  // idempotent -- passing the same README twice produces byte-identical
+  // output on the same reportlab version -- so this adds nothing to the
+  // per-build diff except when README.txt itself changed.
+  //
+  // If the render step fails (Python or reportlab missing on the packaging
+  // host), we WARN and fall through to the existing behavior: the current
+  // on-disk PDF is shipped. That keeps CI-less packaging from a fresh
+  // clone from breaking outright, but the warning is loud enough to notice
+  // when the version-mismatch bug is about to recur.
+  const renderScript = join(repoRoot, "scripts", "render-welcome-guide.py");
+  const welcomePdf = join(welcomeSrc, "AdvisePoint-Docs-Welcome-Guide.pdf");
+  if (existsSync(renderScript)) {
+    const py = process.env.PYTHON || "python3";
+    const render = spawnSync(py, [renderScript, welcomePdf], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (render.status === 0) {
+      const line = (render.stdout || "").trim().split("\n").pop() || "";
+      console.log(`[package-windows] rendered Welcome Guide -- ${line}`);
+    } else {
+      console.warn(
+        "[package-windows] render-welcome-guide.py failed; shipping the " +
+        "existing on-disk PDF (may be stale). " +
+        `Exit code: ${render.status}. Stderr:\n${render.stderr || "(empty)"}`,
+      );
+    }
+  }
+
+  if (existsSync(welcomeSrc)) {
+    cpSync(welcomeSrc, welcomeDst, { recursive: true });
+  } else {
+    console.warn(
+      "[package-windows] packaging/welcome-guide/ is missing -- " +
+      "the shipped zip will NOT include the seed Welcome Guide PDF. " +
+      "Run scripts/render-welcome-guide.py and copy the PDF into " +
+      "packaging/welcome-guide/ before packaging.",
+    );
+  }
+
+  // v1.2.0: refresh @napi-rs/canvas (the JS wrapper) alongside the
+  // architecture-appropriate peer package so the wrapper and the native
+  // binary always come from the same published canvas release. The
+  // baseline zip carries an older wrapper+peer pair that predates the
+  // win32-arm64-msvc peer; keeping the wrapper stale while dropping in a
+  // newer arm64 peer would be an ABI mismatch (NAPI-RS pairs a wrapper
+  // and a peer by exact version). For x64, refreshing the wrapper too is
+  // an intentional but noted change -- the baseline's older
+  // wrapper+x64 peer pair is replaced with the current pair so both
+  // arches ship the identical canvas release. `bufferutil` remains
+  // excluded on both arches (its optionalDependency has no win32-arm64
+  // prebuild; ws works without it).
+  const modulesSrc =
+    targetArch === "arm64" ? args["arm64-modules"] : args["x64-modules"];
+  if (!modulesSrc) {
+    throw new Error(
+      `--${targetArch}-modules <node_modules> is required so the packager can pull ` +
+      `the win32-${targetArch}-msvc @napi-rs/canvas peer and the matching JS ` +
+      `wrapper. Install with: npm install --os=win32 --cpu=${targetArch} ` +
+      `--ignore-scripts into a scratch folder and pass its node_modules path.`,
+    );
+  }
+  const modulesRoot = resolve(modulesSrc);
+
+  // 1. @napi-rs/canvas JS wrapper: replace baseline copy with the copy from
+  //    the scratch install. Same version+lockfile as the app, so the
+  //    wrapper matches whichever peer we drop in next to it.
+  const canvasWrapperSrc = join(modulesRoot, "@napi-rs", "canvas");
+  const canvasWrapperDst = join(appRoot, "node_modules", "@napi-rs", "canvas");
+  if (!existsSync(canvasWrapperSrc)) {
+    throw new Error(
+      `@napi-rs/canvas wrapper missing at ${canvasWrapperSrc}. Install with ` +
+      `npm install --os=win32 --cpu=${targetArch} --ignore-scripts into the ` +
+      `${targetArch} modules folder.`,
+    );
+  }
+  rmSync(canvasWrapperDst, { recursive: true, force: true });
+  cpSync(canvasWrapperSrc, canvasWrapperDst, { recursive: true });
+
+  // 2. @napi-rs/canvas peer: remove the baseline x64 peer folder and drop
+  //    in the architecture-appropriate one. `@napi-rs/canvas/js-binding.js`
+  //    picks a peer by process.arch at runtime, so both folders CANNOT be
+  //    present (the other would be dead weight and, in unrelated apps, has
+  //    caused loader confusion when the wrong arch loads first).
+  const canvasBaselineX64 = join(
+    appRoot, "node_modules", "@napi-rs", "canvas-win32-x64-msvc",
+  );
+  const canvasPeerName = `canvas-win32-${targetArch}-msvc`;
+  const canvasPeerSrc = join(modulesRoot, "@napi-rs", canvasPeerName);
+  const canvasPeerDst = join(appRoot, "node_modules", "@napi-rs", canvasPeerName);
+  if (!existsSync(canvasPeerSrc)) {
+    throw new Error(
+      `${targetArch} @napi-rs/canvas peer missing at ${canvasPeerSrc}. Install with ` +
+      `npm install --os=win32 --cpu=${targetArch} --ignore-scripts into the ` +
+      `${targetArch} modules folder.`,
+    );
+  }
+  rmSync(canvasBaselineX64, { recursive: true, force: true });
+  rmSync(canvasPeerDst, { recursive: true, force: true });
+  cpSync(canvasPeerSrc, canvasPeerDst, { recursive: true });
+
+  if (targetArch === "arm64") {
+    // 3. node runtime: replace <appRoot>/node/node.exe with the arm64 build.
+    const nodeDest = join(appRoot, "node", "node.exe");
+    rmSync(nodeDest, { force: true });
+    cpSync(resolve(args["arm64-node"]), nodeDest);
+
+    // 4. better-sqlite3: replace the shipped x64 .node with the arm64 one
+    //    installed into args["arm64-modules"]. Same NAPI ABI, same on-disk
+    //    file layout, same file name -- the app resolves
+    //    node_modules/better-sqlite3/build/Release/better_sqlite3.node
+    //    regardless of arch, so only the binary needs to change.
+    const bsqSrc = join(
+      modulesRoot,
+      "better-sqlite3",
+      "build",
+      "Release",
+      "better_sqlite3.node",
+    );
+    const bsqDst = join(
+      appRoot,
+      "node_modules",
+      "better-sqlite3",
+      "build",
+      "Release",
+      "better_sqlite3.node",
+    );
+    if (!existsSync(bsqSrc)) {
+      throw new Error(
+        `arm64 better-sqlite3 prebuild missing at ${bsqSrc}. Install with ` +
+        `npm install --os=win32 --cpu=arm64 --ignore-scripts into the arm64 ` +
+        `modules folder, then npx prebuild-install --target=<node-version> ` +
+        `--runtime=node --arch=arm64 --platform=win32 inside better-sqlite3/.`,
+      );
+    }
+    rmSync(bsqDst, { force: true });
+    cpSync(bsqSrc, bsqDst);
+  }
+
   writeFileSync(join(appRoot, "VERSION"), `${version}\r\n`, "utf8");
   writeFileSync(join(appRoot, "NODE_VERSION"), `${args["node-version"] || "20.18.1"}\r\n`, "utf8");
+  // v1.2.0: ARCH sentinel. The updater refuses an upgrade whose incoming
+  // ARCH does not match the installed one, so an x64 user cannot
+  // accidentally overlay an arm64 zip (or vice versa) and end up with a
+  // half-swapped mixed-arch install.
+  writeFileSync(join(appRoot, "ARCH"), `${targetArch}\r\n`, "utf8");
   rmSync(join(appRoot, "seed.db"), { force: true });
   rmSync(join(appRoot, "pages"), { recursive: true, force: true });
   rmSync(join(appRoot, "dist.bak"), { recursive: true, force: true });
@@ -265,6 +493,7 @@ try {
 
   console.log(`Created ${basename(output)}`);
   console.log(`version: ${version}`);
+  console.log(`arch: ${targetArch}`);
   console.log(`sha256: ${sha256File(output)}`);
   console.log(`launcher-sha256: ${sha256File(launcher)}`);
 } finally {

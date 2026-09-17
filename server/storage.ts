@@ -2,7 +2,14 @@ import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
 import { and, desc, eq, gte, sql } from "drizzle-orm";
 import { documents, chunks, DOCUMENT_TYPES } from "@shared/schema";
+import { labelFromKey } from "@shared/doctype-case";
+import { repointFilenameCodesInTx } from "./filename-codes";
+// v1.2.4: filename phrases follow the same repoint contract as codes. Every
+// document-type merge/rename/delete transaction below carries a companion
+// call so a phrase never points at a doc_type_key with no row.
+import { repointFilenamePhrasesInTx } from "./filename-phrases";
 import type { Document, Chunk } from "@shared/schema";
+import { SEED_WELCOME_GUIDE_DOC_ID } from "./seed-welcome-guide";
 import { copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
@@ -116,6 +123,39 @@ const sqlite = new Database(DB_PATH);
 sqlite.pragma("journal_mode = WAL");
 export const db = drizzle(sqlite);
 export const rawDb = sqlite;
+
+// ---------------------------------------------------------------------------
+// v1.0.12.3 - controlled shutdown for restore.
+//
+// A wipe-and-replace restore has to move the live DB file aside. On Windows
+// that rename fails outright while SQLite still holds the file open, which is
+// why every in-app restore failed: the restore code's comment claimed the DB
+// had just been closed, but nothing ever closed it.
+//
+// After closeDbForRestore() the process must not touch the database again -
+// any query on a closed handle throws. The restore reports restart_required,
+// and callers that run on a timer (the backup scheduler) or on request
+// (/api/health) check isDbClosedForRestore() and bow out instead.
+// ---------------------------------------------------------------------------
+let _dbClosedForRestore = false;
+
+export function isDbClosedForRestore(): boolean {
+  return _dbClosedForRestore;
+}
+
+export function closeDbForRestore(): void {
+  if (_dbClosedForRestore) return;
+  try {
+    // Checkpoint and drop the WAL so the on-disk file is self-contained and
+    // the -wal/-shm sidecars do not outlive the file we are about to move.
+    try { sqlite.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* best effort */ }
+    sqlite.close();
+  } finally {
+    // Set even if close() threw: never hand out a half-open handle.
+    _dbClosedForRestore = true;
+  }
+  console.log("[storage] database closed for restore; restart required");
+}
 
 // v1.0.3: exported so the backup/restore module can locate the DB file
 // (for VACUUM INTO staging) and the sibling pages/ directory. The pages
@@ -251,20 +291,27 @@ CREATE TABLE IF NOT EXISTS app_settings (
 );
 `);
 
+// Title Case every word so the list reads consistently. Previously a mix of
+// "User manual" and "Security guide" against "Document"/"Brochures", which
+// looked unfinished in Settings and in the Upload type picker.
+// "API" and "KB" are acronyms and stay uppercase -- naive title-casing would
+// produce "Api reference" / "Kb article", which is worse than what we had.
+// Only the display label changes; the KEYS are untouched, so no document or
+// chunk needs re-tagging.
+//
+// FRESH INSTALLS ONLY. The seed below uses INSERT OR IGNORE, so an install
+// that already has these rows keeps whatever labels and order it has. This is
+// deliberate: no migration, and an existing install is never rewritten.
 const BUILTIN_DOCUMENT_TYPE_LABELS: Record<string, string> = {
   document: "Document",
   brochures: "Brochures",
-  user_manual: "User manual",
-  admin_guide: "Admin guide",
-  installation_guide: "Installation guide",
-  quick_start: "Quick start",
-  release_notes: "Release notes",
-  api_reference: "API reference",
-  troubleshooting_guide: "Troubleshooting guide",
-  security_guide: "Security guide",
+  admin_guide: "Admin Guide",
+  installation_guide: "Installation Guide",
+  quick_start: "Quick Start",
+  release_notes: "Release Notes",
+  troubleshooting_guide: "Troubleshooting Guide",
+  security_guide: "Security Guide",
   procedures: "Procedures",
-  kb_article: "KB article",
-  bulletin: "Bulletin",
   pricing: "Pricing",
   misc: "Miscellaneous",
 };
@@ -287,11 +334,18 @@ const BUILTIN_DOCUMENT_TYPE_LABELS: Record<string, string> = {
     for (const row of historical) {
       const key = String(row.key || "").trim();
       if (!key) continue;
-      insert.run(key, key.replace(/_/g, " "), 0, nextOrder++, now);
+      // v1.1.4: was key.replace(/_/g, " "), which produced LOWERCASE labels
+      // ("technical bulletin"). Because the filename-code seeder looks labels
+      // up case-insensitively, it then adopted the bad row instead of creating
+      // a correctly-cased one -- and this backfill re-created it on every boot.
+      insert.run(key, labelFromKey(key), 0, nextOrder++, now);
     }
+    // Alphabetical is the out-of-the-box order for a new install. An unsorted
+    // "importance" list is only useful once someone has actually arranged it.
+    // INSERT OR IGNORE: an existing install keeps its saved choice.
     sqlite.prepare(`
       INSERT OR IGNORE INTO app_settings (key, value)
-      VALUES ('document_type_sort_mode', 'importance')
+      VALUES ('document_type_sort_mode', 'alphabetical')
     `).run();
   });
   tx();
@@ -451,7 +505,19 @@ export interface IStorage {
   listDocumentTypes(): { sort_mode: DocumentTypeSortMode; types: DocumentTypeRecord[] };
   documentTypeExists(key: string): boolean;
   createDocumentType(key: string, label: string): void;
+  // v1.1.3: bulk rename/merge for the free-text product_model and
+  // product_family columns. Unlike document_types there is no registry table
+  // for these -- the values exist only as strings on documents, and the
+  // filter dropdowns are built by DISTINCT. So a rename is a bulk UPDATE.
+  listProductValues(): {
+    models: { value: string; count: number }[];
+    families: { value: string; count: number }[];
+  };
+  renameProductModel(from: string, to: string): number;
+  renameProductFamily(from: string, to: string): number;
   renameDocumentType(key: string, nextKey: string, label: string): void;
+  /** v1.1.4: merge one document type into another, preserving tagging. */
+  mergeDocumentType(fromKey: string, intoKey: string): number;
   deleteDocumentType(key: string): number;
   setDocumentTypeOrder(mode: DocumentTypeSortMode, keys: string[]): void;
   // v0.9.36: per-doc-type accent color. Pass null to clear.
@@ -649,6 +715,117 @@ export class SqliteStorage implements IStorage {
     `).run(key, label, max.n + 1, new Date().toISOString());
   }
 
+  // ---- v1.1.3: product model / family bulk rename + merge ----
+  //
+  // The seeded Welcome Guide is excluded everywhere here, matching
+  // /api/facets: it does not contribute to the value lists, so it must not be
+  // silently rewritten by a rename of a value the user cannot even see.
+  listProductValues(): {
+    models: { value: string; count: number }[];
+    families: { value: string; count: number }[];
+  } {
+    const tally = (column: "product_model" | "product_family") =>
+      sqlite
+        .prepare(
+          `SELECT TRIM(COALESCE(${column}, '')) AS value, COUNT(*) AS count
+             FROM documents
+            WHERE id != ?
+              AND TRIM(COALESCE(${column}, '')) != ''
+            GROUP BY value
+            ORDER BY value COLLATE NOCASE ASC`,
+        )
+        .all(SEED_WELCOME_GUIDE_DOC_ID) as { value: string; count: number }[];
+    return { models: tally("product_model"), families: tally("product_family") };
+  }
+
+  /** Rename every document using `from` to `to`. If `to` already exists this
+   *  is a MERGE -- the rows simply join the existing value. Returns the number
+   *  of documents changed. `to` may be empty: product_model is optional as of
+   *  v1.1.3, so clearing a value is legitimate.
+   *
+   *  chunks.product_model is denormalized for query filtering and MUST move
+   *  with the documents, or the Query tab would filter on stale values. Both
+   *  updates share one transaction so a failure changes nothing. */
+  renameProductModel(from: string, to: string): number {
+    const before = from.trim();
+    const after = to.trim();
+    if (!before) throw new Error("The value to rename cannot be empty.");
+    if (before === after) return 0;
+    let affected = 0;
+    const tx = sqlite.transaction(() => {
+      const ids = sqlite
+        .prepare(
+          `SELECT id FROM documents
+            WHERE TRIM(COALESCE(product_model, '')) = ? AND id != ?`,
+        )
+        .all(before, SEED_WELCOME_GUIDE_DOC_ID) as { id: string }[];
+      affected = ids.length;
+      if (!affected) return;
+      const updateDoc = sqlite.prepare("UPDATE documents SET product_model = ? WHERE id = ?");
+      const updateChunks = sqlite.prepare("UPDATE chunks SET product_model = ? WHERE parent_id = ?");
+      for (const { id } of ids) {
+        updateDoc.run(after, id);
+        updateChunks.run(after, id);
+      }
+    });
+    tx();
+    return affected;
+  }
+
+  /** Same as renameProductModel, for product_family. chunks do NOT denormalize
+   *  product_family (see the note at routes.ts around the chunk filter), so
+   *  only the documents table is touched -- deliberately, not an omission. */
+  renameProductFamily(from: string, to: string): number {
+    const before = from.trim();
+    const after = to.trim();
+    if (!before) throw new Error("The value to rename cannot be empty.");
+    if (before === after) return 0;
+    const result = sqlite
+      .prepare(
+        `UPDATE documents SET product_family = ?
+          WHERE TRIM(COALESCE(product_family, '')) = ? AND id != ?`,
+      )
+      .run(after, before, SEED_WELCOME_GUIDE_DOC_ID);
+    return result.changes;
+  }
+
+  // v1.1.4: merge fromKey into intoKey.
+  //
+  // deleteDocumentType() reassigns to the 'document' fallback, which throws
+  // away the tag. A merge re-points the documents at a type the caller chose.
+  //
+  // Both documents AND chunks must be re-tagged. chunks.document_type is
+  // denormalized, and initializeDocumentTypes() re-creates a document_types
+  // row for any key still referenced by either table -- so missing the chunk
+  // update would resurrect the merged-away type on the next boot.
+  //
+  // Any filename code pointing at fromKey is re-pointed in the same
+  // transaction, otherwise auto-detection would write a key with no row.
+  mergeDocumentType(fromKey: string, intoKey: string): number {
+    if (fromKey === intoKey) throw new Error("Cannot merge a document type into itself.");
+    if (fromKey === "document") throw new Error("The Document fallback cannot be merged away.");
+    let affected = 0;
+    const tx = sqlite.transaction(() => {
+      const from = sqlite.prepare("SELECT 1 FROM document_types WHERE key = ?").get(fromKey);
+      if (!from) throw new Error("Document type not found.");
+      const into = sqlite.prepare("SELECT 1 FROM document_types WHERE key = ?").get(intoKey);
+      if (!into) throw new Error("Target document type not found.");
+
+      affected = (sqlite
+        .prepare("SELECT COUNT(*) AS n FROM documents WHERE document_type = ?")
+        .get(fromKey) as { n: number }).n;
+
+      sqlite.prepare("UPDATE documents SET document_type = ? WHERE document_type = ?").run(intoKey, fromKey);
+      sqlite.prepare("UPDATE chunks SET document_type = ? WHERE document_type = ?").run(intoKey, fromKey);
+      repointFilenameCodesInTx(sqlite, fromKey, intoKey);
+      // v1.2.4: filename phrases follow the same repoint on merge.
+      repointFilenamePhrasesInTx(sqlite, fromKey, intoKey);
+      sqlite.prepare("DELETE FROM document_types WHERE key = ?").run(fromKey);
+    });
+    tx();
+    return affected;
+  }
+
   renameDocumentType(key: string, nextKey: string, label: string): void {
     if (key === "document") throw new Error("The Document fallback cannot be renamed.");
     const tx = sqlite.transaction(() => {
@@ -665,6 +842,11 @@ export class SqliteStorage implements IStorage {
       `).run(nextKey, label, row.is_builtin, row.sort_order, row.created_at);
       sqlite.prepare("UPDATE documents SET document_type = ? WHERE document_type = ?").run(nextKey, key);
       sqlite.prepare("UPDATE chunks SET document_type = ? WHERE document_type = ?").run(nextKey, key);
+      // v1.1.4: a rename that changes the label also changes the KEY, so any
+      // filename code aimed at the old key has to follow it here.
+      repointFilenameCodesInTx(sqlite, key, nextKey);
+      // v1.2.4: same rule for filename phrases.
+      repointFilenamePhrasesInTx(sqlite, key, nextKey);
       sqlite.prepare("DELETE FROM document_types WHERE key = ?").run(key);
     });
     tx();
@@ -679,6 +861,11 @@ export class SqliteStorage implements IStorage {
       affected = (sqlite.prepare("SELECT COUNT(*) AS n FROM documents WHERE document_type = ?").get(key) as { n: number }).n;
       sqlite.prepare("UPDATE documents SET document_type = 'document' WHERE document_type = ?").run(key);
       sqlite.prepare("UPDATE chunks SET document_type = 'document' WHERE document_type = ?").run(key);
+      // v1.1.4: drop rather than re-point. Aiming the code at the 'document'
+      // fallback would keep auto-detection running and quietly mis-tag.
+      repointFilenameCodesInTx(sqlite, key, null);
+      // v1.2.4: drop the phrase row too, same rationale.
+      repointFilenamePhrasesInTx(sqlite, key, null);
       sqlite.prepare("DELETE FROM document_types WHERE key = ?").run(key);
     });
     tx();

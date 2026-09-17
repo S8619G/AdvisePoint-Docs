@@ -44,6 +44,8 @@ export interface QueryTabState {
   matchMode: MatchMode;
   maxResults: number;
   productModel: string;
+  // v1.0.14: Product family filter (defaults to "" = Any).
+  productFamily: string;
   docType: string;
   firmware: string;
   errorCode: string;
@@ -66,6 +68,7 @@ export const queryTabStore = createTabStore<QueryTabState>({
   matchMode: "smart",
   maxResults: 12,
   productModel: "",
+  productFamily: "",
   docType: "",
   firmware: "",
   errorCode: "",
@@ -94,6 +97,7 @@ export function serializeQueryStateToUrl(s: QueryTabState): string {
   if (s.matchMode !== "smart") params.set("mode", s.matchMode);
   if (s.maxResults !== 12) params.set("top_k", String(s.maxResults));
   if (s.productModel) params.set("model", s.productModel);
+  if (s.productFamily) params.set("family", s.productFamily);
   if (s.docType) params.set("type", s.docType);
   if (s.firmware) params.set("fw", s.firmware);
   if (s.errorCode) params.set("err", s.errorCode);
@@ -124,6 +128,8 @@ export function hydrateQueryStateFromUrl(hash: string): Partial<QueryTabState> {
   }
   const model = params.get("model");
   if (model) out.productModel = model;
+  const family = params.get("family");
+  if (family) out.productFamily = family;
   const type = params.get("type");
   if (type) out.docType = type;
   const fw = params.get("fw");

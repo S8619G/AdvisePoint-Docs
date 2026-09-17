@@ -12,9 +12,9 @@
 
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { rawDb } from "./storage";
-import { scheduledBackupFilename, isBackupFilename, writeBackupToFile } from "./backup";
-import { getDataDirForBackup } from "./storage";
+import { rawDb, isDbClosedForRestore } from "./storage";
+import { scheduledBackupFilename, isBackupFilename, writeBackupToFile, translateBackupError, verifyBackupArchiveFile } from "./backup";
+import { appendBackupLog } from "./backup-log";
 
 // -------- Settings persistence (app_settings key/value) --------
 
@@ -64,9 +64,14 @@ function set(key: string, value: string): void {
   ).run(key, value);
 }
 
-function defaultBackupFolder(): string {
-  return join(getDataDirForBackup(), "backups");
-}
+// v1.0.12.4: there is deliberately no default backup folder.
+//
+// Earlier builds seeded the backup path with a "backups" folder inside the
+// application data directory -- the same directory that holds the live
+// database and page images. That pre-filled a destination the user never
+// chose, and one where a backup offers little protection, since a problem
+// affecting that directory affects the backup with it. The path is now empty
+// until the user picks one, and the scheduler refuses to run without it.
 
 export interface BackupSettingsWire extends BackupSettings {
   // UI-friendly aliases so the client can use consistent snake_case field
@@ -77,7 +82,20 @@ export interface BackupSettingsWire extends BackupSettings {
   last_run_finished_at: string | null;
   last_run_started_at: string | null;
   last_run_status: "success" | "failed" | null;
+  // Kept for backward compatibility with older client builds; will hold
+  // the friendly title when the error is a v1.0.11+ structured record,
+  // otherwise the raw text as before.
   last_run_error: string | null;
+  // Structured error surface introduced in v1.0.11. Older backups whose
+  // `last_run_error` is plain text will fall through with `raw` set and
+  // all other fields null so clients can still show a message.
+  last_run_error_detail: {
+    title: string | null;
+    cause: string | null;
+    next_action: string | null;
+    kind: string | null;
+    raw: string;
+  } | null;
   last_backup_filename: string | null;
   next_run_at: string | null;
 }
@@ -86,12 +104,53 @@ export function readSettings(): BackupSettingsWire {
   const cadence = (get(KEYS.cadence) ?? DEFAULTS.cadence) as BackupSettings["cadence"];
   const time = get(KEYS.time) ?? DEFAULTS.time;
   const folderRaw = get(KEYS.folder);
-  const folder = folderRaw && folderRaw.length > 0 ? folderRaw : defaultBackupFolder();
+  const folder = folderRaw && folderRaw.trim().length > 0 ? folderRaw.trim() : "";
   const retention = parseInt(get(KEYS.retention) ?? String(DEFAULTS.retention), 10) || DEFAULTS.retention;
   const lastRunAt = get(KEYS.lastRunAt);
   const lastStatusRaw = get(KEYS.lastStatus);
   const lastStatus = lastStatusRaw === "success" || lastStatusRaw === "failed" ? lastStatusRaw : null;
-  const lastError = get(KEYS.lastError);
+  const lastErrorRaw = get(KEYS.lastError);
+  // From v1.0.11 we store `lastError` as a JSON blob with the friendly
+  // headline + suggested next action. Older field-machine databases will
+  // have a plain-text message; try to parse and fall back gracefully.
+  let lastErrorTitle: string | null = null;
+  let lastErrorDetail: BackupSettingsWire["last_run_error_detail"] = null;
+  if (lastErrorRaw && lastErrorRaw.length > 0) {
+    let parsed: {
+      title?: unknown;
+      cause?: unknown;
+      next_action?: unknown;
+      kind?: unknown;
+      raw?: unknown;
+    } | null = null;
+    try {
+      const maybe = JSON.parse(lastErrorRaw);
+      if (maybe && typeof maybe === "object") parsed = maybe as typeof parsed;
+    } catch { /* legacy plain-text last-run error */ }
+    if (parsed && typeof parsed.title === "string") {
+      lastErrorTitle = parsed.title;
+      lastErrorDetail = {
+        title: parsed.title,
+        cause: typeof parsed.cause === "string" ? parsed.cause : null,
+        next_action: typeof parsed.next_action === "string" ? parsed.next_action : null,
+        kind: typeof parsed.kind === "string" ? parsed.kind : null,
+        raw: typeof parsed.raw === "string" ? parsed.raw : "",
+      };
+    } else {
+      // Legacy plain-text last-run error. Preserve it as `raw` so support
+      // can still see what shipped, and treat the whole string as the
+      // title for the UI so older upgrades don't render blank.
+      lastErrorTitle = lastErrorRaw;
+      lastErrorDetail = {
+        title: lastErrorRaw,
+        cause: null,
+        next_action: null,
+        kind: null,
+        raw: lastErrorRaw,
+      };
+    }
+  }
+  const lastError = lastErrorTitle;
   const lastBytesRaw = get(KEYS.lastBytes);
   const lastBytes = lastBytesRaw ? parseInt(lastBytesRaw, 10) : null;
   const lastFilename = get("backup_last_filename");
@@ -122,6 +181,7 @@ export function readSettings(): BackupSettingsWire {
     last_run_started_at: lastRunAt,
     last_run_status: lastStatus,
     last_run_error: lastError,
+    last_run_error_detail: lastErrorDetail,
     last_backup_filename: lastFilename,
     next_run_at: nextRunIso,
   };
@@ -254,12 +314,37 @@ function shouldRunMissedOnStartup(settings: BackupSettings, now: Date): boolean 
 
 async function runBackupNow(reason: "scheduled" | "catchup"): Promise<void> {
   const settings = readSettings();
+
+  // No destination chosen: do nothing rather than inventing one. Recorded as
+  // a failure with a clear reason so the Settings page can say what to do.
+  if (!settings.folder || settings.folder.trim().length === 0) {
+    logBackup(`[BACKUP] ${reason} run skipped: no backup folder has been chosen`);
+    set(KEYS.lastStatus, "failed");
+    set(KEYS.lastError, JSON.stringify({
+      title: "No backup folder has been chosen",
+      cause: "Scheduled backups are turned on, but no destination folder has been selected yet.",
+      next_action: "Choose a backup folder in Settings -- ideally on a different drive from the app.",
+      kind: "permission",
+      raw: "backup folder not configured",
+    }));
+    set(KEYS.lastRunAt, new Date().toISOString());
+    return;
+  }
+
   try {
     mkdirSync(settings.folder, { recursive: true });
   } catch (err) {
-    logBackup(`[BACKUP] failed to create folder ${settings.folder}: ${(err as Error).message}`);
+    const raw = (err as Error).message || String(err);
+    logBackup(`[BACKUP] failed to create folder ${settings.folder}: ${raw}`);
+    const friendly = translateBackupError(err);
     set(KEYS.lastStatus, "failed");
-    set(KEYS.lastError, `folder create failed: ${(err as Error).message}`);
+    set(KEYS.lastError, JSON.stringify({
+      title: friendly.title,
+      cause: friendly.cause,
+      next_action: friendly.next_action,
+      kind: friendly.kind,
+      raw,
+    }));
     return;
   }
 
@@ -274,19 +359,33 @@ async function runBackupNow(reason: "scheduled" | "catchup"): Promise<void> {
     set(KEYS.lastError, "");
     set(KEYS.lastBytes, String(result.bytes));
     set("backup_last_filename", filename);
-    pruneOldBackups(settings.folder, settings.retention);
+    await pruneOldBackups(settings.folder, settings.retention);
   } catch (err) {
-    const msg = (err as Error).message || String(err);
-    logBackup(`[BACKUP] failed: ${msg}`);
+    // Raw exception message goes to server.log so support and the
+    // diagnostics bundle both see it. The stored `lastError` is the
+    // plain-language translation so the UI never has to re-parse the
+    // raw text at render time.
+    const raw = (err as Error).message || String(err);
+    const friendly = translateBackupError(err);
+    logBackup(`[BACKUP] failed (${friendly.kind}): ${raw}`);
     set(KEYS.lastRunAt, new Date().toISOString());
     set(KEYS.lastStatus, "failed");
-    set(KEYS.lastError, msg);
+    // Store the friendly title as the primary error and keep the raw
+    // message + kind alongside so the client can render both a heading
+    // and a suggested next action.
+    set(KEYS.lastError, JSON.stringify({
+      title: friendly.title,
+      cause: friendly.cause,
+      next_action: friendly.next_action,
+      kind: friendly.kind,
+      raw,
+    }));
     // Best-effort delete partial file.
     try { if (existsSync(outPath)) rmSync(outPath); } catch { /* ignore */ }
   }
 }
 
-function pruneOldBackups(folder: string, retention: number): void {
+async function pruneOldBackups(folder: string, retention: number): Promise<void> {
   try {
     const entries = readdirSync(folder, { withFileTypes: true })
       .filter((e) => e.isFile() && isBackupFilename(e.name))
@@ -296,11 +395,30 @@ function pruneOldBackups(folder: string, retention: number): void {
       })
       .sort((a, b) => b.mtime - a.mtime); // newest first
     if (entries.length <= retention) return;
+
+    // v1.0.12.3: prove a newer backup is actually restorable before removing
+    // any older one. Deleting on count alone can throw away the last good
+    // archive when the recent ones are damaged.
+    const keepers = entries.slice(0, retention);
+    let verifiedKeeper: string | null = null;
+    for (const k of keepers) {
+      const verdict = await verifyBackupArchiveFile(k.full);
+      if (verdict.ok) { verifiedKeeper = k.name; break; }
+      logBackup(`[BACKUP] retention: ${k.name} did not verify (${verdict.problems.join("; ")})`);
+    }
+    if (!verifiedKeeper) {
+      logBackup(
+        `[BACKUP] retention: nothing deleted -- none of the ${keepers.length} newest ` +
+          `backup(s) could be verified, so older backups are being kept.`,
+      );
+      return;
+    }
+
     const toDelete = entries.slice(retention);
     for (const f of toDelete) {
       try {
         rmSync(f.full);
-        logBackup(`[BACKUP] retention: deleted ${f.name}`);
+        logBackup(`[BACKUP] retention: deleted ${f.name} (verified keeper: ${verifiedKeeper})`);
       } catch { /* ignore */ }
     }
   } catch (err) {
@@ -312,9 +430,41 @@ function logBackup(line: string): void {
   // server.log capture is already wired through console; keep the
   // [BACKUP] prefix so it's greppable.
   try { console.log(line); } catch { /* ignore */ }
+  // v1.0.12.2: also append to the dedicated backups.log, which the
+  // launcher does not rotate on every start, so scheduled-run history
+  // survives across launches. Best-effort and never throws, so a log
+  // that cannot be written can't affect the backup outcome.
+  appendBackupLog(line);
 }
 
+// v1.0.13.0: coarse throttle for the opt-in recovery auto-cleanup sweep.
+// The sweep is cheap (list + per-item re-verification), but a per-minute tick
+// is far more frequently than "is there anything to clean up?" needs to run.
+let lastAutoCleanupTickAt = 0;
+const AUTO_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // hourly
+
 async function tick(): Promise<void> {
+  // v1.0.12.3: never run a backup against a database that was closed for a
+  // restore -- the app is waiting to be restarted.
+  if (isDbClosedForRestore()) return;
+
+  // v1.0.13.0: opt-in recovery auto-cleanup runs on the same tick. Kept
+  // strictly separate from the backup flow so a backup failure never blocks
+  // it and vice versa.
+  const nowMs = Date.now();
+  if (nowMs - lastAutoCleanupTickAt >= AUTO_CLEANUP_INTERVAL_MS) {
+    lastAutoCleanupTickAt = nowMs;
+    try {
+      // Late require to avoid a bootstrap cycle with recovery.ts.
+      const recovery = require("./recovery") as typeof import("./recovery");
+      if (recovery.getAutoCleanupEnabled()) {
+        recovery.runAutoCleanupOnce();
+      }
+    } catch (err) {
+      console.error("[recovery] scheduled auto-cleanup failed:", err);
+    }
+  }
+
   const settings = readSettings();
   if (settings.cadence === "off") return;
 

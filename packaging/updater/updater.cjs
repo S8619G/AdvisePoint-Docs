@@ -9,7 +9,7 @@ const https = require("node:https");
 const crypto = require("node:crypto");
 const zlib = require("node:zlib");
 const readline = require("node:readline");
-const { spawn } = require("node:child_process");
+const { spawn, execFileSync } = require("node:child_process");
 
 const OWNER = "S8619G";
 // v1.0.1.1: Repo name must match GitHub's canonical mixed-case spelling.
@@ -200,19 +200,55 @@ async function fetchLatestRelease() {
   // release that reverts to the versioned name for a specific reason.
   const canonicalName = "advisepoint-docs.zip";
   const versionedName = `advisepoint-docs-v${String(release.tag_name).replace(/^v/i, "")}.zip`;
-  const isMatchingAsset = (item) =>
-    typeof item?.name === "string" &&
-    (item.name.toLowerCase() === canonicalName || item.name.toLowerCase() === versionedName) &&
-    isTrustedAssetUrl(item.browser_download_url) &&
-    Number.isSafeInteger(item.size) &&
-    item.size > 0;
+  // v1.0.11.3: some GitHub uploads (especially manual ones through the
+  // Releases UI) end up with the asset filename that the browser sent,
+  // which can be dotted or mixed-case -- e.g. `AdvisePoint.Docs.v1.0.11.1.zip`.
+  // Prior versions only accepted the exact lowercase-hyphen forms and
+  // rejected the asset with `Release asset ... was not found`, which
+  // silently broke every GitHub-hosted in-place upgrade whose asset
+  // filename didn't match. Normalize by stripping case, dots, hyphens,
+  // and underscores before comparing so all reasonable naming styles
+  // match the same target.
+  const normalize = (s) => String(s || "").toLowerCase().replace(/[.\-_]/g, "");
+  const canonicalKey = normalize(canonicalName);
+  const versionedKey = normalize(versionedName);
+  // v1.0.12.1: the exact-key comparison above still rejected every asset
+  // whose embedded version had more parts than the tag. A three-part tag
+  // like `v1.0.12` produced the key `advisepointdocsv1012zip`, while the
+  // four-part build uploaded as `AdvisePoint.Docs.v1.0.12.0.zip`
+  // normalized to `advisepointdocsv10120zip` -- no match, so the update
+  // aborted before downloading. Every GitHub-hosted upgrade from v1.0.11
+  // onward failed this way. Tag and package version numbers are allowed
+  // to differ in precision (compareVersions() below zero-pads them), so
+  // the asset filename must not be required to echo the tag exactly.
+  //
+  // Accept, in descending order of confidence:
+  //   1. the canonical version-free name,
+  //   2. the exact tag-versioned name,
+  //   3. any product-prefixed .zip (covers any version spelling), and
+  //   4. a lone .zip asset on the release.
+  // The trust check on browser_download_url is unchanged and still gates
+  // every candidate, so widening the name match cannot introduce a
+  // download from outside the release.
+  const productKey = "advisepointdocs";
+  const isUsableAsset = (item) => {
+    if (typeof item?.name !== "string") return false;
+    if (!isTrustedAssetUrl(item.browser_download_url)) return false;
+    if (!Number.isSafeInteger(item.size) || item.size <= 0) return false;
+    return normalize(item.name).endsWith("zip");
+  };
   const assetList = Array.isArray(release.assets) ? release.assets : [];
-  // Prefer the canonical version-free name when both are somehow present.
+  const usable = assetList.filter(isUsableAsset);
   const asset =
-    assetList.find((item) => isMatchingAsset(item) && item.name.toLowerCase() === canonicalName) ||
-    assetList.find(isMatchingAsset) ||
+    usable.find((item) => normalize(item.name) === canonicalKey) ||
+    usable.find((item) => normalize(item.name) === versionedKey) ||
+    usable.find((item) => normalize(item.name).startsWith(productKey)) ||
+    (usable.length === 1 ? usable[0] : null) ||
     null;
-  const expectedName = `${canonicalName} or ${versionedName}`;
+  if (asset && normalize(asset.name) !== canonicalKey) {
+    log(`Release asset matched by relaxed name rule: ${asset.name}`);
+  }
+  const expectedName = `${canonicalName}, ${versionedName}, or any AdvisePoint-Docs*.zip`;
   if (!asset) {
     // v1.0.1.1: enumerate what the API actually returned so this class of
     // bug is diagnosable from update.log without needing the source tree.
@@ -319,6 +355,24 @@ async function requestServerShutdown() {
   }
 }
 
+// v1.0.12.1: confirm the relaunched server actually came back up. The
+// updater previously spawned the launcher and exited immediately, so a
+// launcher that failed to start node produced no evidence at all -- the log
+// ended at "Update complete" and the user was left staring at a dead tab
+// with no idea whether the update or the relaunch had failed.
+async function waitForPortInUse(timeoutMs = 45_000) {
+  const start = Date.now();
+  const deadline = start + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await checkPort(5000)) {
+      log(`Port 5000 accepted connections after ${Date.now() - start} ms.`);
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return false;
+}
+
 async function waitForPortRelease(timeoutMs = 30_000) {
   // v0.9.34: Raised from 15 s -> 30 s. Even with the server's new
   // closeAllConnections() drop, Windows process-chain teardown behind the
@@ -339,6 +393,215 @@ async function waitForPortRelease(timeoutMs = 30_000) {
   const elapsedMs = Date.now() - start;
   log(`Port 5000 did not release within ${elapsedMs} ms.`);
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.12: stale-instance detection.
+//
+// Every prior release gated the dist/node swap solely on port 5000 being
+// free (waitForPortRelease). That is not sufficient: the launcher does
+// `cd /d "%~dp0"` and runs `<installRoot>\node\node.exe`, so a surviving
+// server process holds BOTH an executable-image handle inside the install
+// folder AND the install folder as its working directory. Such a process
+// keeps the folder locked (Windows refuses to rename it) and can make the
+// atomic rename fail mid-flight, yet it is completely invisible to a
+// LISTENING-on-5000 check once it has lost or never claimed the port.
+//
+// Field report (v1.0.11.4 -> v1.0.11.5): the install folder could not even
+// be renamed by hand afterwards because one of these orphans was still
+// alive while the app was being served from a different folder.
+//
+// Detection is Windows-only and best-effort by design. If the query cannot
+// run we return null, meaning "unknown", and the caller treats unknown as
+// safe-to-proceed so we never block a legitimate upgrade on a broken
+// PowerShell. A positive result, by contrast, aborts BEFORE anything in
+// dist/ is touched.
+function findStaleInstallProcesses() {
+  if (process.platform !== "win32") return [];
+  // v1.0.12: the trailing separator is load-bearing. Without it, a bare
+  // startsWith() on "c:\...\advisepoint docs" also matches sibling folders
+  // like "c:\...\advisepoint docs-old\node\node.exe", and we would happily
+  // kill a DIFFERENT installation the user is deliberately running.
+  const rootLower = installRoot.toLowerCase().replace(/[\\/]+$/, "") + path.sep;
+  // Win32_Process exposes ExecutablePath and CommandLine but not the working
+  // directory, so we match on the image path (covers launcher-started node)
+  // and on the command line (covers a node started with an explicit path to
+  // dist\index.cjs under this root).
+  const script =
+    "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | " +
+    "Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress -Depth 2";
+  let raw;
+  try {
+    raw = execFileSync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", script],
+      { encoding: "utf8", timeout: 15_000, windowsHide: true },
+    );
+  } catch (error) {
+    log(`Stale-instance check could not run: ${error.message}`);
+    return null;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.trim() || "[]");
+  } catch {
+    log("Stale-instance check returned unparseable output.");
+    return null;
+  }
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+
+  // v1.0.12: the updater is itself `<installRoot>\node\node.exe`, launched by
+  // "Update AdvisePoint Docs.bat", which the running server spawns. So this
+  // process matches its own filter (excluded by PID below) and an old server
+  // may still be our ANCESTOR. Killing an ancestor tree would terminate the
+  // updater mid-run, so ancestors are reported but never killed.
+  const parentOf = new Map();
+  for (const row of rows) {
+    if (row && typeof row.ProcessId === "number") {
+      parentOf.set(row.ProcessId, typeof row.ParentProcessId === "number" ? row.ParentProcessId : 0);
+    }
+  }
+  const ancestors = new Set();
+  let cursor = parentOf.get(process.pid) ?? 0;
+  for (let hops = 0; cursor && hops < 32 && !ancestors.has(cursor); hops += 1) {
+    ancestors.add(cursor);
+    cursor = parentOf.get(cursor) ?? 0;
+  }
+
+  const matches = [];
+  for (const row of rows) {
+    if (!row || typeof row.ProcessId !== "number") continue;
+    if (row.ProcessId === process.pid) continue;
+    const image = String(row.ExecutablePath || "").toLowerCase();
+    const cmdline = String(row.CommandLine || "").toLowerCase();
+    if (image.startsWith(rootLower) || cmdline.includes(rootLower)) {
+      matches.push({
+        pid: row.ProcessId,
+        image: row.ExecutablePath || "(unknown)",
+        isAncestor: ancestors.has(row.ProcessId),
+      });
+    }
+  }
+  return matches;
+}
+
+// Terminate a stale instance and confirm it is actually gone. Returns true
+// when the install folder is clear (or when detection is unavailable), false
+// only when we positively know a process is still holding it.
+async function ensureNoStaleInstance() {
+  let found = findStaleInstallProcesses();
+  if (found === null) return true; // unknown -> do not block the upgrade
+  if (found.length === 0) {
+    log("No stale AdvisePoint Docs processes are holding the install folder.");
+    return true;
+  }
+
+  // v1.0.12.1: give the old server a chance to finish exiting on its own
+  // before reaching for taskkill. The v1.0.12.0 field diagnostics showed
+  // the previous node.exe releasing port 5000 in 3 ms but not actually
+  // exiting for another 44 seconds -- it was still flushing its shutdown
+  // path. Terminating it the instant the port frees is both unnecessary
+  // and riskier than waiting a few seconds for a clean exit, so poll
+  // first and only force what is genuinely stuck.
+  //
+  // v1.1.7: widened from 20 s to 45 s. A v1.1.4 -> v1.1.6 upgrade in the
+  // field observed the old server taking 18.6 s to exit on its own, well
+  // inside the previous window but close enough to the boundary that a
+  // slightly slower shutdown (a larger library, an antivirus scan mid-
+  // close) would tip into a forced kill. The server itself now bounds its
+  // own shutdown at 5 s via a worker-thread watchdog (server/shutdown-
+  // watchdog.ts), so 45 s here is a generous margin, not an SLA.
+  const graceDeadline = Date.now() + 45_000;
+  log(`Waiting for ${found.length} exiting process(es) to finish before touching files.`);
+  while (Date.now() < graceDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const still = findStaleInstallProcesses();
+    if (still === null) return true;
+    if (still.length === 0) {
+      log("Previous instance exited on its own; install folder is clear.");
+      return true;
+    }
+    found = still;
+  }
+  log(`Still held after grace period; forcing termination of ${found.length} process(es).`);
+
+  for (const proc of found) {
+    log(`Stale process holding the install folder: pid=${proc.pid} image=${proc.image}`);
+    if (proc.isAncestor) {
+      // Killing our own ancestor would take this updater down with it.
+      log(`pid=${proc.pid} is an ancestor of this updater; not terminating it.`);
+      continue;
+    }
+    try {
+      // No /T. The process tree below an old server can contain THIS updater
+      // (server -> cmd -> node updater), and /T would kill us mid-run.
+      execFileSync("taskkill.exe", ["/PID", String(proc.pid), "/F"], {
+        encoding: "utf8",
+        timeout: 15_000,
+        windowsHide: true,
+      });
+      log(`Terminated stale process pid=${proc.pid}.`);
+    } catch (error) {
+      log(`Could not terminate pid=${proc.pid}: ${error.message}`);
+    }
+  }
+
+  // Windows takes a moment to release handles after the process object dies.
+  // v1.1.7: widened from 10 s to 20 s. On the field-observed slow shutdown
+  // the file handles were the actual blocker for the subsequent dist swap
+  // ('EPERM: operation not permitted, unlink ...'). A longer wait here
+  // makes the retry loop in replaceInstall() less likely to escalate to
+  // its recovery path.
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    found = findStaleInstallProcesses();
+    if (found === null) return true;
+    if (found.length === 0) {
+      log("Install folder is clear after terminating stale processes.");
+      return true;
+    }
+  }
+  // v1.0.12.1: never abort over a process we deliberately refused to kill.
+  // Anything flagged isAncestor belongs to this updater's own launch chain,
+  // so treating it as a foreign holder would make every in-place update
+  // fail with "a previous process is still holding the folder" -- exactly
+  // the outcome this gate exists to prevent. Proceed and let
+  // replaceInstall()'s retry handle a genuine sharing violation.
+  if (found.every((p) => p.isAncestor)) {
+    log(
+      `Remaining process(es) are part of this updater's own launch chain (${found
+        .map((p) => p.pid)
+        .join(", ")}); proceeding.`,
+    );
+    return true;
+  }
+  log(`Install folder is still held by: ${found.map((p) => p.pid).join(", ")}`);
+  return false;
+}
+
+// v1.0.12.1: Windows can keep a directory handle open for a short window
+// after the owning process dies, which surfaces as EBUSY/EPERM/EACCES on
+// rename. Retrying briefly turns a hard update failure into a slightly
+// slower success.
+function renameWithRetry(from, to, attempts = 12) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      fs.renameSync(from, to);
+      if (attempt > 1) log(`Rename succeeded on attempt ${attempt}: ${path.basename(to)}`);
+      return;
+    } catch (error) {
+      const retryable =
+        error && (error.code === "EBUSY" || error.code === "EPERM" || error.code === "EACCES");
+      if (!retryable || attempt >= attempts) throw error;
+      log(`Rename blocked (${error.code}) on ${path.basename(to)}; retrying (${attempt}/${attempts}).`);
+      // Synchronous sleep: replaceInstall() is deliberately non-async so the
+      // swap window cannot interleave with anything else. Atomics.wait on a
+      // private buffer blocks this thread without spawning a helper process
+      // (process.execPath lives inside the folder being replaced).
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+    }
+  }
 }
 
 function crc32(buffer) {
@@ -373,6 +636,163 @@ function findEndOfCentralDirectory(zip) {
     if (zip.readUInt32LE(offset) === 0x06054b50) return offset;
   }
   throw new Error("ZIP end-of-central-directory record is missing");
+}
+
+// v1.2.2: local-zip preflight. Verify a local update zip's integrity BEFORE
+// touching the install directory, so a corrupt file (bad USB transfer,
+// interrupted download) is refused with a clear "redownload" message
+// instead of a mid-extraction "integrity check failed" that reads like a
+// generic "retry" prompt. Two tiers:
+//   Tier 1: if `<zipPath>.sha256` or `SHA256SUMS.txt` sits beside the zip
+//           and names this file, hash the zip and refuse on mismatch.
+//   Tier 2: no companion file -> walk the central directory once and
+//           verify every entry's compressed CRC without writing anything.
+// Only after preflight passes does extractZip run for real.
+function readCompanionSha256(zipPath) {
+  const dir = path.dirname(zipPath);
+  const base = path.basename(zipPath);
+  const perFile = path.join(dir, base + ".sha256");
+  if (fs.existsSync(perFile)) {
+    try {
+      const raw = fs.readFileSync(perFile, "utf8").trim();
+      // sha256sum format: "<64 hex>  <basename>"; be lenient about the filename column.
+      const m = raw.match(/^([a-f0-9]{64})\b/i);
+      if (m) return { hash: m[1].toLowerCase(), source: perFile };
+    } catch (error) {
+      log(`Preflight: could not read companion hash file ${perFile}: ${error.message}`);
+    }
+  }
+  const sumsFile = path.join(dir, "SHA256SUMS.txt");
+  if (fs.existsSync(sumsFile)) {
+    try {
+      const lines = fs.readFileSync(sumsFile, "utf8").split(/\r?\n/);
+      for (const line of lines) {
+        const m = line.match(/^([a-f0-9]{64})\s+\*?(\S.*)$/i);
+        if (m && path.basename(m[2].trim()) === base) {
+          return { hash: m[1].toLowerCase(), source: sumsFile };
+        }
+      }
+    } catch (error) {
+      log(`Preflight: could not read SHA256SUMS.txt at ${sumsFile}: ${error.message}`);
+    }
+  }
+  return null;
+}
+
+function formatPreflightErrorLines(expected, actual, failingEntry, failingCount) {
+  const lines = [];
+  lines.push("");
+  lines.push("The update file on your disk is damaged.");
+  lines.push("");
+  lines.push("The file that was shipped is not the same as the file that's on");
+  lines.push("your disk now. Something between the download and this laptop");
+  lines.push("corrupted it -- most commonly a USB thumbdrive, a network share,");
+  lines.push("or an interrupted download.");
+  lines.push("");
+  if (expected && actual) {
+    lines.push(`Expected SHA-256: ${expected}`);
+    lines.push(`Actual SHA-256:   ${actual}`);
+    lines.push("");
+  } else if (failingEntry) {
+    lines.push(`Failing entry: ${failingEntry}`);
+    if (failingCount && failingCount > 1) {
+      lines.push(`Total corrupted entries in the zip: ${failingCount}`);
+    }
+    lines.push("");
+  }
+  lines.push("Do NOT retry the update against this file. Instead:");
+  lines.push("  1. Redownload the update file, ideally directly to this laptop.");
+  lines.push("  2. If you must transfer via USB, hash the file on both ends");
+  lines.push("     with Get-FileHash before running the updater.");
+  lines.push("  3. If the file continues to arrive corrupt, your USB drive");
+  lines.push("     or your network path may be the cause -- try a different route.");
+  lines.push("");
+  lines.push("Your existing installation was not touched.");
+  return lines;
+}
+
+function preflightLocalZip(zip, zipPath) {
+  // Tier 1: companion hash file, if present.
+  const companion = readCompanionSha256(zipPath);
+  if (companion) {
+    const actual = crypto.createHash("sha256").update(zip).digest("hex").toLowerCase();
+    log(`Preflight: companion hash source=${companion.source}`);
+    log(`Preflight: expected=${companion.hash} actual=${actual}`);
+    if (actual !== companion.hash) {
+      const lines = formatPreflightErrorLines(companion.hash, actual, null, 0);
+      const err = new Error("Local zip failed SHA-256 preflight");
+      err.userLines = lines;
+      err.expectedHash = companion.hash;
+      err.actualHash = actual;
+      throw err;
+    }
+    log("Preflight: companion SHA-256 verified.");
+    return;
+  }
+
+  // Tier 2: no companion file. Walk the central directory and verify every
+  // entry's CRC without writing anything. This is intentionally the SAME
+  // decode path extractZip uses, so a mid-stream DEFLATE corruption on a
+  // large binary entry is caught here rather than after we've started
+  // writing files to the install root.
+  log("Preflight: no companion hash file; verifying entries by CRC.");
+  const eocd = findEndOfCentralDirectory(zip);
+  const entryCount = zip.readUInt16LE(eocd + 10);
+  const centralOffset = zip.readUInt32LE(eocd + 16);
+  if (entryCount > MAX_ENTRIES) throw new Error("ZIP contains too many entries");
+  let cursor = centralOffset;
+  let firstFailingEntry = null;
+  let failingCount = 0;
+  for (let index = 0; index < entryCount; index += 1) {
+    if (zip.readUInt32LE(cursor) !== 0x02014b50) {
+      throw new Error(`Invalid ZIP central-directory entry ${index}`);
+    }
+    const flags = zip.readUInt16LE(cursor + 8);
+    const method = zip.readUInt16LE(cursor + 10);
+    const expectedCrc = zip.readUInt32LE(cursor + 16);
+    const compressedSize = zip.readUInt32LE(cursor + 20);
+    const uncompressedSize = zip.readUInt32LE(cursor + 24);
+    const nameLength = zip.readUInt16LE(cursor + 28);
+    const extraLength = zip.readUInt16LE(cursor + 30);
+    const commentLength = zip.readUInt16LE(cursor + 32);
+    const localOffset = zip.readUInt32LE(cursor + 42);
+    if (flags & 0x1) throw new Error("Encrypted ZIP entries are not supported");
+    if (method !== 0 && method !== 8) throw new Error(`Unsupported ZIP compression method ${method}`);
+    const name = zip.subarray(cursor + 46, cursor + 46 + nameLength).toString("utf8");
+    if (!name.endsWith("/")) {
+      if (zip.readUInt32LE(localOffset) !== 0x04034b50) {
+        throw new Error(`Invalid local ZIP header for ${name}`);
+      }
+      const localNameLength = zip.readUInt16LE(localOffset + 26);
+      const localExtraLength = zip.readUInt16LE(localOffset + 28);
+      const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
+      const compressed = zip.subarray(dataOffset, dataOffset + compressedSize);
+      let content;
+      try {
+        content = method === 0 ? compressed : zlib.inflateRawSync(compressed);
+      } catch (error) {
+        if (!firstFailingEntry) firstFailingEntry = name;
+        failingCount += 1;
+        cursor += 46 + nameLength + extraLength + commentLength;
+        continue;
+      }
+      if (content.length !== uncompressedSize || crc32(content) !== expectedCrc) {
+        if (!firstFailingEntry) firstFailingEntry = name;
+        failingCount += 1;
+      }
+    }
+    cursor += 46 + nameLength + extraLength + commentLength;
+  }
+  if (failingCount > 0) {
+    log(`Preflight: ${failingCount} corrupt entr${failingCount === 1 ? "y" : "ies"} in local zip; first failure: ${firstFailingEntry}`);
+    const lines = formatPreflightErrorLines(null, null, firstFailingEntry, failingCount);
+    const err = new Error(`Local zip failed integrity preflight (${failingCount} corrupt entr${failingCount === 1 ? "y" : "ies"}, first: ${firstFailingEntry})`);
+    err.userLines = lines;
+    err.failingEntry = firstFailingEntry;
+    err.failingCount = failingCount;
+    throw err;
+  }
+  log("Preflight: all entries verified.");
 }
 
 function extractZip(zip, outputRoot) {
@@ -447,6 +867,160 @@ function copyIfPresent(source, destination) {
   fs.copyFileSync(source, destination);
 }
 
+// ---------------------------------------------------------------------------
+// v1.1.0: app-root sync (fixes the v1.0.14 -> v1.0.15 "welcome guide vanished"
+// upgrade bug).
+//
+// Through v1.0.15 replaceInstall() swapped dist/ and then hand-copied exactly
+// two files ("Update AdvisePoint Docs.bat" and packaging/updater/updater.cjs)
+// plus the node/ runtime. Everything else in the incoming release's app root
+// was silently discarded. That meant any file or folder introduced by a NEW
+// version never landed on disk during an upgrade -- which is how v1.0.15's
+// welcome-guide/AdvisePoint-Docs-Welcome-Guide.pdf went missing for anyone who
+// upgraded from v1.0.14 instead of extracting a fresh copy. README.txt,
+// launcher/, and "Setup Icon (run once).bat" were equally stale for the same
+// reason; nobody noticed because those files rarely changed.
+//
+// The sync below walks the incoming app root and writes EVERY file it finds,
+// creating directories as needed.
+//
+// Two safety properties, both deliberate:
+//
+//   1. ADDITIVE ONLY. We copy and overwrite; we never delete anything already
+//      in the install root. An upgrade therefore cannot remove user content
+//      that happens to live beside the app, and a stale file left behind by an
+//      older build is strictly less harmful than the data loss that pruning
+//      could cause. VERSION is the one authoritative marker of "what is
+//      installed", and replaceInstall() still writes it last.
+//   2. EXPLICIT PRESERVE SET. Shipped releases must not contain user data, so
+//      in practice the names below never appear in an incoming zip. The guard
+//      exists anyway: if a future packaging mistake ever ships a file named
+//      advisepoint.db (or pages/, originals/, ...), the updater refuses to
+//      overwrite the user's copy rather than destroying a library. This is the
+//      same preserve-first posture the backup/restore path uses.
+//
+// Note that user data does not normally live in the install root at all --
+// "Start AdvisePoint Docs.bat" points RAG_DB_PATH and RAG_PAGES_DIR at
+// %LOCALAPPDATA%\AdvisePoint Docs\. The preserve set covers older installs and
+// portable/dev layouts that kept the DB next to the app.
+
+// Top-level names replaceInstall() manages through their own dedicated,
+// rollback-aware code paths. Syncing them again here would either duplicate
+// work or fight the atomic rename/marker logic.
+const SYNC_SKIP_TOP_LEVEL = new Set([
+  "dist",          // swapped atomically via dist.new -> dist with dist.bak rollback
+  "node",          // replaced only when NODE_VERSION changes
+  "NODE_VERSION",  // written alongside the node/ swap
+  "VERSION",       // written last, after every other step succeeds
+  // v1.2.0: ARCH is checked up-front by the incoming-vs-installed match
+  // gate below; a mismatched upgrade is refused before replaceInstall()
+  // runs. Skipping the sync here keeps the ARCH sentinel arch-locked to
+  // the installed layout even in the (impossible-under-the-gate) case
+  // where an incoming zip somehow carried a different value.
+  "ARCH",
+]);
+
+// Never created, overwritten, or removed by the sync. Lowercase for
+// case-insensitive comparison (Windows filesystems are case-insensitive, and
+// an upgrade must behave identically on a case-sensitive volume).
+const SYNC_PRESERVE_NAMES = new Set([
+  // user database, current and historical names
+  "advisepoint.db",
+  "advisepoint.db-wal",
+  "advisepoint.db-shm",
+  "data.db",
+  "data.db-wal",
+  "data.db-shm",
+  // user content and derived caches
+  "pages",
+  "originals",
+  "snapshots",
+  "backups",
+  "quarantine",
+  "trash",
+  "logs",
+  // local runtime state, not shipped
+  ".unblocked",
+  ".updating",
+  // transient artifacts owned by this updater's rollback logic
+  "dist.bak",
+  "node.old",
+]);
+
+function isPreservedName(name) {
+  const lower = String(name).toLowerCase();
+  if (SYNC_PRESERVE_NAMES.has(lower)) return true;
+  // server.log, server.log.1, update.log, ...
+  if (/\.log(\.\d+)?$/.test(lower)) return true;
+  // dist.new-1234 / node.new-1234 from an interrupted prior run
+  if (/^(dist|node)\.new-\d+$/.test(lower)) return true;
+  return false;
+}
+
+// Recursively copy `sourceDir` over `targetDir`. Returns a summary so the
+// update log records exactly what the upgrade added or refreshed -- the
+// v1.0.15 bug was invisible partly because the log said nothing about the
+// files it skipped.
+function syncDirectory(sourceDir, targetDir, summary, isTopLevel) {
+  const entries = fs.readdirSync(sourceDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const name = entry.name;
+    if (isTopLevel && SYNC_SKIP_TOP_LEVEL.has(name)) continue;
+    if (isPreservedName(name)) {
+      summary.preserved.push(name);
+      continue;
+    }
+
+    const source = path.join(sourceDir, name);
+    const target = path.join(targetDir, name);
+
+    if (entry.isDirectory()) {
+      const isNew = !fs.existsSync(target);
+      fs.mkdirSync(target, { recursive: true });
+      if (isNew) summary.newFolders.push(path.relative(installRoot, target));
+      syncDirectory(source, target, summary, false);
+      continue;
+    }
+
+    // Symlinks in a release zip are not expected; extractZip() writes regular
+    // files only. Skip anything that is neither a file nor a directory rather
+    // than following it somewhere unexpected.
+    if (!entry.isFile()) continue;
+
+    const isNew = !fs.existsSync(target);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(source, target);
+    if (isNew) summary.newFiles.push(path.relative(installRoot, target));
+    else summary.updatedFiles.push(path.relative(installRoot, target));
+  }
+}
+
+function syncAppRoot(incomingRoot) {
+  const summary = { newFiles: [], newFolders: [], updatedFiles: [], preserved: [] };
+  syncDirectory(incomingRoot, installRoot, summary, true);
+
+  log(
+    `App root sync: ${summary.newFiles.length} new file(s), ` +
+    `${summary.newFolders.length} new folder(s), ` +
+    `${summary.updatedFiles.length} refreshed file(s).`,
+  );
+  if (summary.newFolders.length) {
+    log(`New folders: ${summary.newFolders.join(", ")}`);
+  }
+  if (summary.newFiles.length) {
+    // Cap the listing so a first-time node_modules sync cannot flood the log.
+    const shown = summary.newFiles.slice(0, 25);
+    const suffix = summary.newFiles.length > shown.length
+      ? `, ... (+${summary.newFiles.length - shown.length} more)`
+      : "";
+    log(`New files: ${shown.join(", ")}${suffix}`);
+  }
+  if (summary.preserved.length) {
+    log(`Preserved existing (not overwritten): ${[...new Set(summary.preserved)].join(", ")}`);
+  }
+  return summary;
+}
+
 function replaceInstall(incomingRoot, latestVersion) {
   const currentDist = path.join(installRoot, "dist");
   const backupDist = path.join(installRoot, "dist.bak");
@@ -466,21 +1040,23 @@ function replaceInstall(incomingRoot, latestVersion) {
 
   try {
     removePath(backupDist);
-    fs.renameSync(currentDist, backupDist);
+    renameWithRetry(currentDist, backupDist);
     backupCreated = true;
     if (process.env.APD_UPDATE_TEST_FAIL_AFTER_BACKUP === "1") {
       throw new Error("Simulated failure after backup");
     }
-    fs.renameSync(newDist, currentDist);
+    renameWithRetry(newDist, currentDist);
 
-    copyIfPresent(
-      path.join(incomingRoot, "Update AdvisePoint Docs.bat"),
-      path.join(installRoot, "Update AdvisePoint Docs.bat"),
-    );
-    copyIfPresent(
-      path.join(incomingRoot, "packaging", "updater", "updater.cjs"),
-      path.join(installRoot, "packaging", "updater", "updater.cjs"),
-    );
+    // v1.1.0: sync the whole incoming app root instead of hand-copying two
+    // known files. This is what makes new shipped content (welcome-guide/,
+    // README.txt, launcher/, ...) actually land during an upgrade. The two
+    // files copied explicitly before v1.1.0 -- "Update AdvisePoint Docs.bat"
+    // and packaging/updater/updater.cjs -- are covered by the walk, so the
+    // self-update of the updater still happens exactly as it did.
+    //
+    // Placement matters: this runs INSIDE the try, after the dist swap, so any
+    // failure here still hits the catch below and rolls dist back to dist.bak.
+    syncAppRoot(incomingRoot);
 
     const currentNodeMarker = path.join(installRoot, "NODE_VERSION");
     const incomingNodeMarker = path.join(incomingRoot, "NODE_VERSION");
@@ -541,17 +1117,103 @@ function waitForEnter(message) {
 function launchApp() {
   if (process.platform !== "win32" || process.env.APD_UPDATE_NO_LAUNCH === "1") return;
   const launcher = path.join(installRoot, "Start AdvisePoint Docs.bat");
+  const vbs = path.join(installRoot, "launcher", "run-hidden.vbs");
+
+  // v1.0.9.22: strip APD_HIDDEN and APD_MIN from the spawn env. The prior
+  // node process inherits these from the VBS/minimized wrapper that
+  // launched IT, and passing them through to the .bat makes the .bat
+  // skip its own VBS-bounce guard on line 29 -- which means the whole
+  // relaunched process tree runs under a bare cmd->powershell chain
+  // created by Node's spawn+windowsHide. That chain leaves a
+  // taskbar-visible powershell.exe (proven in the v1.0.9.21 diagnostics
+  // bundle: PID 35204 was the Tee-Object PowerShell). Clearing the
+  // vars forces a fresh launch through the correct hidden path.
+  const cleanEnv = { ...process.env };
+  delete cleanEnv.APD_HIDDEN;
+  delete cleanEnv.APD_MIN;
+
+  // v1.0.12.1: tell the relaunched server directly that it is the
+  // post-update boot, instead of relying solely on the `.updating`
+  // sentinel file. server/index.ts honors APD_JUST_UPDATED=1 and appends a
+  // cache-busting `?updated=<ts>` to the URL it opens, which is what forces
+  // the browser into a fresh navigation rather than re-focusing the stale
+  // tab left over from before the update. The sentinel remains as the
+  // fallback for launches that don't come from here (e.g. the user starting
+  // the app manually after an update), but a missing or already-consumed
+  // sentinel can no longer cost us the cache-bust.
+  cleanEnv.APD_JUST_UPDATED = "1";
+
+  // Do not leak updater-only variables into the long-lived server process.
+  // APD_LOCAL_ZIP in particular points at a temp file this updater is about
+  // to delete, and APD_UPDATE_ASSUME_YES would suppress prompts in any
+  // updater the new server later spawns from its own environment.
+  delete cleanEnv.APD_LOCAL_ZIP;
+  delete cleanEnv.APD_UPDATE_ASSUME_YES;
+  delete cleanEnv.APD_UPDATE_NO_PROMPT;
+
+  // v1.0.9.22: prefer launching through wscript+run-hidden.vbs when it
+  // exists. VBS's WScript.Shell.Run(..., 0, false) creates the console
+  // with SW_HIDE at kernel level, before any window is mapped -- Windows
+  // never allocates a taskbar tile for the child. This is the same path
+  // taken by the desktop shortcut on double-click, so the post-update
+  // process tree matches the fresh-launch process tree exactly.
+  //
+  // Fall back to spawning the .bat under a hidden cmd if VBS is missing
+  // (e.g. hand-copied install). That path is imperfect (see the reason
+  // for the APD_HIDDEN strip above) but keeps the app launching.
+  if (fs.existsSync(vbs)) {
+    spawn("wscript.exe", [vbs], {
+      cwd: installRoot,
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+      env: cleanEnv,
+    }).unref();
+    return;
+  }
   spawn("cmd.exe", ["/c", launcher], {
     cwd: installRoot,
     detached: true,
     stdio: "ignore",
     windowsHide: true,
+    env: cleanEnv,
   }).unref();
 }
 
+// v1.0.9: --local-zip <path>. Parse once here so downstream code doesn't need
+// to re-scan argv. When set, the updater bypasses the GitHub API entirely and
+// reads the zip from the given path. Everything else (shutdown handshake,
+// atomic swap, sentinel handling) is unchanged.
+//
+// v1.2.3: --allow-same-version. The version guard below normally refuses any
+// install where the incoming VERSION is <= the currently installed VERSION
+// (downgrade OR same-version reinstall). This flag relaxes that check to
+// only refuse a strict downgrade -- an equal-version reinstall is allowed.
+// Downgrade remains forbidden even with this flag. Intended for developer
+// reinstalls of a corrupted install and for QA reproducing a build without
+// having to bump the version number.
+function parseArgv(argv) {
+  const out = { localZip: null, allowSameVersion: false };
+  for (let i = 2; i < argv.length; i++) {
+    if (argv[i] === "--local-zip" && argv[i + 1]) {
+      out.localZip = argv[i + 1];
+      i++;
+    } else if (argv[i] === "--allow-same-version") {
+      out.allowSameVersion = true;
+    }
+  }
+  return out;
+}
+
 async function main() {
+  const args = parseArgv(process.argv);
+  // v1.0.12.1: tracks whether we actually relaunched the app, so the
+  // top-level handler knows who owns clearing the update sentinel.
+  let launched = false;
   log("=== Update check started ===");
   log(`Install root: ${installRoot}`);
+  if (args.localZip) log(`Local-zip mode: ${args.localZip}`);
+  if (args.allowSameVersion) log("Same-version reinstall allowed (--allow-same-version)");
   if (await checkPort(5000)) {
     if (!(await identifyRunningApp())) {
       log("Port 5000 is in use by a process that is not AdvisePoint Docs.");
@@ -590,83 +1252,243 @@ async function main() {
   const currentVersion = readCurrentVersion();
   log(`Running version: v${currentVersion}`);
 
-  let latest;
-  try {
-    latest = await fetchLatestRelease();
-  } catch (error) {
-    log(`Network/release check failed: ${error.message}`);
-    console.log("Could not reach GitHub. Check your internet connection and try again.");
-    return 3;
+  // v1.0.9: local-zip path. Skip fetchLatestRelease entirely; read the zip
+  // bytes from disk and jump into the same extract+swap flow. The server
+  // endpoint that hands us the path has already validated the zip is an
+  // AdvisePoint Docs release, so we still re-validate here (VERSION file,
+  // no-downgrade, dist/index.cjs present via findPackageRoot) as defense in
+  // depth.
+  let archive;
+  let sourceLabel;
+  let expectedVersion = null;
+  if (args.localZip) {
+    if (!fs.existsSync(args.localZip)) {
+      log(`Local zip not found: ${args.localZip}`);
+      console.log(`The specified update zip could not be found: ${args.localZip}`);
+      return 3;
+    }
+    try {
+      archive = fs.readFileSync(args.localZip);
+    } catch (error) {
+      log(`Could not read local zip: ${error.message}`);
+      console.log(`Could not read the specified update zip: ${error.message}`);
+      return 3;
+    }
+    sourceLabel = args.localZip;
+    log(`[updater] using local zip ${args.localZip} (skipping GitHub fetch)`);
+    // v1.2.2: verify integrity BEFORE any staging or install writes. On
+    // failure, print user-facing lines that explicitly steer the user to
+    // redownload rather than retry against the same corrupt file.
+    try {
+      preflightLocalZip(archive, args.localZip);
+    } catch (error) {
+      log(`Update failed at preflight: ${error.message}`);
+      if (error.userLines && Array.isArray(error.userLines)) {
+        for (const line of error.userLines) console.log(line);
+      } else {
+        console.log("Update failed. Your existing installation was preserved.");
+      }
+      return 4;
+    }
+  } else {
+    let latest;
+    try {
+      latest = await fetchLatestRelease();
+    } catch (error) {
+      log(`Network/release check failed: ${error.message}`);
+      console.log("Could not reach GitHub. Check your internet connection and try again.");
+      return 3;
+    }
+    log(`Latest version available on GitHub: v${latest.version}`);
+    const comparison = compareVersions(currentVersion, latest.version);
+    if (comparison === 0) {
+      log(`You are running v${currentVersion}, which matches the latest version available on GitHub.`);
+      await waitForEnter("Press Enter to close.");
+      return 0;
+    }
+    if (comparison > 0) {
+      log(`You are running v${currentVersion}. GitHub's latest published release is v${latest.version}, so this installation is newer than the published release.`);
+      await waitForEnter("Press Enter to close.");
+      return 0;
+    }
+    log(`GitHub has a newer version: v${latest.version}.`);
+    try {
+      log(`Downloading ${latest.assetUrl}`);
+      archive = await requestBuffer(latest.assetUrl);
+    } catch (error) {
+      log(`Download failed: ${error.message}`);
+      console.log("Update failed. Your existing installation was preserved.");
+      return 4;
+    }
+    sourceLabel = latest.assetUrl;
+    const actualHash = crypto.createHash("sha256").update(archive).digest("hex");
+    log(`Downloaded bytes=${archive.length} sha256=${actualHash}`);
+    if (archive.length !== latest.assetSize) {
+      log(`Update failed: Download size mismatch: expected ${latest.assetSize}, received ${archive.length}`);
+      console.log("Update failed. Your existing installation was preserved.");
+      return 4;
+    }
+    if (latest.sha256 && actualHash !== latest.sha256) {
+      log(`Update failed: SHA-256 mismatch: expected ${latest.sha256}, received ${actualHash}`);
+      console.log("Update failed. Your existing installation was preserved.");
+      return 4;
+    }
+    if (!latest.sha256) log("Release notes contain no sha256 line; size and ZIP CRC checks will be used.");
+    expectedVersion = latest.version;
   }
-  log(`Latest version available on GitHub: v${latest.version}`);
-  const comparison = compareVersions(currentVersion, latest.version);
-  if (comparison === 0) {
-    log(`You are running v${currentVersion}, which matches the latest version available on GitHub.`);
-    await waitForEnter("Press Enter to close.");
-    return 0;
-  }
-  if (comparison > 0) {
-    log(`You are running v${currentVersion}. GitHub's latest published release is v${latest.version}, so this installation is newer than the published release.`);
-    await waitForEnter("Press Enter to close.");
-    return 0;
-  }
-  log(`GitHub has a newer version: v${latest.version}.`);
 
   const tempBase = process.env.TEMP || os.tmpdir();
   fs.mkdirSync(tempBase, { recursive: true });
-  const zipPath = path.join(tempBase, `apd-update-${latest.version}.zip`);
-  const stagingRoot = path.join(tempBase, `apd-update-${latest.version}`);
+  const stagingSuffix = expectedVersion || "local";
+  const zipPath = path.join(tempBase, `apd-update-${stagingSuffix}.zip`);
+  const stagingRoot = path.join(tempBase, `apd-update-${stagingSuffix}`);
   removePath(zipPath);
   removePath(stagingRoot);
 
   try {
-    log(`Downloading ${latest.assetUrl}`);
-    const archive = await requestBuffer(latest.assetUrl);
-    fs.writeFileSync(zipPath, archive);
-    const actualHash = crypto.createHash("sha256").update(archive).digest("hex");
-    log(`Downloaded bytes=${archive.length} sha256=${actualHash}`);
-    if (archive.length !== latest.assetSize) {
-      throw new Error(`Download size mismatch: expected ${latest.assetSize}, received ${archive.length}`);
+    if (!args.localZip) {
+      // Only write the temp zip for the online path; the local-zip path
+      // already has the file on disk at args.localZip.
+      fs.writeFileSync(zipPath, archive);
     }
-    if (latest.sha256 && actualHash !== latest.sha256) {
-      throw new Error(`SHA-256 mismatch: expected ${latest.sha256}, received ${actualHash}`);
-    }
-    if (!latest.sha256) log("Release notes contain no sha256 line; size and ZIP CRC checks will be used.");
-
-    log(`Extracting to ${stagingRoot}`);
+    log(`Extracting to ${stagingRoot} (source: ${sourceLabel})`);
     extractZip(archive, stagingRoot);
     const incomingRoot = findPackageRoot(stagingRoot);
     const incomingVersionPath = path.join(incomingRoot, "VERSION");
     if (!fs.existsSync(incomingVersionPath)) throw new Error("Incoming VERSION marker is missing");
     const incomingVersion = fs.readFileSync(incomingVersionPath, "utf8").trim();
-    if (compareVersions(incomingVersion, currentVersion) <= 0) {
-      throw new Error(`Refusing downgrade or same-version install: v${incomingVersion}`);
+    // v1.2.3: default is refuse-if-<=, so an equal-version reinstall is
+    // blocked alongside a downgrade. --allow-same-version relaxes this to
+    // refuse-if-< only, so "reinstall the exact same version" (developer
+    // repair, QA reproduction) is permitted while downgrade stays blocked.
+    const versionCmp = compareVersions(incomingVersion, currentVersion);
+    if (versionCmp < 0) {
+      throw new Error(`Refusing downgrade: v${incomingVersion} is older than installed v${currentVersion}`);
     }
-    if (compareVersions(incomingVersion, latest.version) !== 0) {
-      throw new Error(`Release tag v${latest.version} does not match package v${incomingVersion}`);
+    if (versionCmp === 0 && !args.allowSameVersion) {
+      throw new Error(
+        `Refusing same-version install: v${incomingVersion} is already installed. ` +
+          `Pass --allow-same-version if this is intentional (developer repair or QA reproduction).`,
+      );
+    }
+    if (versionCmp === 0) {
+      log(`Same-version reinstall of v${incomingVersion} proceeding (--allow-same-version).`);
+    }
+    if (expectedVersion && compareVersions(incomingVersion, expectedVersion) !== 0) {
+      throw new Error(`Release tag v${expectedVersion} does not match package v${incomingVersion}`);
+    }
+
+    // v1.2.0: ARCH match gate. AdvisePoint Docs ships a single-arch zip per
+    // build (x64 or arm64). Overlaying an x64 zip onto an arm64 install --
+    // or vice versa -- would leave a mixed-arch install (arm64 node.exe
+    // trying to load an x64 better_sqlite3.node, or worse) with no clean
+    // recovery. Fail fast, before dist/ is touched. Missing ARCH on the
+    // installed side is treated as "x64" for backward compatibility with
+    // pre-v1.2.0 installs, which were always x64. Missing ARCH on the
+    // incoming zip is a hard refusal: v1.2.0 and up always write it.
+    const incomingArchPath = path.join(incomingRoot, "ARCH");
+    if (!fs.existsSync(incomingArchPath)) {
+      throw new Error(
+        "Incoming build is missing the ARCH sentinel. Refusing an upgrade whose " +
+          "architecture cannot be verified. Reinstall AdvisePoint Docs by extracting " +
+          "the zip that matches your machine directly, rather than upgrading.",
+      );
+    }
+    const incomingArch = fs.readFileSync(incomingArchPath, "utf8").trim().toLowerCase();
+    const installedArchPath = path.join(installRoot, "ARCH");
+    const installedArch = fs.existsSync(installedArchPath)
+      ? fs.readFileSync(installedArchPath, "utf8").trim().toLowerCase()
+      : "x64";
+    if (incomingArch !== installedArch) {
+      throw new Error(
+        `Refusing cross-architecture upgrade: installed is ${installedArch}, ` +
+          `incoming is ${incomingArch}. Download the ${installedArch} zip, ` +
+          `or back up your data and reinstall by extracting the ${incomingArch} ` +
+          `zip into a fresh folder.`,
+      );
+    }
+
+    // v1.0.12: last gate before we touch dist/. Port 5000 being free does
+    // not prove the old server is gone, and a survivor pins the install
+    // folder. Abort here, with dist/ untouched, rather than half-applying.
+    if (!(await ensureNoStaleInstance())) {
+      throw new Error(
+        "A previous AdvisePoint Docs process is still holding the installation folder. " +
+          "No files were changed. Close AdvisePoint Docs (or restart Windows) and run this updater again.",
+      );
     }
 
     log("Replacing application files.");
-    replaceInstall(incomingRoot, latest.version);
-    log(`Update complete: v${currentVersion} -> v${latest.version}`);
+    replaceInstall(incomingRoot, incomingVersion);
+    log(`Update complete: v${currentVersion} -> v${incomingVersion}`);
+
+    // v1.0.12.1: relaunch BEFORE the staging cleanup in the finally block.
+    // That cleanup deletes a ~57 MB extracted tree plus the uploaded zip,
+    // which on a real disk delays the relaunch by many seconds. In the
+    // v1.0.12.0 field test the app did not come back until 48 seconds after
+    // the swap finished -- long enough that the drag-and-drop update looked
+    // like it had simply stopped, and the user started the app by hand. The
+    // temp files are the updater's own and are equally safe to remove after
+    // the new server is up.
+    if (await ask("Update complete. Launch AdvisePoint Docs now? (Y/N) ")) {
+      log("Relaunching AdvisePoint Docs.");
+      launchApp();
+      launched = true;
+      if (await waitForPortInUse()) {
+        log("Relaunched server is listening on port 5000.");
+      } else {
+        // Not fatal: the update itself succeeded and the launcher may still
+        // be starting. Logging it makes a silent failure to come back
+        // diagnosable instead of invisible.
+        log("WARN relaunched server was not listening within 45 s; start the app manually if it did not appear.");
+      }
+    } else {
+      log("Relaunch declined; leaving AdvisePoint Docs closed.");
+    }
   } catch (error) {
     log(`Update failed: ${error.stack || error.message}`);
     console.log("Update failed. Your existing installation was preserved.");
+    // v1.0.12: surface the reason on screen. The stale-instance abort is
+    // user-actionable ("close the app / restart Windows") and was previously
+    // only visible by opening update.log.
+    if (error && error.message) console.log(error.message);
     return 4;
   } finally {
     removePath(zipPath);
     removePath(stagingRoot);
+    // v1.0.9: local-zip mode cleans up the user-supplied temp file too. The
+    // server dropped it in tempBase; it's safe to remove after either
+    // success or failure.
+    if (args.localZip) removePath(args.localZip);
   }
 
-  if (await ask("Update complete. Launch AdvisePoint Docs now? (Y/N) ")) {
-    launchApp();
-  }
-  return 0;
+  // v1.0.11.4: report launched=true so the top-level handler knows to
+  // LEAVE the sentinel in place. The freshly-spawned server reads it at
+  // boot to decide whether to open the browser with a cache-busting URL
+  // (avoiding Chrome's "focus existing tab" behavior), and clears it
+  // itself once consumed. If we cleared it here, the new server would
+  // usually miss it because spawn+unref returns in ms while the .bat
+  // needs seconds to reach listen().
+  //
+  // v1.0.12.1: `launched` is now the real outcome rather than a hardcoded
+  // true. When the relaunch was declined or skipped, nothing will ever
+  // consume the sentinel, so the top-level handler must clear it -- a
+  // leftover sentinel makes the NEXT ordinary launch think it is a
+  // post-update boot.
+  return { code: 0, launched };
 }
 
 if (require.main === module) {
   main().then(
-    (code) => { clearUpdateSentinel(); process.exitCode = code; },
+    (result) => {
+      // Back-compat: result may be a bare number (failure paths) or the
+      // new { code, launched } shape. When launched===true, the new
+      // server takes ownership of clearing the sentinel.
+      const code = typeof result === "number" ? result : result?.code ?? 0;
+      const launched = typeof result === "number" ? false : !!result?.launched;
+      if (!launched) clearUpdateSentinel();
+      process.exitCode = code;
+    },
     (error) => {
       clearUpdateSentinel();
       try {
@@ -688,4 +1510,21 @@ module.exports = {
   identifyRunningApp,
   localAppRequest,
   waitForPortRelease,
+  findStaleInstallProcesses,
+  ensureNoStaleInstance,
+  // v1.0.12.1: exported so the asset-name matching that broke every
+  // GitHub-hosted upgrade from v1.0.11 onward can be regression-tested
+  // without performing a real update.
+  fetchLatestRelease,
+  renameWithRetry,
+  // v1.1.0: exported so the app-root sync that fixes the dropped
+  // welcome-guide/ folder can be unit-tested (new-file and new-folder cases)
+  // without performing a real update.
+  syncAppRoot,
+  isPreservedName,
+  // v1.2.2: exported so the local-zip preflight can be regression-tested
+  // (healthy zip with/without companion, corrupt zip with wrong hash,
+  // corrupt zip caught by walk-and-verify) without performing a real update.
+  preflightLocalZip,
+  readCompanionSha256,
 };

@@ -82,6 +82,36 @@ import {
 import { Link } from "wouter";
 import { apiRequest } from "@/lib/queryClient";
 import { DocxDropUpdate } from "./DocxDropUpdate";
+import { DocumentFileNameWithBadge } from "./DocumentFormatBadge";
+import { Highlight, extractTerms } from "@/lib/highlight";
+
+// v1.0.10: class applied to every <mark> this viewer injects into the
+// docx-preview DOM. The cleanup pass keys off this exact class, so it must
+// stay in sync between the highlight pass and the cleanup pass.
+const SEARCH_HIT_CLASS = "advisepoint-search-hit";
+// NOTE: deliberately no `dark:` variants here. docx-preview renders the page
+// with its own inline white background that does not follow the app theme, so
+// in dark mode the dark: variants (light amber text on a light amber chip over
+// a white page) were effectively invisible. The DOCX marks therefore always
+// use the light-mode pair, which is correct against the always-white page.
+// The RTF/TXT <Highlight> component keeps its dark: variants because that
+// body pane *does* follow the app theme.
+const SEARCH_HIT_STYLE = "rounded-sm bg-amber-200/70 px-0.5 text-amber-950";
+
+// Mirrors the regex Highlight builds in @/lib/highlight so DOCX and RTF (and
+// the TXT viewer) all match the same way: longest terms first, quoted
+// phrases tolerant of run-together whitespace, case-insensitive.
+function buildSearchPattern(query: string): RegExp | null {
+  const terms = extractTerms(query);
+  if (terms.length === 0) return null;
+  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const source = terms
+    .map((t) =>
+      t.includes(" ") ? t.split(/\s+/).map(escape).join("\\s+") : escape(t),
+    )
+    .join("|");
+  return new RegExp(`(${source})`, "gi");
+}
 
 // v1.0.6.1: DOCX zoom bounds are separate from use-zoom-pan's MIN_ZOOM
 // (which is 1 -- native pixel size, appropriate for scanned page
@@ -166,6 +196,11 @@ export function DocxViewerDialog({
   const [renderError, setRenderError] = useState<string | null>(null);
   const [pageCount, setPageCount] = useState<number>(0);
   const [currentPage, setCurrentPage] = useState<number>(1);
+
+  // v1.0.10: in-viewer text search. Mirrors the TXT viewer's simple
+  // highlight box -- live highlight, no counter, no prev/next.
+  const [searchInput, setSearchInput] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
   // v1.0.6.1: when the source .docx has no pagination hints at all, we
   // collapse the pager UI to "Continuous view" instead of lying about
   // "Page 1 of 1". True only when the synthesizer couldn't produce >1
@@ -506,6 +541,12 @@ export function DocxViewerDialog({
         editPollTimer.current = null;
       }
       const sid = editSessionRef.current;
+      // v1.0.10 (belt-and-braces): drop the pill state synchronously BEFORE
+      // firing the async close request. Closes a race where a poll timer
+      // that already fired sets editSession again after the close returns,
+      // leaving a stale "Editing in Word" pill on the next open.
+      setEditSession(null);
+      editSessionRef.current = null;
       if (sid) {
         void fetch(`/api/documents/${encodeURIComponent(documentId)}/edit-close`, {
           method: "POST",
@@ -692,6 +733,125 @@ export function DocxViewerDialog({
     }, 5000);
     return () => window.clearTimeout(t);
   }, [editSession?.status]);
+
+  // ---------- v1.0.10: in-viewer search ----------
+
+  // Debounce so highlight recomputation stays cheap on large documents.
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebouncedQuery(searchInput.trim()), 200);
+    return () => window.clearTimeout(t);
+  }, [searchInput]);
+
+  // Clear the search whenever the dialog opens for a fresh document, or the
+  // document is replaced via drag-to-update, so a stale query never carries
+  // over into an unrelated document.
+  useEffect(() => {
+    setSearchInput("");
+    setDebouncedQuery("");
+  }, [open, documentId, reloadKey]);
+
+  // Remove every <mark> this component injected and stitch the split text
+  // nodes back together. normalize() is essential: without it each
+  // highlight cycle leaves the text fragmented, so the next TreeWalker pass
+  // would see partial words and fail to match phrases it should.
+  const clearDocxHighlights = useCallback(() => {
+    const host = renderRef.current;
+    if (!host) return;
+    const marks = host.querySelectorAll(`mark.${SEARCH_HIT_CLASS}`);
+    const touchedParents = new Set<Node>();
+    marks.forEach((mark) => {
+      const parent = mark.parentNode;
+      if (!parent) return;
+      parent.replaceChild(
+        document.createTextNode(mark.textContent ?? ""),
+        mark,
+      );
+      touchedParents.add(parent);
+    });
+    touchedParents.forEach((parent) => {
+      try {
+        (parent as Element).normalize();
+      } catch {
+        /* ignore -- a detached parent needs no normalizing */
+      }
+    });
+  }, []);
+
+  // Highlight matches inside the docx-preview DOM.
+  //
+  // docx-preview mutates its container directly via renderAsync, so React
+  // does not own that subtree and <Highlight> cannot be used. We walk text
+  // nodes and splice in <mark> elements, exactly as browser Ctrl+F does.
+  //
+  // Deliberately never: mutates attributes/styles/non-text nodes,
+  // re-triggers renderAsync, touches the IntersectionObserver page tracker,
+  // or touches scrollRef/renderRef layout. <mark> is inline, so adding it
+  // does not reflow surrounding text and scrolling stays smooth.
+  useEffect(() => {
+    if (renderState !== "ready" || !renderRef.current) return;
+
+    // Always start from a clean slate.
+    clearDocxHighlights();
+
+    const query = debouncedQuery.trim();
+    if (!query) return;
+
+    const pattern = buildSearchPattern(query);
+    if (!pattern) return;
+
+    const host = renderRef.current;
+
+    // Collect first -- mutating during traversal invalidates the walker.
+    const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
+    const textNodes: Text[] = [];
+    let node: Node | null = walker.nextNode();
+    while (node) {
+      textNodes.push(node as Text);
+      node = walker.nextNode();
+    }
+
+    for (const textNode of textNodes) {
+      const value = textNode.nodeValue;
+      if (!value || value.length === 0) continue;
+
+      const parent = textNode.parentElement;
+      if (!parent) continue;
+      const tag = parent.tagName;
+      if (tag === "SCRIPT" || tag === "STYLE") continue;
+      if (parent.classList.contains(SEARCH_HIT_CLASS)) continue;
+      // Defensive: nothing sets this today, but it gives us an opt-out.
+      if (parent.hasAttribute("data-no-highlight")) continue;
+
+      pattern.lastIndex = 0;
+      if (!pattern.test(value)) continue;
+
+      // Alternating [text, match, text, match, ...] like Highlight does.
+      pattern.lastIndex = 0;
+      const parts = value.split(pattern);
+      if (parts.length < 2) continue;
+
+      const fragment = document.createDocumentFragment();
+      parts.forEach((part, idx) => {
+        if (!part) return;
+        if (idx % 2 === 1) {
+          const mark = document.createElement("mark");
+          mark.className = `${SEARCH_HIT_CLASS} ${SEARCH_HIT_STYLE}`;
+          mark.setAttribute("data-testid", "highlight");
+          mark.textContent = part;
+          fragment.appendChild(mark);
+        } else {
+          fragment.appendChild(document.createTextNode(part));
+        }
+      });
+      parent.replaceChild(fragment, textNode);
+    }
+
+    // Cleanup on unmount and whenever renderState leaves "ready" (e.g. a
+    // drag-to-update re-render) so no stale marks survive.
+    return () => {
+      clearDocxHighlights();
+    };
+  }, [debouncedQuery, renderState, clearDocxHighlights]);
 
   // v1.0.7: undo handler wired to the undo toast (calls
   // /api/documents/:id/undo-replace which restores the pre-update backup
@@ -959,6 +1119,12 @@ export function DocxViewerDialog({
               </div>
             )}
           </div>
+          {/* v1.0.10: filename + colored type badge, so the DOCX/RTF header
+              matches the PDF and TXT viewers. */}
+          <DocumentFileNameWithBadge
+            fileName={documentFileName}
+            className="mt-0.5 pr-8 text-xs text-muted-foreground"
+          />
           <DialogDescription className="sr-only">
             {isRtf ? "RTF" : "Word"} document viewer for {documentTitle}.
           </DialogDescription>
@@ -1021,7 +1187,10 @@ export function DocxViewerDialog({
                 className="flex-1 min-h-0 overflow-auto bg-background px-6 py-4"
               >
                 <pre className="whitespace-pre-wrap font-sans text-sm leading-relaxed">
-                  {meta.markdown}
+                  {/* v1.0.10: live search highlight. RTF renders as plain
+                      text we own, so the shared <Highlight> component works
+                      directly -- no TreeWalker needed here. */}
+                  <Highlight text={meta.markdown} query={debouncedQuery} />
                 </pre>
               </div>
             </div>
@@ -1047,6 +1216,22 @@ export function DocxViewerDialog({
             </div>
           )}
         </div>
+
+        {/* v1.0.10: in-document search row, styled to match the TXT viewer's
+            highlight box. Kept as its own row above the toolbar so the
+            existing page-nav / zoom / Print controls keep their layout. */}
+        {!isLegacy && (
+          <div className="px-4 py-2 border-t border-border shrink-0 flex items-center gap-2">
+            <input
+              type="text"
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
+              placeholder="Highlight text in document…"
+              className="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-xs outline-none focus:ring-1 focus:ring-ring"
+              data-testid="input-content-highlight"
+            />
+          </div>
+        )}
 
         {/* Toolbar -- kept slim, parity with PdfPageViewerDialog. Hidden
             when the legacy re-upload UI is showing since none of these

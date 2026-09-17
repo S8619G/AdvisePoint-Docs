@@ -21,6 +21,8 @@ import {
   setBackendHealth,
   subscribeBackendHealth,
   queryClient,
+  noteHealthTick,
+  shouldSuppressEscalation,
   type BackendHealth,
 } from "@/lib/queryClient";
 
@@ -65,6 +67,9 @@ export function BackendDownOverlay() {
 
     const tick = async () => {
       if (cancelled) return;
+      // v1.0.11.2: detect large wall-clock jumps so a laptop resume
+      // triggers a grace window instead of an immediate reconnect banner.
+      noteHealthTick();
       const ok = await pingHealth();
       if (cancelled) return;
       if (ok) {
@@ -77,6 +82,11 @@ export function BackendDownOverlay() {
         }
       } else {
         failCountRef.current += 1;
+        // v1.0.11.2: skip escalation while a known-busy op is running
+        // (Restore, packaged export) or immediately after wake. The
+        // counter keeps advancing so a real crash escalates the
+        // moment the suppression window ends.
+        if (shouldSuppressEscalation()) return;
         if (failCountRef.current >= DOWN_THRESHOLD) {
           if (getBackendHealth() !== "down") setBackendHealth("down");
         } else if (failCountRef.current >= RECONNECT_THRESHOLD) {

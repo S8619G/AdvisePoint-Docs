@@ -14,10 +14,14 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { APP_VERSION } from "./version";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { InstallLocationBanner } from "@/components/InstallLocationBanner";
+import { StaleTabBanner } from "@/components/StaleTabBanner";
 import { BackendDownOverlay } from "@/components/BackendDownOverlay";
 import { RenderStatusIndicator } from "@/components/RenderStatusIndicator";
 import { libraryTabStore } from "@/lib/libraryTabStore";
 import { useTabState } from "@/lib/tabStore";
+// v1.1.0 item 5: sidebar badge that surfaces in-flight uploads from any
+// tab, so the user can tell background work is still running.
+import { useUploadsInProgress } from "@/lib/uploadTabStore";
 
 function TopNav() {
   const [loc] = useLocation();
@@ -75,6 +79,12 @@ function TopNav() {
               >
                 <Icon className="h-3.5 w-3.5" />
                 {t.label}
+                {/* v1.1.0 item 5: small "uploads in progress" pill on the
+                    Upload tab so background uploads are visible from any
+                    tab. Rendered only for the Upload tab and only while
+                    the batch loop is live (count > 0). Kept compact per
+                    the backlog: dot + count, no separate global toaster. */}
+                {t.testid === "tab-upload" && <UploadInProgressBadge />}
               </Link>
             );
           })}
@@ -115,6 +125,22 @@ function TopNav() {
   );
 }
 
+// v1.1.0 item 5: small pill next to the Upload tab label. Hidden when
+// no batch is in flight so the tab looks unchanged for the common case.
+function UploadInProgressBadge() {
+  const inProgress = useUploadsInProgress();
+  if (inProgress <= 0) return null;
+  return (
+    <span
+      data-testid="badge-uploads-in-progress"
+      aria-label={`${inProgress} upload${inProgress === 1 ? "" : "s"} in progress`}
+      className="ml-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-medium leading-none text-primary-foreground"
+    >
+      {inProgress}
+    </span>
+  );
+}
+
 function AppRouter() {
   return (
     <Switch>
@@ -140,6 +166,10 @@ function App() {
             {/* v1.0.5: cloud-sync / UNC folder warning. Sits above the update
                 banner so it stays visible even when an update is available. */}
             <InstallLocationBanner />
+            {/* v1.0.9.22: detects when an in-app update ran while this tab was
+                open (server version drifts from this tab's compiled APP_VERSION)
+                and prompts the user to close or reload. */}
+            <StaleTabBanner />
             <UpdateBanner />
             <main className="mx-auto max-w-[1400px] px-6 py-8">
               <AppRouter />

@@ -16,6 +16,17 @@ import { rawDb } from "./storage";
 import { backfillMissingLocations } from "./locate";
 import { bootState, envSnapshot, logRotate, withPhase } from "./boot";
 import { logInstallLocationAtBoot } from "./install-location";
+import { appendBackupLogSessionStart } from "./backup-log";
+import { IdleWatchdog } from "./idle-watchdog";
+import {
+  getRenderQueueSnapshot,
+  reconcilePersistedRenderStatuses,
+  reconcilePersistedPageImagePaths,
+} from "./pages";
+// v1.1.7: import the shared shutdown watchdog so it is instantiated at boot.
+// The worker thread is idle until /api/updater/shutdown arms it.
+import "./shutdown-watchdog-holder";
+import { APP_VERSION } from "../client/src/version";
 
 const app = express();
 const httpServer = createServer(app);
@@ -112,24 +123,77 @@ export function log(message: string, source = "express") {
 // pauses while the tab is hidden — see client/src/lib/heartbeat.ts). The
 // symptom is the BackendDownOverlay firing seemingly at random. Raising the
 // default to 10 minutes matches how techs actually use the tool.
+//
+// v1.1.6: the elapsed-time test moved into IdleWatchdog so it can tell a
+// suspended machine from an absent browser. Sleeping the computer for longer
+// than the idle window used to kill the server every time: node and the
+// browser freeze together, no heartbeats arrive, but the wall clock keeps
+// running, so the first tick after wake saw hours of "idleness" and exited
+// before the tab could ping again. The watchdog now treats a tick that
+// arrives far later than the interval as proof the process was not running,
+// and restarts the idle clock from the moment of resume.
 // -------------------------------------------------------------------
 const IDLE_SHUTDOWN_MS = parseInt(process.env.RAG_IDLE_SHUTDOWN_MS || "600000", 10);
 const IDLE_CHECK_MS = 10000;
-let lastHeartbeat = 0;
-let hasSeenHeartbeat = false;
 
-app.get("/api/heartbeat", (_req, res) => {
-  lastHeartbeat = Date.now();
-  hasSeenHeartbeat = true;
-  res.json({ ok: true, ts: lastHeartbeat });
+const idleWatchdog = new IdleWatchdog({
+  idleShutdownMs: IDLE_SHUTDOWN_MS,
+  checkMs: IDLE_CHECK_MS,
 });
 
+app.get("/api/heartbeat", (_req, res) => {
+  const ts = Date.now();
+  idleWatchdog.heartbeat(ts);
+  res.json({ ok: true, ts });
+});
+
+// v1.1.7: log the render-busy hold at most once per busy interval so
+// server.log doesn't fill with the same line every 10 s while a long batch
+// finishes. Reset once we've actually exited the busy state.
+let renderBusyHoldLogged = false;
+
 if (process.env.RAG_NO_IDLE_SHUTDOWN !== "1") {
+  idleWatchdog.start(Date.now());
   setInterval(() => {
-    if (!hasSeenHeartbeat) return; // wait for the browser to connect at least once
-    const idle = Date.now() - lastHeartbeat;
-    if (idle > IDLE_SHUTDOWN_MS) {
-      log(`no browser heartbeat for ${Math.round(idle / 1000)}s — shutting down`);
+    const result = idleWatchdog.tick(Date.now());
+    if (result.action === "resumed") {
+      // Logged because this is the one event that explains an otherwise
+      // puzzling gap in server.log, and because it confirms the sleep
+      // handling is doing its job on a real machine.
+      if (result.suspendedMs > 0) {
+        log(
+          `resumed after ${Math.round(result.suspendedMs / 1000)}s suspended — ` +
+            `idle timer reset, waiting for the browser`,
+        );
+      } else {
+        log("system clock moved backwards — idle timer reset");
+      }
+      return;
+    }
+    if (result.action === "shutdown") {
+      // v1.1.7: hold off idle shutdown while renders are still in flight. The
+      // render queue lives in RAM, so exiting here would abandon queued and
+      // in-progress documents (they show as interrupted after next boot's
+      // reconcile pass). The tab is already gone -- nobody to prompt -- so we
+      // just wait. The next tick reruns this branch; when the queue drains
+      // the shutdown fires normally. The busy check lives at the call site
+      // deliberately so IdleWatchdog stays pure and testable (no queue
+      // state injected). Backoff log is emitted at most once per busy state
+      // to keep server.log readable across long-lived queues.
+      const snap = getRenderQueueSnapshot();
+      const busy = snap.running || snap.queue_depth > 0;
+      if (busy) {
+        if (!renderBusyHoldLogged) {
+          const inFlight = (snap.running ? 1 : 0) + snap.queue_depth;
+          log(
+            `idle shutdown held: ${inFlight} document${inFlight === 1 ? "" : "s"} still rendering; will retry on next tick`,
+          );
+          renderBusyHoldLogged = true;
+        }
+        return;
+      }
+      renderBusyHoldLogged = false;
+      log(`no browser heartbeat for ${Math.round(result.idleMs / 1000)}s — shutting down`);
       // Give the log line a moment to flush, then exit cleanly.
       setTimeout(() => process.exit(0), 200);
     }
@@ -192,6 +256,13 @@ app.use((req, res, next) => {
   // file is fresh. Runs every 5 minutes.
   logRotate.start();
 
+  // v1.0.12.2: mark each app start in the dedicated backup log. Without a
+  // start marker, a night with no backup line is ambiguous -- it could mean
+  // the scheduled run failed silently, or simply that the app was never
+  // open. The marker makes those two cases distinguishable when reading a
+  // bundle weeks later.
+  appendBackupLogSessionStart(APP_VERSION);
+
   // One-shot: derive page numbers + section titles for any excerpts that
   // don't have them yet. Idempotent — no-op once everything is populated.
   await withPhase("locate-backfill", async () => {
@@ -200,6 +271,45 @@ app.use((req, res, next) => {
       if (updated > 0) log(`backfilled location metadata for ${updated} excerpts`);
     } catch (err) {
       console.error("[locate] backfill failed:", err);
+    }
+  });
+
+  // v1.1.7: settle any render_status rows left at pending/rendering by a
+  // previous crash, upgrade, or forced shutdown. Interrupted documents reach
+  // a terminal error state instead of spinning forever in the PageViewer
+  // and start appearing in /api/render/status.recent_failures. See
+  // server/pages.ts::reconcilePersistedRenderStatuses for the rules.
+  await withPhase("reconcile-render-status", async () => {
+    try {
+      const result = reconcilePersistedRenderStatuses();
+      if (result.scanned > 0) {
+        log(
+          `render-status reconcile: scanned=${result.scanned} ` +
+            `promoted_ready=${result.promoted_ready} ` +
+            `marked_interrupted=${result.marked_interrupted}`,
+        );
+      }
+    } catch (err) {
+      console.error("[reconcile] render-status reconcile failed:", err);
+    }
+  });
+
+  // v1.2.1: heal document_pages.image_path values that point at the previous
+  // machine's absolute paths after a cross-machine or cross-user restore.
+  // Runs after render-status reconcile so we operate on the freshest view of
+  // what's actually on disk. See
+  // server/pages.ts::reconcilePersistedPageImagePaths for the exact rules.
+  await withPhase("reconcile-page-image-paths", async () => {
+    try {
+      const result = reconcilePersistedPageImagePaths();
+      if (result.rewritten > 0 || result.missing > 0) {
+        log(
+          `page-image-path reconcile: scanned=${result.scanned} ` +
+            `rewritten=${result.rewritten} missing=${result.missing}`,
+        );
+      }
+    } catch (err) {
+      console.error("[reconcile] page-image-path reconcile failed:", err);
     }
   });
 
@@ -251,6 +361,88 @@ app.use((req, res, next) => {
     () => {
       bootState.markReady();
       log(`serving on http://${host}:${port}`);
+
+      // v1.0.12.5: detect and clear the post-update `.updating` sentinel
+      // unconditionally, before (and independent of) the browser-open
+      // path. Previously this lived inside the `APD_OPEN_BROWSER === "1"`
+      // block, so any launch that did not open a browser (or any launch
+      // where APD_JUST_UPDATED=1 was already set by updater.cjs since
+      // v1.0.12.1) left the sentinel on disk. That stale marker made
+      // Settings > Update show "A previous update attempt didn't
+      // complete." after every successful in-app update, once the file
+      // aged past readSentinelStatus()'s 5-minute freshness window.
+      //
+      // Detection: env var OR sentinel presence on Windows. Cleanup:
+      // unconditionally attempt to unlink the sentinel on Windows so a
+      // successful boot always clears it, regardless of how justUpdated
+      // was determined. Kept non-fatal on any filesystem error so a
+      // permissions hiccup can never block boot.
+      let justUpdated = process.env.APD_JUST_UPDATED === "1";
+      if (process.platform === "win32") {
+        try {
+          const fs = require("node:fs") as typeof import("node:fs");
+          const path = require("node:path") as typeof import("node:path");
+          const base = process.env.LOCALAPPDATA || process.env.APPDATA;
+          if (base) {
+            const sentinel = path.join(base, "AdvisePoint Docs", ".updating");
+            let sentinelPresent = false;
+            try { sentinelPresent = fs.existsSync(sentinel); } catch { /* non-fatal */ }
+            if (sentinelPresent) {
+              justUpdated = true;
+            }
+            // Consume the sentinel now so a subsequent restart
+            // (e.g. wipe-and-replace restore) doesn't misread us
+            // as still coming out of an update. Unlinking a
+            // missing file throws ENOENT; the try/catch swallows it.
+            try { fs.unlinkSync(sentinel); } catch { /* non-fatal */ }
+          }
+        } catch { /* non-fatal */ }
+      }
+
+      // v1.0.9.23: open the browser from the server, once we're actually
+      // listening. This replaces the launcher's old PowerShell
+      // "Start-Sleep 3; Start-Process http://..." one-shot, which was
+      // one of two PowerShell processes the launcher used to spawn and
+      // which contributed to the persistent-taskbar-entry issue on
+      // Windows 11 26200. Firing after listen() also means the browser
+      // never gets to the URL before the server is ready to respond,
+      // eliminating a class of first-load races that used to require
+      // manual refresh on slow disks.
+      if (process.env.APD_OPEN_BROWSER === "1") {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const { spawn } = require("node:child_process");
+          // v1.0.11.5: when we've just come out of an update, the previous
+          // browser tab is already sitting on http://127.0.0.1:<port> (now
+          // showing the down modal because the server was killed and
+          // relaunched). If we open the exact same URL, Chrome/Edge just
+          // focus that stale tab without reloading -- the user sees the
+          // "disconnected" page and thinks the update failed. Append a
+          // unique query string so the shell URL association picks a
+          // fresh navigation. Either the stale tab reloads to the new
+          // URL (loading the new client bundle) or a new tab opens.
+          // `justUpdated` was determined and the sentinel cleared above.
+          const url = justUpdated
+            ? `http://127.0.0.1:${port}/?updated=${Date.now()}`
+            : `http://127.0.0.1:${port}`;
+          if (process.platform === "win32") {
+            // `cmd /c start "" <url>` opens the default browser via the
+            // Windows shell URL association, then cmd exits. windowsHide
+            // + detached + stdio ignore means no window is ever mapped.
+            spawn("cmd.exe", ["/c", "start", "", url], {
+              detached: true,
+              stdio: "ignore",
+              windowsHide: true,
+            }).unref();
+          } else if (process.platform === "darwin") {
+            spawn("open", [url], { detached: true, stdio: "ignore" }).unref();
+          } else {
+            spawn("xdg-open", [url], { detached: true, stdio: "ignore" }).unref();
+          }
+        } catch (err) {
+          log(`browser-open skipped: ${String(err)}`);
+        }
+      }
     },
   );
 })();

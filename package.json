@@ -11,10 +11,24 @@
     "build:nobump": "tsx script/build.ts",
     "package:windows": "node scripts/package-windows.mjs",
     "test:updater": "node --test scripts/updater.test.cjs",
+    "test:fix-title": "node --test scripts/fix-title.test.mjs",
+    "test:detect-doctype": "node --test scripts/detect-doctype.test.mjs",
+    "test:upload-tab-store": "node --test scripts/upload-tab-store.test.mjs",
+    "test:upload-meta-select": "node --test scripts/upload-meta-select.test.mjs",
+    "test:query-history": "node --test scripts/query-history.test.mjs",
+    "test:product-rename": "node --import tsx --test scripts/product-rename.test.mjs",
+    "test:derive-product": "node --import tsx --test scripts/derive-product.test.mjs",
     "version:show": "node -e \"import('./client/src/version.ts').then(m => console.log(m.APP_VERSION))\" 2>/dev/null || node -e \"const s=require('fs').readFileSync('client/src/version.ts','utf8'); console.log(s.match(/\\\"([\\d.]+)\\\"/)[1])\"",
     "start": "NODE_ENV=production node dist/index.cjs",
     "check": "tsc",
-    "db:push": "drizzle-kit push"
+    "db:push": "drizzle-kit push",
+    "test:upload-page": "node --test scripts/upload-page.test.mjs",
+    "test:upload-page:browsers": "playwright install chromium",
+    "test:doctype-case": "node --import tsx --test scripts/doctype-case.test.mjs",
+    "test:doctype-merge": "node --import tsx --test scripts/doctype-merge.test.mjs",
+    "test:duplicate-keeper": "node --import tsx --test scripts/duplicate-keeper.test.mjs",
+    "test:idle-watchdog": "node --import tsx --test scripts/idle-watchdog.test.mjs",
+    "test:image-path-heal": "node --import tsx --test scripts/image-path-heal.test.mjs"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.4.0",
@@ -69,7 +83,7 @@
     "lucide-react": "^0.453.0",
     "mammoth": "^1.12.1",
     "memorystore": "^1.6.7",
-    "multer": "^2.2.0",
+    "multer": "2.3.0",
     "next-themes": "^0.4.6",
     "passport": "^0.7.0",
     "passport-local": "^1.0.0",
@@ -109,6 +123,7 @@
     "autoprefixer": "^10.4.20",
     "drizzle-kit": "^0.31.8",
     "esbuild": "^0.25.0",
+    "playwright": "1.59.0",
     "postcss": "^8.4.47",
     "tailwindcss": "^3.4.17",
     "tsx": "^4.20.5",
@@ -119,6 +134,7 @@
     "bufferutil": "^4.0.8"
   },
   "overrides": {
+    "qs": "6.16.0",
     "drizzle-kit": {
       "@esbuild-kit/esm-loader": "npm:tsx@^4.20.4"
     }

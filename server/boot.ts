@@ -186,11 +186,66 @@ export async function withPhase<T>(
 const ROTATE_INTERVAL_MS = 5 * 60 * 1000; // 5 min
 const ROTATE_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
 
+// v1.0.11: field diagnostics from v1.0.10 machines showed server.log
+// bytes starting with a UTF-16LE BOM even though the current .bat
+// launcher writes via cmd `>>` (which produces ANSI / UTF-8). The BOM
+// is left over from a pre-v1.0.9.23 launcher that piped through
+// PowerShell's Tee-Object, and cmd is now appending single-byte lines
+// on top of a UTF-16 file -- every line splits mid-character in the
+// diagnostics tool.
+//
+// The launcher .bat is intentionally not modified. Instead, on the
+// very first rotate tick after boot, we sniff the first two bytes of
+// server.log and, if they are FF FE (UTF-16LE BOM), rename the file
+// aside as server.log.pre-utf8 so cmd's next `>>` creates a fresh
+// UTF-8 file. This runs once per process and is a no-op on machines
+// where the log is already clean.
+let utf16CleanupChecked = false;
 function tryRotateOnce(): void {
   const dir = process.env.APD_LOG_DIR;
   if (!dir) return;
   const logPath = path.join(dir, "server.log");
   const rotatedPath = path.join(dir, "server.log.1");
+
+  if (!utf16CleanupChecked) {
+    utf16CleanupChecked = true;
+    try {
+      const fd = fs.openSync(logPath, "r");
+      try {
+        const head = Buffer.alloc(2);
+        const n = fs.readSync(fd, head, 0, 2, 0);
+        if (n === 2 && head[0] === 0xff && head[1] === 0xfe) {
+          fs.closeSync(fd);
+          // Preserve the old (UTF-16LE) log so support can still recover
+          // it -- decoded with iconv -- while future writes land in a
+          // fresh UTF-8 file. Use a distinct suffix so we don't clobber
+          // whatever server.log.1 the size-rotation path also keeps.
+          const asideBase = path.join(dir, "server.log.pre-utf8");
+          let aside = asideBase;
+          let n2 = 1;
+          while (fs.existsSync(aside)) {
+            aside = `${asideBase}.${n2++}`;
+            if (n2 > 20) break;
+          }
+          try {
+            fs.renameSync(logPath, aside);
+            // eslint-disable-next-line no-console
+            console.log(`[boot] rotated pre-UTF-8 log aside -> ${path.basename(aside)}`);
+          } catch (renameErr) {
+            // eslint-disable-next-line no-console
+            console.log(`[boot] UTF-16 log rotate skipped: ${renameErr instanceof Error ? renameErr.message : String(renameErr)}`);
+          }
+        } else {
+          fs.closeSync(fd);
+        }
+      } catch {
+        try { fs.closeSync(fd); } catch { /* ignore */ }
+      }
+    } catch {
+      // No log file yet; nothing to sniff.
+    }
+  }
+
   let st: fs.Stats;
   try {
     st = fs.statSync(logPath);

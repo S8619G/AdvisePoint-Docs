@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useStoreField } from "@/lib/tabStore";
 import {
   queryTabStore,
@@ -7,6 +7,8 @@ import {
   hydrateQueryStateFromUrl,
   type QueryTabState,
 } from "@/lib/queryTabStore";
+// v1.1.9: Recent searches panel types.
+import type { QueryHistoryEntry, QueryHistoryFilters } from "@shared/query-history-types";
 import { writeHashQuery, readHashQuery } from "@/lib/tabUrlSync";
 import { apiRequest } from "@/lib/queryClient";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -34,6 +36,8 @@ import {
   Zap,
   Info,
   SearchX,
+  History,
+  Trash2,
 } from "lucide-react";
 import { PageViewerDialog } from "@/components/PageViewer";
 import { Link } from "wouter";
@@ -64,6 +68,9 @@ import { Highlight } from "@/lib/highlight";
 
 interface Facets {
   product_models: string[];
+  // v1.0.14: Product family filter values. Server omits blank/whitespace-only
+  // entries; the "Any" option is added by the client dropdown.
+  product_families: string[];
   product_versions: string[];
   firmware_versions: string[];
   document_types: string[];
@@ -315,6 +322,14 @@ export default function Query() {
   const { toast } = useToast();
   const { data: facets } = useQuery<Facets>({ queryKey: ["/api/facets"] });
 
+  // v1.1.9: Recent searches panel. Server-persisted so history survives
+  // restarts. See server/query-history.ts.
+  const queryClient = useQueryClient();
+  const { data: historyData } = useQuery<{ history: QueryHistoryEntry[] }>({
+    queryKey: ["/api/query-history"],
+  });
+  const historyList = historyData?.history ?? [];
+
   // v0.9.31: State lives in queryTabStore so it survives tab switches.
   // useStoreField mimics useState's [value, setValue] shape so the rest
   // of the component reads the same as before.
@@ -322,6 +337,10 @@ export default function Query() {
   const [maxResults, setMaxResults] = useStoreField(queryTabStore, "maxResults");
   const [matchMode, setMatchMode] = useStoreField(queryTabStore, "matchMode");
   const [productModel, setProductModel] = useStoreField(queryTabStore, "productModel");
+  // v1.0.14: Product family filter -- independent from product_model (both
+  // dropdowns list the full set regardless of the other's value). When set,
+  // documents whose family is empty are still included, per product decision.
+  const [productFamily, setProductFamily] = useStoreField(queryTabStore, "productFamily");
   const [docType, setDocType] = useStoreField(queryTabStore, "docType");
   const [firmware, setFirmware] = useStoreField(queryTabStore, "firmware");
   const [errorCode, setErrorCode] = useStoreField(queryTabStore, "errorCode");
@@ -366,6 +385,8 @@ export default function Query() {
     mutationFn: async () => {
       const filters: any = {};
       if (productModel) filters.product_model = [productModel];
+      // v1.0.14: send as a scalar to match searchRequestSchema.filters.product_family.
+      if (productFamily) filters.product_family = productFamily;
       if (docType) filters.document_type = [docType];
       if (firmware) filters.firmware_version = [firmware];
       if (errorCode) filters.error_code = errorCode;
@@ -404,6 +425,36 @@ export default function Query() {
       // v0.9.31: Cache the response so it survives a tab switch. The
       // mutation state is reset on remount, but this cache is not.
       setLastResponse(data);
+      // v1.1.9: Record this run in the recent-searches history. Fire and
+      // forget -- if the history POST fails, the search itself is
+      // unaffected. Skips blank queries here as a second layer of
+      // defense (the server also drops them). The server dedupes and
+      // truncates, and we invalidate the history query so the panel
+      // reflects the new state without a manual refetch.
+      const trimmed = q.trim();
+      if (trimmed.length > 0) {
+        const entry: Omit<QueryHistoryEntry, "ranAt"> = {
+          q: trimmed,
+          matchMode,
+          maxResults,
+          filters: {
+            productModel,
+            productFamily,
+            docType,
+            firmware,
+            errorCode,
+            confidentialityMax,
+            selectedTags,
+          },
+        };
+        apiRequest("POST", "/api/query-history", entry)
+          .then(() => queryClient.invalidateQueries({ queryKey: ["/api/query-history"] }))
+          .catch(() => {
+            // Non-fatal: the search succeeded, only the history bookkeeping
+            // failed. Log to console for debugging but do not toast.
+            console.warn("[query-history] failed to record entry");
+          });
+      }
     },
   });
 
@@ -413,7 +464,7 @@ export default function Query() {
   const activeResponse = mut.data ?? (lastResponse as SearchResponse | null | undefined);
 
   const clearFilters = () => {
-    setProductModel(""); setDocType(""); setFirmware(""); setErrorCode(""); setConfidentialityMax(""); setTenant(""); setSelectedTags([]);
+    setProductModel(""); setProductFamily(""); setDocType(""); setFirmware(""); setErrorCode(""); setConfidentialityMax(""); setTenant(""); setSelectedTags([]);
   };
 
   // v0.9.31: Mirror the URL-synced subset of state to the hash on every
@@ -425,8 +476,8 @@ export default function Query() {
     if (!window.location.hash.startsWith("#/query")) return;
     const s = queryTabStore.getState();
     writeHashQuery(serializeQueryStateToUrl(s));
-  }, [q, matchMode, maxResults, productModel, docType, firmware, errorCode, confidentialityMax, selectedTags, selectedResultId]);
-  const hasFilters = productModel || docType || firmware || errorCode || confidentialityMax || tenant || selectedTags.length > 0;
+  }, [q, matchMode, maxResults, productModel, productFamily, docType, firmware, errorCode, confidentialityMax, selectedTags, selectedResultId]);
+  const hasFilters = productModel || productFamily || docType || firmware || errorCode || confidentialityMax || tenant || selectedTags.length > 0;
 
   const submit = useCallback(() => {
     if (q.trim()) {
@@ -578,7 +629,8 @@ export default function Query() {
 
   return (
     <div className={gridClass}>
-      {/* --------- Filters sidebar --------- */}
+      {/* --------- Filters sidebar + Recent searches --------- */}
+      <div className="space-y-4">
       <Card className="h-fit">
         <CardHeader className="pb-3">
           <CardTitle className="flex items-center justify-between text-sm">
@@ -622,6 +674,42 @@ export default function Query() {
               </SelectContent>
             </Select>
           </FilterField>
+          {/* v1.0.14: Product family filter. Defaults to "Any". Independent
+              from Product model -- the two dropdowns don't narrow each other,
+              so a user can pick any family/model combination. When a family
+              is picked, documents with no recorded family are still included
+              in results. Positioned below Document type per v1.0.15 UI
+              request so Product model stays at the top of the filters list.
+              v1.0.15: always rendered; when no library document has a
+              product_family value the control is shown disabled with a
+              tooltip explaining why, instead of being hidden. This keeps
+              the filter list layout stable and makes it obvious that the
+              feature exists once families are tagged in metadata. */}
+          {(() => {
+            const familyOptions = facets?.product_families ?? [];
+            const familiesExist = familyOptions.length > 0;
+            const trigger = (
+              <SelectTrigger
+                data-testid="select-filter-family"
+                className="h-8 text-xs"
+                disabled={!familiesExist}
+                title={familiesExist ? undefined : "No product family has been added to any document's metadata yet."}
+              >
+                <SelectValue placeholder="Any" />
+              </SelectTrigger>
+            );
+            return (
+              <FilterField label="Product family">
+                <Select value={productFamily || "__any"} onValueChange={(v) => setProductFamily(v === "__any" ? "" : v)} disabled={!familiesExist}>
+                  {trigger}
+                  <SelectContent>
+                    <SelectItem value="__any">Any</SelectItem>
+                    {familyOptions.map((f) => <SelectItem key={f} value={f}>{f}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </FilterField>
+            );
+          })()}
           {/* v0.9.29: Tenant filter hidden — single-tenant deployment. The
               filter payload and server-side handling remain intact for
               future multi-tenant use; only the UI is removed. */}
@@ -710,6 +798,45 @@ export default function Query() {
           </div>
         </CardContent>
       </Card>
+
+      {/* v1.1.9: Recent searches. Below and in line with the Filters card. */}
+      <RecentSearchesCard
+        history={historyList}
+        onRerun={(entry) => {
+          // Restore every stored field so the mutation reproduces the
+          // exact same hits, not just the input text. Order matches
+          // QueryTabState so a future field addition is obvious.
+          setQ(entry.q);
+          setMatchMode(entry.matchMode);
+          setMaxResults(entry.maxResults);
+          setProductModel(entry.filters.productModel ?? "");
+          setProductFamily(entry.filters.productFamily ?? "");
+          setDocType(entry.filters.docType ?? "");
+          setFirmware(entry.filters.firmware ?? "");
+          setErrorCode(entry.filters.errorCode ?? "");
+          setConfidentialityMax(entry.filters.confidentialityMax ?? "");
+          setSelectedTags(entry.filters.selectedTags ?? []);
+          // Fire the same mutation the Search button uses. onSuccess
+          // will re-record the entry (bumping ranAt to now).
+          mut.mutate();
+        }}
+        onClear={async () => {
+          if (!window.confirm("Clear the recent searches list? This does not touch any documents or filters.")) {
+            return;
+          }
+          try {
+            await apiRequest("DELETE", "/api/query-history");
+            queryClient.invalidateQueries({ queryKey: ["/api/query-history"] });
+          } catch {
+            toast({
+              title: "Could not clear the history",
+              description: "The server did not accept the request. Try again in a moment.",
+              variant: "destructive",
+            });
+          }
+        }}
+      />
+      </div>
 
       {/* --------- Results column --------- */}
       <div className="space-y-4">
@@ -980,6 +1107,90 @@ function FilterField({ label, children }: { label: React.ReactNode; children: Re
       <Label className="text-[11px] text-muted-foreground">{label}</Label>
       {children}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// v1.1.9: Recent searches panel (Query tab side column).
+//
+// Renders up to 5 rows, newest first. Each row is a full-width button
+// showing the query text and, on a second line, a compact summary of
+// applied filters using user-facing labels ("Model:", "Type:") rather
+// than schema keys. Clicking a row invokes onRerun with the full
+// entry -- the caller restores every stored field into the store and
+// fires the search mutation.
+//
+// Empty state: a short CardDescription. Clear button lives in the
+// header and is disabled when there is nothing to clear.
+// ---------------------------------------------------------------------------
+function summarizeHistoryFilters(f: QueryHistoryFilters | undefined): string {
+  if (!f) return "";
+  const parts: string[] = [];
+  if (f.productModel) parts.push(`Model: ${f.productModel}`);
+  if (f.productFamily) parts.push(`Family: ${f.productFamily}`);
+  if (f.docType) parts.push(`Type: ${f.docType}`);
+  if (f.firmware) parts.push(`Firmware: ${f.firmware}`);
+  if (f.errorCode) parts.push(`Error: ${f.errorCode}`);
+  if (f.confidentialityMax) parts.push(`Max sensitivity: ${f.confidentialityMax}`);
+  if (f.selectedTags && f.selectedTags.length > 0) {
+    parts.push(`Tags: ${f.selectedTags.join(", ")}`);
+  }
+  return parts.join(" \u00b7 ");
+}
+
+function RecentSearchesCard(props: {
+  history: QueryHistoryEntry[];
+  onRerun: (entry: QueryHistoryEntry) => void;
+  onClear: () => void;
+}) {
+  const { history, onRerun, onClear } = props;
+  const isEmpty = history.length === 0;
+  return (
+    <Card className="h-fit" data-testid="card-recent-searches">
+      <CardHeader className="pb-3">
+        <CardTitle className="flex items-center justify-between text-sm">
+          <span className="flex items-center gap-2">
+            <History className="h-3.5 w-3.5" />Recent searches
+          </span>
+          <button
+            onClick={onClear}
+            disabled={isEmpty}
+            className="flex items-center gap-1 text-[11px] font-normal text-muted-foreground hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+            data-testid="button-clear-history"
+          >
+            <Trash2 className="h-3 w-3" />Clear
+          </button>
+        </CardTitle>
+        {isEmpty && (
+          <CardDescription className="text-xs">
+            Your recent searches will appear here.
+          </CardDescription>
+        )}
+      </CardHeader>
+      {!isEmpty && (
+        <CardContent className="space-y-1 pt-0">
+          {history.map((entry, idx) => {
+            const summary = summarizeHistoryFilters(entry.filters);
+            return (
+              <button
+                key={`${entry.ranAt}-${idx}`}
+                onClick={() => onRerun(entry)}
+                className="block w-full rounded-md border border-transparent px-2 py-1.5 text-left transition hover:border-border hover:bg-muted/40"
+                data-testid={`button-history-row-${idx}`}
+                title={entry.q}
+              >
+                <div className="truncate text-xs font-medium">{entry.q}</div>
+                {summary && (
+                  <div className="truncate text-[10.5px] text-muted-foreground">
+                    {summary}
+                  </div>
+                )}
+              </button>
+            );
+          })}
+        </CardContent>
+      )}
+    </Card>
   );
 }
 

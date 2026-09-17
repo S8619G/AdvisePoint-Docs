@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { ArrowDown, ArrowUp, Pencil, Pipette, Plus, Trash2, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Merge, Pencil, Pipette, Plus, Trash2, X } from "lucide-react";
 import { apiRequest } from "@/lib/queryClient";
 import { useDocumentTypes, type DocumentTypeOption, type DocumentTypeRegistry } from "@/lib/documentTypes";
 import { useToast } from "@/hooks/use-toast";
@@ -19,6 +19,13 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { DocumentTypeColorPicker } from "@/components/DocumentTypeColorPicker";
 
@@ -35,6 +42,10 @@ export function DocumentTypeManager() {
   const [editing, setEditing] = useState<string | null>(null);
   const [editLabel, setEditLabel] = useState("");
   const [deleting, setDeleting] = useState<DocumentTypeOption | null>(null);
+  // v1.1.4: merge one type into another. Distinct from delete, which drops the
+  // tag by reassigning to the Document fallback.
+  const [merging, setMerging] = useState<DocumentTypeOption | null>(null);
+  const [mergeTarget, setMergeTarget] = useState<string>("");
 
   const updateRegistry = (registry: DocumentTypeRegistry) => {
     queryClient.setQueryData(["/api/document-types"], registry);
@@ -76,6 +87,23 @@ export function DocumentTypeManager() {
       });
     },
     onError: (error: Error) => toast({ title: "Could not delete document type", description: error.message, variant: "destructive" }),
+  });
+
+  const mergeMutation = useMutation({
+    mutationFn: ({ key, into }: { key: string; into: string }) =>
+      jsonRequest("POST", `/api/document-types/${encodeURIComponent(key)}/merge`, { into }),
+    onSuccess: (result) => {
+      updateRegistry(result);
+      setMerging(null);
+      setMergeTarget("");
+      toast({
+        title: "Document types merged",
+        description: result.affected
+          ? `${result.affected} document${result.affected === 1 ? "" : "s"} moved.`
+          : "No documents needed moving.",
+      });
+    },
+    onError: (error: Error) => toast({ title: "Could not merge document types", description: error.message, variant: "destructive" }),
   });
 
   const orderMutation = useMutation({
@@ -259,6 +287,16 @@ export function DocumentTypeManager() {
                     <Button
                       size="icon"
                       variant="ghost"
+                      onClick={() => { setMerging(type); setMergeTarget(""); }}
+                      disabled={type.key === "document"}
+                      aria-label={`Merge ${type.label} into another type`}
+                      data-testid={`button-merge-doctype-${type.key}`}
+                    >
+                      <Merge className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      size="icon"
+                      variant="ghost"
                       onClick={() => setDeleting(type)}
                       disabled={type.key === "document"}
                       aria-label={`Delete ${type.label}`}
@@ -272,6 +310,53 @@ export function DocumentTypeManager() {
           </div>
         </CardContent>
       </Card>
+
+      <AlertDialog
+        open={Boolean(merging)}
+        onOpenChange={(open) => { if (!open) { setMerging(null); setMergeTarget(""); } }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Merge {merging?.label} into another type</AlertDialogTitle>
+            <AlertDialogDescription>
+              {merging?.document_count
+                ? `${merging.document_count} document${merging.document_count === 1 ? "" : "s"} will be re-tagged, and "${merging.label}" will be removed.`
+                : `No documents use "${merging?.label}". It will simply be removed.`}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="py-2">
+            <Label htmlFor="merge-target">Merge into</Label>
+            <Select value={mergeTarget} onValueChange={setMergeTarget}>
+              <SelectTrigger id="merge-target" className="mt-1" data-testid="select-merge-target">
+                <SelectValue placeholder="Choose a document type" />
+              </SelectTrigger>
+              <SelectContent>
+                {(data?.types ?? [])
+                  .filter((t) => t.key !== merging?.key)
+                  .map((t) => (
+                    <SelectItem key={t.key} value={t.key}>
+                      {t.label}
+                    </SelectItem>
+                  ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={!mergeTarget || mergeMutation.isPending}
+              onClick={(event) => {
+                // Keep the dialog open if no target is chosen yet.
+                if (!merging || !mergeTarget) { event.preventDefault(); return; }
+                mergeMutation.mutate({ key: merging.key, into: mergeTarget });
+              }}
+              data-testid="button-confirm-merge-document-type"
+            >
+              Merge
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog open={Boolean(deleting)} onOpenChange={(open) => { if (!open) setDeleting(null); }}>
         <AlertDialogContent>

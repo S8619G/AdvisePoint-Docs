@@ -32,6 +32,7 @@ import {
   ChevronDown,
   ChevronRight,
   Info,
+  ScanSearch,
 } from "lucide-react";
 import { Link } from "wouter";
 import {
@@ -40,13 +41,46 @@ import {
   RELEASE_CHANNELS as SHARED_RELEASE_CHANNELS,
   releaseChannelLabel,
 } from "@shared/schema";
-import { ProductModelCombobox, RequiredField } from "@/components/ProductModelCombobox";
+import { ProductModelCombobox } from "@/components/ProductModelCombobox";
+import { ProductFamilyCombobox } from "@/components/ProductFamilyCombobox";
 import { useDocumentTypes, documentTypeColor } from "@/lib/documentTypes";
 import { DocTypeDot } from "@/components/DocTypeDot";
 // v0.9.30: TagsCombobox lives in its own component now (see the bottom of
 // this file for a re-export that keeps library.tsx's `from "./upload"` path
 // working). We still import it here for use inside MetaForm below.
 import { TagsCombobox } from "@/components/TagsCombobox";
+// v1.1.0: locked filename -> title parser. See client/src/lib/fix-title.ts.
+import { fixTitle } from "@/lib/fix-title";
+import { FixTitleButton } from "@/components/FixTitleButton";
+// v1.1.8: mode-to-meta selection for the batch loop. See
+// client/src/lib/upload-meta-select.ts for the history behind extracting this.
+import { selectMetaForFile } from "@/lib/upload-meta-select";
+import { deriveProduct } from "@/lib/derive-product";
+// v1.1.0: auto-classify Document type from filename codes (item 9).
+import { detectDocType } from "@/lib/detect-doctype";
+import { useFilenameCodes } from "@/lib/filenameCodes";
+// v1.2.4 (item 2): filename phrases (fallback classifier). Codes are the
+// primary signal; phrases run only if the code detector returns null. Pass
+// both mappings to detectDocType() so it can honor the code-wins rule.
+import { useFilenamePhrases } from "@/lib/filenamePhrases";
+// v1.1.0 item 5: tab-persistent upload workspace. The 8 useState fields
+// that describe live upload work (staged files, per-file metadata,
+// shared metadata, mode, batch loop status, success card history) now
+// back onto a module-level singleton so a tab switch no longer discards
+// them. Genuinely local UI state (dragging, dialog opens, file input
+// ref, debouncedNames) still uses useState.
+import { uploadTabStore } from "@/lib/uploadTabStore";
+import { useStoreField } from "@/lib/tabStore";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 // Sourced from shared/schema.ts so server + client stay in lockstep.
 // Never re-add local hardcoded copies — that's how enums drift over time.
@@ -95,6 +129,171 @@ const ACCEPT_MIME =
   "application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/rtf,text/rtf,text/plain,text/markdown";
 const MAX_BYTES = 150 * 1024 * 1024; // 150 MB — matches server cap
 
+// v1.2.4: folder drop on the Upload dropzone. Browsers only populate
+// dataTransfer.files with file entries; a dropped folder shows up in
+// dataTransfer.items[] as a directory entry and does not appear in .files
+// at all. We walk items with webkitGetAsEntry(), recurse directories, and
+// collect every accepted file plus a skipped list with a fixed-vocabulary
+// reason. Recursion depth is bounded only by the browser's own entry API
+// (no hardcoded max); the existing per-file MAX_BYTES check is enforced
+// alongside the extension filter. OS metadata / hidden files are silently
+// dropped (not counted as skipped).
+const SILENT_SKIP_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
+const SILENT_SKIP_DIR_NAMES = new Set(["__MACOSX"]);
+
+type FolderSkipReason = "unsupported" | "too-large";
+type FolderSkip = { path: string; reason: FolderSkipReason; ext?: string };
+type FolderDropResult = {
+  files: File[]; // in traversal order (breadth within a directory, depth across)
+  skipped: FolderSkip[];
+  subfolderCount: number; // number of subdirectories descended into (excludes the root)
+  folderName: string; // best-effort root folder name, empty string if unavailable
+};
+
+// Shared by directory drops and the folder picker. The picker supplies the
+// browser's webkitRelativePath; entry traversal supplies the same relative
+// path shape. Keep filtering in one place rather than duplicating policy.
+function isIgnoredFolderPath(path: string): boolean {
+  return path.split("/").some((name) =>
+    name.startsWith(".") || SILENT_SKIP_NAMES.has(name) || SILENT_SKIP_DIR_NAMES.has(name),
+  );
+}
+
+function collectFolderFile(file: File, path: string, result: FolderDropResult): void {
+  if (isIgnoredFolderPath(path)) return;
+  const lower = file.name.toLowerCase();
+  const dotIdx = lower.lastIndexOf(".");
+  const ext = dotIdx >= 0 ? lower.slice(dotIdx) : "";
+  if (!ACCEPT_EXT.includes(ext)) {
+    result.skipped.push({ path, reason: "unsupported", ext });
+  } else if (file.size > MAX_BYTES) {
+    result.skipped.push({ path, reason: "too-large" });
+  } else {
+    result.files.push(file);
+  }
+}
+
+function collectFolderSelection(files: File[]): FolderDropResult {
+  const result: FolderDropResult = {
+    files: [], skipped: [], subfolderCount: 0, folderName: "",
+  };
+  const directories = new Set<string>();
+  for (const file of files) {
+    const path = file.webkitRelativePath || file.name;
+    const parts = path.split("/");
+    if (!result.folderName && parts.length > 1) result.folderName = parts[0];
+    if (isIgnoredFolderPath(path)) continue;
+    // The FileList cannot expose empty directories. Count the non-root
+    // directories represented in its paths, including unsupported files.
+    for (let i = 2; i < parts.length; i++) {
+      directories.add(parts.slice(0, i).join("/"));
+    }
+    collectFolderFile(file, path, result);
+  }
+  result.subfolderCount = directories.size;
+  return result;
+}
+
+// Read a FileSystemDirectoryEntry until its reader drains. Browsers cap
+// each readEntries call at ~100 entries, so we loop until an empty array
+// comes back. Any read error rejects the whole recursion for the caller
+// to swallow gracefully.
+async function readAllEntries(dirEntry: any): Promise<any[]> {
+  const reader = dirEntry.createReader();
+  const all: any[] = [];
+  // Loop until the reader returns an empty array.
+  // Guard against a pathological browser that never drains by capping to a
+  // huge number of iterations; each iteration adds up to ~100 entries so
+  // 10_000 iterations = 1M entries, far beyond any real folder drop.
+  for (let i = 0; i < 10000; i++) {
+    const batch: any[] = await new Promise((resolve, reject) => {
+      reader.readEntries(resolve, reject);
+    });
+    if (!batch || batch.length === 0) break;
+    all.push(...batch);
+  }
+  return all;
+}
+
+async function entryToFile(fileEntry: any): Promise<File> {
+  return new Promise((resolve, reject) => {
+    fileEntry.file(resolve, reject);
+  });
+}
+
+// Walks a single top-level entry (file or directory) and appends to the
+// mutable result. `relPrefix` is the path within the dropped folder, used
+// only for the skipped-file expander display.
+async function walkEntry(
+  entry: any,
+  relPrefix: string,
+  result: FolderDropResult,
+  seenPaths: Set<string>,
+): Promise<void> {
+  if (!entry) return;
+  const name: string = entry.name || "";
+  const rel = relPrefix ? `${relPrefix}/${name}` : name;
+  if (isIgnoredFolderPath(rel)) return;
+  if (entry.isFile) {
+    let f: File;
+    try {
+      f = await entryToFile(entry);
+    } catch {
+      return; // unreadable file entries are silently dropped
+    }
+    collectFolderFile(f, rel, result);
+    return;
+  }
+  if (entry.isDirectory) {
+    // Follow symlinks/directories only once per unique resolved path.
+    // fullPath is the entry API's canonical path inside the drop root; it is
+    // enough to detect the rare cycle case without a resolved-target lookup.
+    const key: string = entry.fullPath || (relPrefix ? `${relPrefix}/${name}` : name);
+    if (seenPaths.has(key)) return;
+    seenPaths.add(key);
+    if (relPrefix) result.subfolderCount += 1;
+    const children = await readAllEntries(entry);
+    const nextPrefix = relPrefix ? `${relPrefix}/${name}` : name;
+    for (const child of children) {
+      await walkEntry(child, nextPrefix, result, seenPaths);
+    }
+  }
+}
+
+// Collect every accepted file from a DataTransferItemList. Handles a mix
+// of plain files and folders in the same drop. Files at the root of the
+// drop are collected with an empty relPrefix; folders push a trailing
+// slash into the traversal via walkEntry. Returns a folderName derived
+// from the FIRST directory in the drop (used in the summary toast); when
+// the drop contains no directories, folderName is empty.
+async function collectFolderDrop(items: DataTransferItemList): Promise<FolderDropResult> {
+  const result: FolderDropResult = {
+    files: [],
+    skipped: [],
+    subfolderCount: 0,
+    folderName: "",
+  };
+  const seenPaths = new Set<string>();
+  // Resolve entries up front -- webkitGetAsEntry() must be called before
+  // any awaits, since the DataTransferItem is invalidated after the drop
+  // event handler returns.
+  const entries: any[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (item.kind !== "file") continue;
+    const anyItem = item as any;
+    const entry =
+      typeof anyItem.webkitGetAsEntry === "function" ? anyItem.webkitGetAsEntry() : null;
+    if (entry) entries.push(entry);
+  }
+  for (const entry of entries) {
+    if (!result.folderName && entry.isDirectory) result.folderName = entry.name || "";
+    // Root files have no prefix. Root folders start their own prefix inside walkEntry.
+    await walkEntry(entry, "", result, seenPaths);
+  }
+  return result;
+}
+
 // -----------------------------------------------------------------------------
 // Per-file record used by the batch UI
 // -----------------------------------------------------------------------------
@@ -126,16 +325,19 @@ export default function Upload() {
 
   // Shared metadata — used both for single-file uploads and for
   // "apply to all" batch uploads.
-  const [shared, setShared] = useState<Meta>(() => emptyMeta());
+  //
+  // v1.1.0 item 5: backed by uploadTabStore so it survives tab switches.
+  // Setter signature is identical to useState's, so no JSX changes.
+  const [shared, setShared] = useStoreField(uploadTabStore, "shared");
 
   // Files staged for upload. This holds 0..N files. When length === 1 we
   // effectively render the single-file mode; when length > 1 the batch UI
   // takes over.
-  const [files, setFiles] = useState<FileEntry[]>([]);
+  const [files, setFiles] = useStoreField(uploadTabStore, "files");
   // v0.9.30: after a batch upload succeeds we clear the successful rows out
   // of `files` (see the batch-complete handler for the why). The results are
   // stashed here so the success card below the form keeps rendering them.
-  const [completedUploads, setCompletedUploads] = useState<any[]>([]);
+  const [completedUploads, setCompletedUploads] = useStoreField(uploadTabStore, "completedUploads");
 
   // v0.9.23: Duplicate-filename detection. As soon as the user stages a file
   // we ask the server "is this filename already in the library?". Match is on
@@ -169,20 +371,99 @@ export default function Upload() {
 
   // "batch-shared" = one metadata block applied to every file (fastest)
   // "batch-perfile" = each file has its own metadata card that can be edited
-  const [mode, setMode] = useState<UploadMode>("batch-shared");
+  const [mode, setMode] = useStoreField(uploadTabStore, "mode");
+
+  // v1.1.9: shared-mode auto-fix titles toggle. Backed by the store so it
+  // survives tab switches like the other shared-mode fields.
+  const [autoFixTitles, setAutoFixTitles] = useStoreField(uploadTabStore, "autoFixTitles");
 
   // For pasted-text ingest (kept from the previous version)
-  const [pastedBody, setPastedBody] = useState("");
-  const [pastedResult, setPastedResult] = useState<any>(null);
+  const [pastedBody, setPastedBody] = useStoreField(uploadTabStore, "pastedBody");
+  const [pastedResult, setPastedResult] = useStoreField(uploadTabStore, "pastedResult");
 
   // Currently-uploading file key. Non-null means the sequential loop is running.
-  const [uploadingKey, setUploadingKey] = useState<string | null>(null);
-  const [batchDone, setBatchDone] = useState(false);
+  const [uploadingKey, setUploadingKey] = useStoreField(uploadTabStore, "uploadingKey");
+  const [batchDone, setBatchDone] = useStoreField(uploadTabStore, "batchDone");
+
+  // v1.1.0: filename-code -> Document type mapping, cached by React Query.
+  // Used at staging time for per-file auto-classification and by the Detect
+  // type button (item 9). undefined while the first fetch is in flight --
+  // classification just skips until it arrives.
+  const { data: filenameCodes } = useFilenameCodes();
+  const { data: filenamePhrases } = useFilenamePhrases();
+
+  // v1.1.2 (field-test fix): auto-classify the SINGLE-file upload form.
+  //
+  // The v1.1.0 auto-classifier only ever wrote into each entry's `perFileMeta`
+  // (see stageFiles below). But the single-file layout renders MetaForm bound
+  // to `shared`, and submitSingle sends `shared` too -- `files[0].meta` is
+  // never read when only one file is staged. Net effect: automatic Document
+  // type detection silently did nothing for single-file uploads, for EVERY
+  // code, not just TB. Per-file batch mode was unaffected.
+  //
+  // Running it as an effect rather than inside stageFiles also closes the
+  // mapping-not-loaded-yet gap the stageFiles comment acknowledges: if the
+  // codes arrive after the drop, this re-runs and classifies then.
+  //
+  // The empty/"document" guard preserves the "never overwrite a user
+  // selection" rule, so a type the user chose himself is never clobbered.
+  useEffect(() => {
+    if (files.length !== 1) return;
+    // v1.2.4: even if there are no code rows, we still want to try phrases,
+    // so this early-return now requires BOTH to be empty.
+    if (!filenameCodes?.mappings?.length && !filenamePhrases?.mappings?.length) return;
+    const current = (shared.document_type || "").trim();
+    if (current !== "" && current !== "document") return;
+    const detected = detectDocType(
+      files[0].file.name,
+      filenameCodes?.mappings ?? [],
+      filenamePhrases?.mappings ?? [],
+    );
+    if (detected && detected !== current) {
+      setShared({ ...shared, document_type: detected });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [files, filenameCodes, filenamePhrases, shared.document_type]);
+
+  // v1.1.3: auto-populate Product model / Product family for the SINGLE-file
+  // form, mirroring the doc-type effect directly above.
+  //
+  // Two rules, both non-negotiable:
+  //  * Fill ONLY when the field is empty. A value the user typed is never
+  //    overwritten, and neither is one he cleared on purpose -- clearing only
+  //    re-triggers this if the staged file also changes.
+  //  * A blank result is a legitimate outcome. Product model is optional as of
+  //    this release, and guessing is worse than leaving it empty.
+  //
+  // The doc-type codes are passed in LIVE so bulletin numbers like TB128 are
+  // excluded from model matching, including codes the user added himself.
+  useEffect(() => {
+    if (files.length !== 1) return;
+    const codes = (filenameCodes?.mappings ?? []).map((m) => m.code);
+    const derived = deriveProduct(files[0].file.name, codes);
+    const patch: Partial<typeof shared> = {};
+    if (!(shared.product_model || "").trim() && derived.product_model) {
+      patch.product_model = derived.product_model;
+    }
+    if (!(shared.product_family || "").trim() && derived.product_family) {
+      patch.product_family = derived.product_family;
+    }
+    if (Object.keys(patch).length > 0) setShared({ ...shared, ...patch });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [files, filenameCodes, shared.product_model, shared.product_family]);
 
   const invalidateAll = () => {
     qc.invalidateQueries({ queryKey: ["/api/stats"] });
     qc.invalidateQueries({ queryKey: ["/api/documents"] });
     qc.invalidateQueries({ queryKey: ["/api/facets"] });
+    // v1.1.0: also refresh the page-render status.
+    //
+    // RenderStatusIndicator polls /api/render/status on a slow 10s cadence while
+    // it believes the queue is idle, and only speeds up to 2s once it sees work.
+    // A fresh upload enqueues render work immediately, so without this
+    // invalidation the indicator could sit stale for up to ~10s after an upload
+    // finished -- long enough to look like rendering never started.
+    qc.invalidateQueries({ queryKey: ["/api/render/status"] });
   };
 
   // -------- Pasted-text ingest (unchanged behaviour) --------
@@ -231,19 +512,54 @@ export default function Upload() {
       }
       // De-dupe against files already staged
       const key = makeKey(f);
+      // Per-file metadata starts as a copy of the shared form — this way if
+      // you switch to per-file mode you already have sensible defaults.
+      const perFileMeta: Meta = {
+        ...shared,
+        // Auto-fill title from filename so per-file editing is fast
+        title: f.name.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " "),
+      };
+      // v1.1.0 (item 9): per-file Document type auto-classification. Runs
+      // ONLY when the inherited doc_type is the default fallback (empty or
+      // "document"). If the user set a non-default value in the shared field
+      // before staging, per-file inherits that and we do not override -- this
+      // upholds the "never overwrite a user selection" rule. Detection runs
+      // per-file on the RAW filename, never on the shared field. If the
+      // mapping hasn't loaded yet, we skip silently -- newly-added files
+      // after it loads will still classify, and manual Detect always works.
+      const inheritedDocType = (perFileMeta.document_type || "").trim();
+      if (
+        (filenameCodes?.mappings?.length || filenamePhrases?.mappings?.length) &&
+        (inheritedDocType === "" || inheritedDocType === "document")
+      ) {
+        const detected = detectDocType(
+          f.name,
+          filenameCodes?.mappings ?? [],
+          filenamePhrases?.mappings ?? [],
+        );
+        if (detected) perFileMeta.document_type = detected;
+      }
+      // v1.1.3: per-file Product model / family auto-population. Same
+      // "only fill an empty field" rule as the single-file effect above --
+      // perFileMeta inherits the shared form, so a value the user typed there
+      // before staging is inherited and left alone.
+      {
+        const codes = (filenameCodes?.mappings ?? []).map((m) => m.code);
+        const derived = deriveProduct(f.name, codes);
+        if (!(perFileMeta.product_model || "").trim() && derived.product_model) {
+          perFileMeta.product_model = derived.product_model;
+        }
+        if (!(perFileMeta.product_family || "").trim() && derived.product_family) {
+          perFileMeta.product_family = derived.product_family;
+        }
+      }
       accepted.push({
         key,
         file: f,
         status: "pending",
         message: "",
         result: null,
-        // Per-file metadata starts as a copy of the shared form — this way if
-        // you switch to per-file mode you already have sensible defaults.
-        meta: {
-          ...shared,
-          // Auto-fill title from filename so per-file editing is fast
-          title: f.name.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " "),
-        },
+        meta: perFileMeta,
         expanded: false,
       });
     }
@@ -269,6 +585,58 @@ export default function Upload() {
     });
     // Batch mode by default when >1 file is staged; single file view otherwise
     setBatchDone(false);
+  };
+
+  // v1.2.4: folder drop. Recurses the dropped entry tree, filters accepted
+  // files exactly like stageFiles does (ACCEPT_EXT + MAX_BYTES), and hands
+  // the accepted list to stageFiles so dedupe, per-file metadata seed,
+  // and doc-type detection all run through their existing paths. Skipped
+  // files are surfaced as a single summary toast with a copy-friendly
+  // expander. Hidden files and OS metadata are dropped silently and do
+  // not appear in the skipped list.
+  const stageFolder = async (selection: DataTransferItemList | File[]) => {
+    let collected: FolderDropResult;
+    try {
+      collected = Array.isArray(selection)
+        ? collectFolderSelection(selection)
+        : await collectFolderDrop(selection);
+    } catch (e: any) {
+      toast({
+        title: "Could not add folder",
+        description: e?.message ?? "Could not read the selected folder.",
+        variant: "destructive",
+      });
+      return;
+    }
+    const { files: accepted, skipped, subfolderCount, folderName } = collected;
+    const label = folderName || "the selected folder";
+    const subfolderClause = subfolderCount > 0 ? ` (from ${subfolderCount} subfolder${subfolderCount === 1 ? "" : "s"})` : "";
+
+    if (accepted.length > 0) {
+      // Reuse the standard stager so dedupe + per-file metadata seed run
+      // through the same path as a multi-file drop. Files here already
+      // passed extension + size filters, so stageFiles' internal checks
+      // are no-ops for this list (no double toasts).
+      stageFiles(accepted);
+    }
+
+    const m = skipped.length;
+    const summaryTitle = `Added ${accepted.length} file${accepted.length === 1 ? "" : "s"} from ${label}.`;
+    const summaryBody = (
+      <div className="text-xs">
+        <div>{`Skipped ${m} unsupported or oversized file${m === 1 ? "" : "s"}.${subfolderClause}`}</div>
+        {m > 0 && <SkippedFilesExpander items={skipped} />}
+      </div>
+    );
+    if (m === 0 && accepted.length === 0) {
+      toast({ title: `Added 0 files from ${label}.${subfolderClause}` });
+      return;
+    }
+    if (m === 0) {
+      toast({ title: summaryTitle + subfolderClause });
+      return;
+    }
+    toast({ title: summaryTitle, description: summaryBody });
   };
 
   const removeFile = (key: string) => {
@@ -330,22 +698,12 @@ export default function Upload() {
   //   - Parallel uploads would compete for RAM (up to 150 MB each).
   //   - Sequential gives the user a clear progress signal file by file.
   const runBatch = async () => {
-    // v0.9.21: single-file uploads still require product_model up front. Multi-
-    // file uploads skip metadata entirely at ingest time and the user fills it
-    // in per-doc from the Library edit dialog after the batch finishes. That
-    // fixes the old confusion where partial shared metadata silently applied
-    // to every file, and where the Upload button stayed active without
-    // flagging Product model as required.
-    if (!isBatch) {
-      if (!shared.product_model.trim()) {
-        toast({
-          title: "Product model is required",
-          description: "Pick or type a product model before uploading.",
-          variant: "destructive",
-        });
-        return;
-      }
-    }
+    // Product model is OPTIONAL. It was required on single-file uploads from
+    // v0.9.21 until this change, which forced a made-up value onto documents
+    // that legitimately have no model -- pricing lists, software notes,
+    // general reference. Multi-file uploads already allowed it to be empty,
+    // and the server schema has always defaulted it to "", so an empty model
+    // is an established, fully supported state rather than a new code path.
 
     setBatchDone(false);
     // Reset any errored/done entries so a retry actually re-attempts them
@@ -359,10 +717,49 @@ export default function Upload() {
       setUploadingKey(entry.key);
       setFiles((prev) => prev.map((f) => (f.key === entry.key ? { ...f, status: "uploading", message: "" } : f)));
 
-      // v0.9.21: for multi-file uploads, send a blank metadata block so nothing
-      // from the shared form leaks in. Only title (auto-filled from filename)
-      // and required defaults survive.
-      const metaForFile: Meta = isBatch ? emptyMeta() : shared;
+      // v1.1.8: three modes, each sends what its UI advertises. Prior to v1.1.8
+      // this line was `isBatch ? emptyMeta() : shared`, which pre-dated the
+      // v1.1.1 addition of "Different per file" mode. That left both batch
+      // modes silently dropping their staged metadata (Fix Title suggestions,
+      // detected document type, per-file cards), so every batch-uploaded doc
+      // arrived with a filename-derived title and document_type="document".
+      //
+      // The v0.9.21 "blank on multi-file" rule was intentional at the time --
+      // there was no per-file card, and applying one metadata block to many
+      // files was considered a footgun. Now that both a per-file mode and a
+      // deliberate "Same metadata for all" mode exist, each mode sends exactly
+      // what its selector promises. selectMetaForFile encapsulates the mapping
+      // and is unit-tested in scripts/upload-meta-select.test.mjs.
+      //
+      // MetaForm on the shared block deliberately hides Title in batch mode
+      // (see showTitle={!isBatch} around line 660), so Title is always filled
+      // by the server from each filename on shared-mode batches -- no risk of
+      // every file in the batch ending up with an identical title.
+      const baseMeta: Meta = selectMetaForFile({
+        isBatch,
+        mode,
+        entryMeta: entry.meta,
+        shared,
+      });
+
+      // v1.1.9: shared-mode auto-fix titles. Only applies to batch-shared,
+      // because batch-perfile already has per-card Fix Title buttons and
+      // single-file has an inline Title field. When enabled, we call the
+      // same fixTitle helper the manual button uses; if it returns a
+      // confident non-empty title we send it, otherwise the field stays
+      // empty and the server falls back to the filename-derived title
+      // (server/routes.ts around line 1915). This is the behavior the
+      // backlog entry calls out as "skipped": the auto-fill is skipped,
+      // not the upload. selectMetaForFile stays pure -- the merge happens
+      // here at the call site so its identity/regression test still holds.
+      let metaForFile: Meta = baseMeta;
+      if (isBatch && mode === "batch-shared" && autoFixTitles) {
+        const suggestion = fixTitle(entry.file.name).title;
+        if (suggestion && suggestion.trim().length > 0) {
+          metaForFile = { ...baseMeta, title: suggestion };
+        }
+      }
+
       const finished = await uploadOne(entry, metaForFile);
       outcomes.push(finished);
 
@@ -411,10 +808,7 @@ export default function Upload() {
 
   // -------- Pasted-text submit (only when no files staged) --------
   const submitPasted = () => {
-    if (!shared.product_model.trim()) {
-      toast({ title: "Product model is required", variant: "destructive" });
-      return;
-    }
+    // Product model intentionally not checked here -- see runBatch().
     if (!pastedBody.trim()) {
       toast({ title: "Nothing to upload", description: "Paste text or attach files.", variant: "destructive" });
       return;
@@ -432,9 +826,6 @@ export default function Upload() {
   const isBatch = files.length > 1;
   const pending = uploadingKey !== null || textMut.isPending;
 
-  // v0.9.21: single-file upload now blocks at the button when product_model
-  // is empty, so users see the required rule before they click.
-  const singleFileMissingModel = anyFiles && !isBatch && !shared.product_model.trim();
   // v0.9.30: successful results now live in two places while a batch is
   // in progress: still-staged rows (`files` with status="done", cleared on
   // batch complete) and the persistent history (`completedUploads`). Merge
@@ -462,6 +853,8 @@ export default function Upload() {
           {/* Dropzone */}
           <Dropzone
             onFiles={stageFiles}
+            onFolderDrop={stageFolder}
+            onFolderSelect={stageFolder}
             hasFiles={anyFiles}
             fileInput={fileInput}
           />
@@ -490,37 +883,106 @@ export default function Upload() {
                 after the batch finishes. Prevents the old failure mode where any
                 stray value in the shared form silently applied to every file.
           */}
-          {!isBatch && (
+          {/*
+            v1.1.8: render the shared MetaForm for single-file uploads (0 or 1
+            files) AND for batch-shared mode. Prior to v1.1.8 the shared form
+            was gated behind `!isBatch`, so in batch-shared mode there was no
+            UI to enter metadata at all -- the banner used to say "metadata is
+            not set during batch upload, use the Library tab after." That was
+            the honest description of a footgun. Now that runBatch actually
+            sends the shared block on batch-shared uploads (see line ~502),
+            the form has to be visible for the user to fill in.
+
+            Two rendering rules differ between the modes:
+              - Single-file uploads show the Title field (Fix Title lives
+                inside it, keyed to the one staged filename).
+              - Batch-shared uploads hide Title -- one shared title across
+                many files would collide and Fix Title needs a single source
+                filename, which does not exist. Server fills Title per file
+                from each filename, which is the pre-v1.1.8 behavior.
+          */}
+          {(!isBatch || mode === "batch-shared") && (
             <>
               <div className="flex items-center gap-2 border-t border-border pt-4">
                 <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                  Metadata
+                  {isBatch ? "Metadata applied to every file in this batch" : "Metadata"}
                 </span>
               </div>
               <MetaForm
                 value={shared}
                 onChange={setShared}
-                showTitle={!anyFiles}
+                // v1.1.8: showTitle only in the single-file path. In batch-
+                // shared mode Title is filled per file by the server from
+                // each filename -- see the runBatch comment.
+                showTitle={!isBatch}
                 testIdPrefix=""
+                // v1.1.1 (fix B): single-file uploads need the staged filename
+                // so MetaForm can render the Fix Title / Detect type buttons.
+                // When no file is staged (or in batch-shared mode where the
+                // buttons make no sense) this is undefined and MetaForm's own
+                // `originalFilename && (...)` gates hide both buttons.
+                originalFilename={!isBatch ? files[0]?.file.name : undefined}
               />
             </>
           )}
 
-          {isBatch && (
+          {/*
+            v1.1.8: the pre-v1.1.8 banner said "metadata is not set during
+            batch upload" and told the user to fix it in the Library tab. That
+            was accurate before v1.1.8 (the shared form was hidden and every
+            batch upload sent an empty meta block). Now that batch-shared mode
+            actually applies the shared block to every file, the banner
+            describes what happens instead of warning the user to work around
+            it. In per-file mode the per-file cards carry metadata, so this
+            note is only shown in shared mode.
+          */}
+          {isBatch && mode === "batch-shared" && (
             <div
-              className="flex items-start gap-3 rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-500/40 dark:bg-amber-950/40 dark:text-amber-100"
+              className="space-y-3 rounded-md border border-sky-300 bg-sky-50 p-3 text-xs text-sky-900 dark:border-sky-500/40 dark:bg-sky-950/40 dark:text-sky-100"
               data-testid="batch-metadata-banner"
             >
-              <Info className="mt-0.5 h-4 w-4 shrink-0" />
-              <div className="space-y-1 leading-relaxed">
-                <div className="font-semibold">Metadata is not set during batch upload.</div>
-                <div>
-                  Each file will be added with just its filename as the title. After the
-                  batch finishes, open the <span className="font-medium">Library</span> tab,
-                  click the pencil icon on each new document, and set the Product model and
-                  any other fields you want to filter by later.
+              <div className="flex items-start gap-3">
+                <Info className="mt-0.5 h-4 w-4 shrink-0" />
+                <div className="space-y-1 leading-relaxed">
+                  <div className="font-semibold">One metadata block, applied to every file.</div>
+                  <div>
+                    The metadata you enter below is copied onto every file in
+                    this batch. Title is filled per file: turn on
+                    <span className="font-medium"> Auto-fix titles from filenames</span>
+                    below to clean titles automatically, or switch to
+                    <span className="font-medium"> Different per file</span> above
+                    for per-document titles with the Fix Title suggestions.
+                  </div>
                 </div>
               </div>
+
+              {/*
+                v1.1.9: Auto-fix titles from filenames toggle. Off by default so
+                v1.1.8 behavior is preserved (server fills each Title from the
+                filename). When on, runBatch calls fixTitle on each file's name
+                and sends the cleaned result as that file's title; files whose
+                names fixTitle cannot resolve fall through to the server's
+                filename-derived title. See the runBatch block around line 522.
+              */}
+              <label
+                className="flex items-start gap-2 border-t border-sky-300/60 pt-3 dark:border-sky-500/30"
+                data-testid="toggle-auto-fix-titles"
+              >
+                <input
+                  type="checkbox"
+                  className="mt-0.5 h-3.5 w-3.5 accent-sky-600"
+                  checked={autoFixTitles}
+                  onChange={(e) => setAutoFixTitles(e.target.checked)}
+                  data-testid="checkbox-auto-fix-titles"
+                />
+                <span className="space-y-0.5 leading-relaxed">
+                  <span className="block font-medium">Auto-fix titles from filenames</span>
+                  <span className="block text-sky-900/80 dark:text-sky-100/80">
+                    Clean up each file's title automatically. Files whose names
+                    can't be cleaned up keep the filename as the title.
+                  </span>
+                </span>
+              </label>
             </div>
           )}
 
@@ -542,9 +1004,8 @@ export default function Upload() {
             {anyFiles ? (
               <Button
                 onClick={runBatch}
-                disabled={pending || singleFileMissingModel}
+                disabled={pending}
                 data-testid="button-ingest"
-                title={singleFileMissingModel ? "Product model is required" : undefined}
               >
                 {pending ? (
                   <>
@@ -617,16 +1078,62 @@ export default function Upload() {
 // Dropzone
 // -----------------------------------------------------------------------------
 
+// v1.2.4: expander embedded in the folder-drop summary toast. Collapsed
+// by default; when open, shows every skipped file on its own line with a
+// fixed-vocabulary reason. The list is scrollable, visually capped so it
+// never pushes the toast off-screen, and copyable as plain text (select
+// all + copy works because we render plain text lines separated by
+// newlines inside a <pre>). Not persisted -- dismissing the toast drops
+// the list, matching the spec (summary of THIS drop only).
+function SkippedFilesExpander({ items }: { items: FolderSkip[] }) {
+  const [open, setOpen] = useState(false);
+  const text = items
+    .map((s) => {
+      if (s.reason === "unsupported") return `${s.path}  --  unsupported type (${s.ext || "unknown"})`;
+      if (s.reason === "too-large") return `${s.path}  --  over per-batch limit`;
+      return `${s.path}  --  skipped`;
+    })
+    .join("\n");
+  return (
+    <div className="mt-1">
+      <button
+        type="button"
+        className="text-xs underline hover:text-foreground"
+        onClick={(e) => {
+          e.stopPropagation();
+          setOpen((v) => !v);
+        }}
+        data-testid="folder-drop-skipped-toggle"
+      >
+        {open ? "Hide skipped" : `Show skipped (${items.length})`}
+      </button>
+      {open && (
+        <pre
+          className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded border border-border bg-muted/30 p-2 text-[11px] leading-tight"
+          data-testid="folder-drop-skipped-list"
+        >
+          {text}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 function Dropzone({
   onFiles,
+  onFolderDrop,
+  onFolderSelect,
   hasFiles,
   fileInput,
 }: {
   onFiles: (files: FileList | File[] | null) => void;
+  onFolderDrop: (items: DataTransferItemList) => void;
+  onFolderSelect: (files: File[]) => void;
   hasFiles: boolean;
   fileInput: React.RefObject<HTMLInputElement>;
 }) {
   const [dragging, setDragging] = useState(false);
+  const folderInput = useRef<HTMLInputElement>(null);
   return (
     <div
       onDragOver={(e) => {
@@ -637,7 +1144,24 @@ function Dropzone({
       onDrop={(e) => {
         e.preventDefault();
         setDragging(false);
-        onFiles(e.dataTransfer.files);
+        // v1.2.4: prefer dataTransfer.items so folder drops are recursed.
+        // Fall back to dataTransfer.files when items is empty or when no
+        // item exposes webkitGetAsEntry (very rare outside Chromium).
+        const items = e.dataTransfer.items;
+        let hasEntryApi = false;
+        if (items && items.length > 0) {
+          for (let i = 0; i < items.length; i++) {
+            if (items[i].kind === "file" && typeof (items[i] as any).webkitGetAsEntry === "function") {
+              hasEntryApi = true;
+              break;
+            }
+          }
+        }
+        if (hasEntryApi) {
+          onFolderDrop(items);
+        } else {
+          onFiles(e.dataTransfer.files);
+        }
       }}
       onClick={() => fileInput.current?.click()}
       className={
@@ -653,6 +1177,7 @@ function Dropzone({
       <input
         ref={fileInput}
         type="file"
+        onClick={(e) => e.stopPropagation()}
         accept={ACCEPT_MIME + "," + ACCEPT_EXT.join(",")}
         multiple
         className="hidden"
@@ -663,11 +1188,40 @@ function Dropzone({
         }}
         data-testid="input-file"
       />
+      <input
+        ref={folderInput}
+        type="file"
+        {...{ webkitdirectory: "" }}
+        multiple
+        hidden
+        onClick={(e) => e.stopPropagation()}
+        onChange={(e) => {
+          // Snapshot before resetting so selecting the same folder works again.
+          const selected = Array.from(e.currentTarget.files ?? []);
+          e.currentTarget.value = "";
+          if (selected.length > 0) onFolderSelect(selected);
+        }}
+        data-testid="input-folder"
+      />
       <UploadIcon className="mb-2 h-8 w-8 text-muted-foreground" />
       <div className="text-sm font-medium">
         {hasFiles ? "Drop more files to add to the batch" : "Drop one or more files here, or click to browse"}
       </div>
       <div className="mt-1 text-xs text-muted-foreground">PDF · DOCX · RTF · TXT · Markdown · up to 150 MB each</div>
+      <div className="mt-1 text-[11px] text-muted-foreground">Drop or select a folder to add every supported file inside it.</div>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="mt-3"
+        onClick={(e) => {
+          e.stopPropagation();
+          folderInput.current?.click();
+        }}
+        data-testid="button-select-folder"
+      >
+        Select folder...
+      </Button>
     </div>
   );
 }
@@ -707,10 +1261,46 @@ function FileList({
         </div>
         <div className="flex items-center gap-2">
           {/*
-            v0.9.21: the per-file-vs-shared metadata mode selector is retired.
-            Multi-file uploads always skip metadata now; users set it per doc
-            from the Library edit dialog after the batch finishes.
+            v0.9.21: the per-file-vs-shared metadata mode selector was retired.
+            Multi-file uploads always skipped metadata; users set it per doc
+            from the Library edit dialog after the batch finished.
+
+            v1.1.1: the selector is restored. The v0.9.21 failure mode it was
+            removed for (stray shared values silently applying to every file)
+            is avoided by keeping "batch-shared" the default -- users only get
+            per-file cards when they deliberately choose "Different per file".
+            The per-file cards are also what surface the Fix Title and Detect
+            type buttons, which were unreachable in batch without this toggle.
           */}
+          {isBatch && (
+            <div
+              className="flex items-center overflow-hidden rounded-md border border-border"
+              role="group"
+              aria-label="Metadata mode"
+              data-testid="group-upload-mode"
+            >
+              <Button
+                variant={mode === "batch-shared" ? "secondary" : "ghost"}
+                size="sm"
+                onClick={() => onModeChange("batch-shared")}
+                className="h-8 rounded-none text-xs"
+                aria-pressed={mode === "batch-shared"}
+                data-testid="button-mode-shared"
+              >
+                Same metadata for all
+              </Button>
+              <Button
+                variant={mode === "batch-perfile" ? "secondary" : "ghost"}
+                size="sm"
+                onClick={() => onModeChange("batch-perfile")}
+                className="h-8 rounded-none border-l border-border text-xs"
+                aria-pressed={mode === "batch-perfile"}
+                data-testid="button-mode-perfile"
+              >
+                Different per file
+              </Button>
+            </div>
+          )}
           <Button
             variant="ghost"
             size="sm"
@@ -830,7 +1420,14 @@ function FileRow({
 
       {perFileMode && entry.expanded && (
         <div className="space-y-4 border-t border-border p-3">
-          <MetaForm value={entry.meta} onChange={(m: Partial<Meta>) => onPatchMeta(m)} showTitle={true} testIdPrefix={`file-${entry.key}-`} compact />
+          <MetaForm
+            value={entry.meta}
+            onChange={(m: Partial<Meta>) => onPatchMeta(m)}
+            showTitle={true}
+            testIdPrefix={`file-${entry.key}-`}
+            compact
+            originalFilename={entry.file.name}
+          />
         </div>
       )}
     </div>
@@ -870,6 +1467,138 @@ function StatusBadge({ status }: { status: FileStatus }) {
 }
 
 // -----------------------------------------------------------------------------
+// DetectDocTypeButton — v1.1.0 (item 9), companion to FixTitleButton above.
+//
+// Small icon-only button placed inline right of the Document type select.
+// Re-runs detectDocType() on the raw uploaded filename and applies the result
+// against the CURRENT selection. Behavior rules locked with the user:
+//
+//   * Empty / default fallback ("document") current value  -> apply silently.
+//   * Non-empty current value that matches detection       -> "unchanged" toast.
+//   * Non-empty current value that differs from detection  -> confirm dialog
+//     (Cancel keeps existing, Replace applies).
+//   * No code detected at all                              -> "no code found"
+//     toast; NEVER clears the field.
+//
+// The button never fires automatically — it is the manual counterpart to the
+// per-file auto-fill at staging time in stageFiles() above. Renders only when
+// originalFilename is present (per-file cards only), matching FixTitleButton.
+// -----------------------------------------------------------------------------
+
+function DetectDocTypeButton({
+  originalFilename,
+  currentDocTypeKey,
+  onApply,
+}: {
+  originalFilename: string;
+  currentDocTypeKey: string;
+  onApply: (next: string) => void;
+}) {
+  const { data: filenameCodes } = useFilenameCodes();
+  const { data: filenamePhrases } = useFilenamePhrases();
+  const { data: documentTypes } = useDocumentTypes();
+  const { toast } = useToast();
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  const detected = useMemo(
+    () =>
+      (filenameCodes?.mappings?.length || filenamePhrases?.mappings?.length)
+        ? detectDocType(
+            originalFilename,
+            filenameCodes?.mappings ?? [],
+            filenamePhrases?.mappings ?? [],
+          )
+        : null,
+    [originalFilename, filenameCodes, filenamePhrases],
+  );
+
+  const currentKey = (currentDocTypeKey || "").trim();
+  const isDefaultFallback = currentKey === "" || currentKey === "document";
+
+  // Resolve keys to labels for the confirm dialog. Falls back to the raw key
+  // if the type registry hasn't loaded yet -- rare, and still informative.
+  const labelFor = (key: string): string =>
+    documentTypes?.types.find((t) => t.key === key)?.label ?? key.replace(/_/g, " ");
+
+  const handleClick = () => {
+    if (!detected) {
+      // No mapping row matched. Do NOT clear the field.
+      toast({
+        title: "No document type code found in filename",
+        description: originalFilename,
+      });
+      return;
+    }
+    if (isDefaultFallback) {
+      onApply(detected);
+      return;
+    }
+    if (detected === currentKey) {
+      toast({ title: "Document type unchanged" });
+      return;
+    }
+    setConfirmOpen(true);
+  };
+
+  return (
+    <>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={handleClick}
+        className="shrink-0"
+        aria-label="Detect type from filename"
+        title={`Detect type from ${originalFilename}`}
+        data-testid="button-detect-doctype"
+      >
+        <ScanSearch className="h-3.5 w-3.5" />
+      </Button>
+      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <AlertDialogContent data-testid="alert-detect-doctype-overwrite">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Replace Document type with the detected value?</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-3">
+                <p>The Document type is set. Detect type would replace it.</p>
+                <div className="space-y-1">
+                  <div className="text-xs uppercase tracking-wide text-muted-foreground">
+                    Current type
+                  </div>
+                  <div className="rounded-md border border-border bg-muted/40 px-2 py-1.5 font-mono text-xs break-all">
+                    {labelFor(currentKey)}
+                  </div>
+                </div>
+                <div className="space-y-1">
+                  <div className="text-xs uppercase tracking-wide text-muted-foreground">
+                    Detected type
+                  </div>
+                  <div className="rounded-md border border-border bg-muted/40 px-2 py-1.5 font-mono text-xs break-all">
+                    {detected ? labelFor(detected) : ""}
+                  </div>
+                </div>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel data-testid="button-detect-doctype-cancel">Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                setConfirmOpen(false);
+                if (detected) onApply(detected);
+              }}
+              data-testid="button-detect-doctype-replace"
+            >
+              Replace
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
+
+// -----------------------------------------------------------------------------
 // MetaForm — reusable metadata editor (shared block + per-file cards)
 // -----------------------------------------------------------------------------
 
@@ -883,12 +1612,20 @@ function MetaForm({
   showTitle,
   testIdPrefix,
   compact,
+  originalFilename,
 }: {
   value: Meta;
   onChange: MetaOnChange;
   showTitle: boolean;
   testIdPrefix: string;
   compact?: boolean;
+  /**
+   * v1.1.0: the RAW uploaded filename for this file, when the form is editing a
+   * specific staged file. Presence of this prop is what enables the Fix Title
+   * button -- the shared "apply to all" metadata block deliberately omits it,
+   * because there is no single filename to parse there.
+   */
+  originalFilename?: string;
 }) {
   const { data: documentTypes } = useDocumentTypes();
   // Support both signatures — pass a full object if the setter is a state
@@ -902,14 +1639,30 @@ function MetaForm({
   return (
     <div className="space-y-4">
       {showTitle && (
-        <Row>
+        <Row full>
           <Field label="Title (auto-filled from filename if blank)">
-            <Input
-              value={value.title}
-              onChange={(e) => set({ title: e.target.value })}
-              data-testid={`${testIdPrefix}input-title`}
-              placeholder="e.g. TASKalfa 5054ci Admin Guide"
-            />
+            {/* v1.1.0: Fix Title sits INLINE to the right of the input, so it
+                never pushes the following fields down. `flex-wrap` + `basis-48`
+                is deliberate: on a wide card the button stays on the same line,
+                but once the column is too narrow to keep the input usable the
+                button drops to its own line instead of crushing the input down
+                to a few pixels. `shrink-0` keeps the button's label intact. */}
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                value={value.title}
+                onChange={(e) => set({ title: e.target.value })}
+                data-testid={`${testIdPrefix}input-title`}
+                placeholder="e.g. TASKalfa 5054ci Admin Guide"
+                className="min-w-0 flex-1 basis-48"
+              />
+              {originalFilename && (
+                <FixTitleButton
+                  originalFilename={originalFilename}
+                  currentTitle={value.title}
+                  onApply={(next) => set({ title: next })}
+                />
+              )}
+            </div>
           </Field>
         </Row>
       )}
@@ -924,42 +1677,68 @@ function MetaForm({
             />
           </Field>
           <Field label="Document type">
-            <Select value={value.document_type} onValueChange={(v) => set({ document_type: v })}>
-              <SelectTrigger data-testid={`${testIdPrefix}select-document-type`}>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {documentTypes?.types.map((type) => (
-                  <SelectItem key={type.key} value={type.key}>
-                    <span className="inline-flex items-center gap-2">
-                      <DocTypeDot color={type.color} />
-                      {type.label}
-                    </span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            {/* v1.1.0 (item 9): Detect type icon button sits INLINE right of
+                the select, same flex-wrap + basis pattern as Fix Title so the
+                select never gets crushed on narrow columns. Icon-only button
+                keeps the row visually calm; the tooltip carries the label. */}
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="min-w-0 flex-1 basis-48">
+                <Select value={value.document_type} onValueChange={(v) => set({ document_type: v })}>
+                  <SelectTrigger data-testid={`${testIdPrefix}select-document-type`}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {documentTypes?.types.map((type) => (
+                      <SelectItem key={type.key} value={type.key}>
+                        <span className="inline-flex items-center gap-2">
+                          <DocTypeDot color={type.color} />
+                          {type.label}
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              {originalFilename && (
+                <DetectDocTypeButton
+                  originalFilename={originalFilename}
+                  currentDocTypeKey={value.document_type}
+                  onApply={(next) => set({ document_type: next })}
+                />
+              )}
+            </div>
           </Field>
         </Row>
       )}
       {compact && (
         <Row>
           <Field label="Document type">
-            <Select value={value.document_type} onValueChange={(v) => set({ document_type: v })}>
-              <SelectTrigger data-testid={`${testIdPrefix}select-document-type`}>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {documentTypes?.types.map((type) => (
-                  <SelectItem key={type.key} value={type.key}>
-                    <span className="inline-flex items-center gap-2">
-                      <DocTypeDot color={type.color} />
-                      {type.label}
-                    </span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="min-w-0 flex-1 basis-48">
+                <Select value={value.document_type} onValueChange={(v) => set({ document_type: v })}>
+                  <SelectTrigger data-testid={`${testIdPrefix}select-document-type`}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {documentTypes?.types.map((type) => (
+                      <SelectItem key={type.key} value={type.key}>
+                        <span className="inline-flex items-center gap-2">
+                          <DocTypeDot color={type.color} />
+                          {type.label}
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              {originalFilename && (
+                <DetectDocTypeButton
+                  originalFilename={originalFilename}
+                  currentDocTypeKey={value.document_type}
+                  onApply={(next) => set({ document_type: next })}
+                />
+              )}
+            </div>
           </Field>
           <Field label="Confidentiality">
             <Select value={value.confidentiality} onValueChange={(v) => set({ confidentiality: v })}>
@@ -979,20 +1758,23 @@ function MetaForm({
       )}
       <Row>
         <Field label="Product family">
-          <Input
+          {/* v1.0.15: swapped plain Input for an autocomplete combobox that
+              surfaces previously-used family values from /api/facets. Both
+              family and model are optional, so neither is wrapped in
+              RequiredField. */}
+          <ProductFamilyCombobox
             value={value.product_family}
-            onChange={(e) => set({ product_family: e.target.value })}
-            data-testid={`${testIdPrefix}input-product-family`}
-            placeholder="e.g. Model 3500"
+            onChange={(v) => set({ product_family: v })}
+            testId={`${testIdPrefix}combobox-product-family`}
           />
         </Field>
-        <RequiredField label="Product model">
+        <Field label="Product model">
           <ProductModelCombobox
             value={value.product_model}
             onChange={(v) => set({ product_model: v })}
             testId={`${testIdPrefix}combobox-product-model`}
           />
-        </RequiredField>
+        </Field>
       </Row>
       {!compact && (
         <>
@@ -1225,8 +2007,16 @@ function buildMetadataPayload(meta: Meta, filename: string | undefined): any {
   };
 }
 
-function Row({ children }: { children: React.ReactNode }) {
-  return <div className="grid gap-4 sm:grid-cols-2">{children}</div>;
+// `Row` is a two-up grid on sm+ screens. A Row holding a SINGLE Field
+// therefore leaves the right-hand column empty, so that field renders at only
+// half the card width.
+//
+// v1.1.2 (field-test fix): `full` opts a Row out of the 2-column split so its
+// one child spans the entire card. Used by the Title row -- titles are the
+// longest value on the form and were being edited through a half-width box
+// that was further shortened by the inline Fix Title button.
+function Row({ children, full = false }: { children: React.ReactNode; full?: boolean }) {
+  return <div className={full ? "grid gap-4" : "grid gap-4 sm:grid-cols-2"}>{children}</div>;
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {

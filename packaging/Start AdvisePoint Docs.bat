@@ -9,12 +9,28 @@ REM  Double-clicking this .bat directly also works - it auto-bounces
 REM  through the VBS wrapper so nothing visible appears either way.
 REM ===================================================================
 
-REM v0.9.18 launcher fixes:
-REM  - .bat now bounces through run-hidden.vbs when double-clicked directly,
-REM    so users no longer see a minimized "AdvisePoint Docs" taskbar entry.
-REM  - PowerShell server launch uses -WindowStyle Hidden so no console flashes.
-REM  - Browser-open delay routes through hidden PowerShell Start-Sleep instead
-REM    of a visible `cmd /c timeout` window.
+REM v1.0.9.23 launcher rewrite: eliminate PowerShell from the runtime
+REM launch path. Prior versions ran the server under a PowerShell
+REM Tee-Object pipeline for log capture, and opened the browser via a
+REM detached PowerShell running Start-Sleep + Start-Process. On
+REM Windows 11 (26200 build) the Tee-Object PowerShell would end up
+REM with a taskbar-eligible window handle post-update, showing an
+REM invisible-but-clickable tile that crashed the app when closed.
+REM
+REM New design:
+REM   * node writes its stdout+stderr directly to server.log via cmd's
+REM     `>>` redirection. No PowerShell wrapper, no pipeline, no
+REM     taskbar-eligible parent process.
+REM   * server opens the browser itself once it's actually listening
+REM     (APD_OPEN_BROWSER=1). No timing race, no second PowerShell.
+REM   * server.log rotation (previous session -> server.log.1) happens
+REM     here at launch, matching the old Tee-Object behavior.
+REM
+REM The Unblock-File call below is still PowerShell but it is one-shot
+REM (guarded by .unblocked sentinel), foreground, hidden window, and
+REM exits before anything else runs -- so it cannot linger on the
+REM taskbar. The crash-surface AppActivate is also PowerShell but only
+REM fires on non-zero exit outside an update, i.e. a real crash.
 
 REM --- Self-relaunch hidden or minimized (only when run directly, not via VBS) ---
 REM The VBS wrapper starts us fully hidden and sets APD_HIDDEN=1, in which case
@@ -72,38 +88,39 @@ set "RAG_DB_PATH=%LOCALAPPDATA%\AdvisePoint Docs\advisepoint.db"
 set "RAG_PAGES_DIR=%LOCALAPPDATA%\AdvisePoint Docs\pages"
 set "RAG_SEED_DB=%~dp0seed.db"
 
-REM Open the browser after a short delay so the server has time to start.
-REM v0.9.18 fix: previous versions spawned a visible cmd window to run
-REM `timeout /t 3`. Under the VBS hidden launcher that window still flashed
-REM (or lingered) because `start cmd /c` creates its own console. Route the
-REM delay through PowerShell with -WindowStyle Hidden so nothing appears.
-start "" powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 3; Start-Process 'http://127.0.0.1:5000'"
-
 REM ---------------- Log file ----------------
 set "APD_LOG_DIR=%LOCALAPPDATA%\AdvisePoint Docs"
 if not exist "%APD_LOG_DIR%" mkdir "%APD_LOG_DIR%" >nul 2>&1
 set "APD_LOG=%APD_LOG_DIR%\server.log"
 
-REM Launch the server in the foreground and mirror stdout+stderr to the log.
-REM PowerShell's Tee-Object gives us both console output AND a persistent log
-REM without needing a third-party tool.
-REM --max-old-space-size=4096 gives node a 4 GB heap so large uploads (100+ MB
-REM manuals held in RAM during extract+chunk+embed) don't OOM.
+REM v1.0.9.23: rotate previous session's log out of the way so this
+REM session starts fresh. Matches the effective behavior of the old
+REM PowerShell Tee-Object pipeline (which truncated on each launch)
+REM while giving support a copy of the previous run. Best-effort: if a
+REM stale PowerShell.exe from a pre-1.0.9.23 install still holds the
+REM handle, the rename fails silently and we append to the existing log.
+if exist "%APD_LOG%" (
+    if exist "%APD_LOG_DIR%\server.log.1" del /q "%APD_LOG_DIR%\server.log.1" >nul 2>&1
+    move /y "%APD_LOG%" "%APD_LOG_DIR%\server.log.1" >nul 2>&1
+)
+
+REM ---------------- Launch server ----------------
+REM v1.0.9.23: node runs directly under cmd, writing stdout+stderr straight
+REM to server.log via `>>`. No PowerShell wrapper. --max-old-space-size=4096
+REM gives node a 4 GB heap so large uploads (100+ MB manuals held in RAM
+REM during extract+chunk+embed) do not OOM.
 REM
-REM v0.9.18 fix: added -WindowStyle Hidden so PowerShell itself doesn't
-REM raise a visible console window when we're launched via the VBS wrapper.
-REM Under the hidden launcher this becomes a truly invisible chain:
-REM   VBS (0=hidden) -> cmd .bat (hidden) -> powershell (WindowStyle Hidden) -> node
+REM Framing lines emitted by cmd itself so support can see when the process
+REM started and stopped without parsing node output.
 REM
-REM v0.9.34: additive [launcher] framing lines. These are Write-Output calls
-REM INSIDE the PowerShell pipeline so they flow through the same Tee-Object
-REM that captures node's stdout+stderr, landing in server.log alongside the
-REM server's own output. Everything above this block is byte-identical to the
-REM v0.9.29 baseline so users who rely on the current launch behaviour don't
-REM see any change; the wrapping is a strictly additive diagnostic aid.
-powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command ^
-    "& { Write-Output ('[launcher] ' + (Get-Date -Format o) + ' node-start log=' + $env:APD_LOG); & '%~dp0node\node.exe' --max-old-space-size=4096 '%~dp0dist\index.cjs' 2>&1 ^| Tee-Object -FilePath '%APD_LOG%'; Write-Output ('[launcher] ' + (Get-Date -Format o) + ' node-exit exit_code=' + $LASTEXITCODE) }"
+REM APD_OPEN_BROWSER=1 tells the server to launch the default browser once
+REM it's actually listening (see server/index.ts). That replaces the old
+REM detached PowerShell Start-Sleep + Start-Process one-liner.
+set APD_OPEN_BROWSER=1
+echo [launcher] %DATE% %TIME% node-start log=%APD_LOG% >> "%APD_LOG%"
+"%~dp0node\node.exe" --max-old-space-size=4096 "%~dp0dist\index.cjs" >> "%APD_LOG%" 2>&1
 set "APD_EXIT=%ERRORLEVEL%"
+echo [launcher] %DATE% %TIME% node-exit exit_code=%APD_EXIT% >> "%APD_LOG%"
 
 REM ---------------- Crash surface ----------------
 REM If the server crashed (non-zero exit) we need to make the failure visible.
@@ -116,15 +133,12 @@ REM
 REM v1.0.8.3: suppress the crash surface when the in-app updater is the one
 REM taking us down. The updater drops ".updating" in %LOCALAPPDATA%\AdvisePoint
 REM Docs\ before requesting /shutdown and removes it after relaunch succeeds.
-REM When that sentinel is present, a non-zero exit is expected (PowerShell's
-REM Tee-Object pipeline reports a non-zero $LASTEXITCODE when node exits mid-
-REM stream during a coordinated shutdown) and MUST NOT pop the "AdvisePoint
-REM Docs - crashed" window on the user. If the sentinel is stale (older than
-REM 1 day), fall through to the normal crash surface so real crashes during
-REM an abandoned update attempt are still visible. Windows forfiles /d only
-REM supports day granularity, which is fine here: the updater cleans up the
-REM sentinel in its normal path, so a stale one means the update abandoned
-REM and any crash after 24h is unrelated to that abandoned attempt.
+REM When that sentinel is present, a non-zero exit is expected (node's
+REM SIGTERM handler in server/index.ts calls process.exit(0), but any code
+REM path that races the shutdown can still exit non-zero) and MUST NOT pop
+REM the "AdvisePoint Docs - crashed" window on the user. If the sentinel is
+REM stale (older than 1 day), fall through to the normal crash surface so
+REM real crashes during an abandoned update attempt are still visible.
 set "APD_UPDATE_SENTINEL=%LOCALAPPDATA%\AdvisePoint Docs\.updating"
 set "APD_SUPPRESS_CRASH="
 if not "%APD_EXIT%"=="0" if exist "%APD_UPDATE_SENTINEL%" (

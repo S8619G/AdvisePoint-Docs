@@ -1,3 +1,4 @@
-packaging/README.txt text eol=crlf
-packaging/*.bat text eol=crlf
+# Preserve the exact bytes supplied in the approved source archive.
+packaging/README.txt -text
+packaging/*.bat -text
 packaging/Start?Kyo?Info?Explorer.bat -text

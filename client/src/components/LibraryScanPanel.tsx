@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { CheckCircle2, Loader2, AlertTriangle, ScanLine, FileX, TagIcon, ImageOff, GitCompare, Trash2 } from "lucide-react";
+import { CheckCircle2, Loader2, AlertTriangle, ScanLine, FileX, ImageOff, GitCompare, Trash2 } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Link } from "wouter";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -57,7 +57,6 @@ interface ScanResult {
   scanned_at: string;
   total_documents: number;
   duplicate_filenames: DupeGroup[][];
-  missing_product_model: { id: string; title: string }[];
   missing_pages: MissingPagesDoc[];
   issue_count: number;
 }
@@ -221,7 +220,7 @@ export function LibraryScanPanel() {
             data-testid="text-scan-clean"
           >
             <CheckCircle2 className="h-4 w-4 shrink-0" />
-            All clear — no duplicate filenames, no missing product models, no missing page files.
+            All clear — no duplicate filenames, no missing page files.
           </div>
         )}
 
@@ -290,26 +289,6 @@ export function LibraryScanPanel() {
                       </li>
                     ))}
                   </ul>
-                </li>
-              ))}
-            </ul>
-          </ScanSection>
-        )}
-
-        {result && result.missing_product_model.length > 0 && (
-          <ScanSection
-            icon={<TagIcon className="h-4 w-4" />}
-            title="Missing product model"
-            description="Documents with a blank product_model field. Edit the doc's metadata to fix."
-            count={result.missing_product_model.length}
-            testid="section-missing-model"
-          >
-            <ul className="space-y-1">
-              {result.missing_product_model.map((doc) => (
-                <li key={doc.id} className="text-xs" data-testid={`missing-model-${doc.id}`}>
-                  <Link href={`/library/${doc.id}`} className="text-foreground hover:underline">
-                    {doc.title}
-                  </Link>
                 </li>
               ))}
             </ul>

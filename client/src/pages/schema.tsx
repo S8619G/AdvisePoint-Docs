@@ -4,9 +4,24 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { UpdateCheckPanel } from "@/components/UpdateCheckPanel";
 import { ViewerPrefsPanel } from "@/components/ViewerPrefsPanel";
 import { LibraryScanPanel } from "@/components/LibraryScanPanel";
+import { DuplicatesPanel } from "@/components/DuplicatesPanel";
 import { DiagnosticsPanel } from "@/components/DiagnosticsPanel";
 import { BackupPanel } from "@/components/BackupPanel";
+import { RecoveryPanel } from "@/components/RecoveryPanel";
+import { RenderFailuresPanel } from "@/components/RenderFailuresPanel";
+import { WelcomeGuidePanel } from "@/components/WelcomeGuidePanel";
+// v1.2.4 (item 3): Manage Values moved off the Library tab into a Settings
+// card of its own. Sits next to WelcomeGuidePanel in a two-column row.
+import { ManageValuesPanel } from "@/components/ManageValuesPanel";
+import { RestoreFirstLaunchBanner } from "@/components/RestoreFirstLaunchBanner";
 import { DocumentTypeManager } from "@/components/DocumentTypeManager";
+// v1.1.0 (item 9): filename-code -> Document type mapping editor. Placed
+// UNDER the existing Document types list with a divider, so the existing
+// list is not shifted or reordered (per the v1.0.13.0 UI-break lesson).
+import { FilenameCodesEditor } from "@/components/FilenameCodesEditor";
+// v1.2.4 (item 2): filename-phrase fallback classifier, editable in the
+// same tab, right below Filename codes.
+import { FilenamePhrasesEditor } from "@/components/FilenamePhrasesEditor";
 
 const FIELD_GROUPS = [
   {
@@ -88,32 +103,65 @@ export default function SchemaPage() {
       <div>
         <h1 className="text-xl font-semibold tracking-tight">Settings &amp; schema</h1>
         <p className="text-sm text-muted-foreground">
-          App version and update checker, plus the metadata schema that gets attached to every parent document and excerpt.
+          App status, document formats, backup and restore, and the metadata schema.
         </p>
       </div>
 
-      <Tabs defaultValue="about" className="space-y-4">
-        <TabsList data-testid="tabs-schema">
-          <TabsTrigger value="about" data-testid="tab-about">About</TabsTrigger>
-          <TabsTrigger value="document-types" data-testid="tab-document-types">Document types</TabsTrigger>
-          <TabsTrigger value="fields" data-testid="tab-fields">Fields</TabsTrigger>
-          <TabsTrigger value="filters" data-testid="tab-filters">Filter mapping</TabsTrigger>
-          <TabsTrigger value="examples" data-testid="tab-examples">Examples</TabsTrigger>
+      <Tabs defaultValue="system" className="space-y-4">
+        <TabsList data-testid="tabs-schema" className="h-auto flex-wrap">
+          <TabsTrigger value="system" data-testid="tab-system">System</TabsTrigger>
+          <TabsTrigger value="formats" data-testid="tab-formats">Formats</TabsTrigger>
+          <TabsTrigger value="backup-restore" data-testid="tab-backup-restore">Backup / Restore</TabsTrigger>
+          <TabsTrigger value="developer" data-testid="tab-developer">Developer</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="about" className="space-y-4">
+        <TabsContent value="system" className="space-y-4">
+          {/* v1.2.3: first-launch banner after a restore. Renders nothing
+              when there is no pending restore record, so it costs one
+              cheap GET on tab mount in the common case. */}
+          <RestoreFirstLaunchBanner />
+          {/* The v1.2.4 panel already contains the installed-version row.
+              Preserve that panel intact; there is no separate version card. */}
           <UpdateCheckPanel />
           <ViewerPrefsPanel />
+          {/* v1.0.15: reinstall action for the seeded Welcome Guide.
+              v1.2.4: paired with the Manage Values panel in a two-column
+              grid; each is a compact one-action card and neither warrants
+              a full-width row of its own. Collapses to a single column on
+              small screens. */}
+          <div className="grid gap-4 md:grid-cols-2">
+            <WelcomeGuidePanel />
+            <ManageValuesPanel />
+          </div>
           <LibraryScanPanel />
-          <BackupPanel />
           <DiagnosticsPanel />
         </TabsContent>
 
-        <TabsContent value="document-types">
+        <TabsContent value="formats" className="space-y-6">
           <DocumentTypeManager />
+          {/* v1.1.0 (item 9): filename codes appear BELOW the existing list,
+              separated by a clear divider. The divider is a plain <hr> so it
+              stays out of the DocumentTypeManager card and does not affect
+              its own spacing. */}
+          <hr className="border-border" />
+          <FilenameCodesEditor />
+          {/* v1.2.4 (item 2): filename phrases sit below the codes editor,
+              same visual pattern. Codes are matched first at classification
+              time; this editor's intro copy calls that out. */}
+          <hr className="border-border" />
+          <FilenamePhrasesEditor />
         </TabsContent>
 
-        <TabsContent value="fields" className="space-y-4">
+        <TabsContent value="backup-restore" className="space-y-4">
+          <BackupPanel />
+          {/* Pre-restore snapshots remain nested inside RecoveryPanel. */}
+          <RecoveryPanel />
+          <DuplicatesPanel />
+          <RenderFailuresPanel />
+        </TabsContent>
+
+        <TabsContent value="developer" className="space-y-4">
+          <h2 className="text-base font-semibold">Fields</h2>
           <div className="grid gap-4 md:grid-cols-2">
             {FIELD_GROUPS.map((g) => (
               <Card key={g.name}>
@@ -136,9 +184,8 @@ export default function SchemaPage() {
               </Card>
             ))}
           </div>
-        </TabsContent>
-
-        <TabsContent value="filters">
+          <hr className="border-border" />
+          <h2 className="text-base font-semibold">Filter mapping</h2>
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="text-sm">Field → filter mapping</CardTitle>
@@ -167,9 +214,8 @@ export default function SchemaPage() {
               </table>
             </CardContent>
           </Card>
-        </TabsContent>
-
-        <TabsContent value="examples" className="space-y-4">
+          <hr className="border-border" />
+          <h2 className="text-base font-semibold">Examples</h2>
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm">Parent document (minimal)</CardTitle>

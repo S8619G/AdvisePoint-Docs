@@ -1,10 +1,91 @@
 import { build as esbuild } from "esbuild";
 import { build as viteBuild } from "vite";
-import { rm, readFile, mkdir, cp, mkdtemp } from "node:fs/promises";
+import { rm, readFile, readdir, stat, mkdir, cp, mkdtemp, access } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { platform } from "node:process";
+
+// v1.0.13.1: build-time guards. v1.0.13.0 shipped a broken UI because
+// postcss.config.js / tailwind.config.ts / components.json were missing from
+// the source tree, so Vite silently produced a CSS bundle with no Tailwind
+// utilities (7 kB instead of the ~90 kB the app needs). Nothing failed --
+// the build just packaged a broken app.
+//
+// Two guards, checked in this order:
+//   1. REQUIRED_BUILD_CONFIG_FILES must exist BEFORE the client build runs.
+//   2. After the client build, the emitted CSS bundle must be at least
+//      MIN_CSS_BUNDLE_BYTES, because a Tailwind-less bundle is far smaller.
+//
+// These do not replace visual verification -- they defend against the one
+// specific silent-failure class that has now bitten a release.
+const REQUIRED_BUILD_CONFIG_FILES = [
+  "postcss.config.js",
+  "tailwind.config.ts",
+  "components.json",
+  "vite.config.ts",
+  "tsconfig.json",
+];
+// v1.0.12.4 shipped ~91 kB of CSS; every prior release has been in that
+// range. 60 kB is well above a Tailwind-less bundle (~7 kB) and well below
+// every real build, giving a wide safety margin while catching the actual
+// regression class.
+const MIN_CSS_BUNDLE_BYTES = 60 * 1024;
+const CSS_ASSETS_DIR = "dist/public/assets";
+
+async function assertRequiredConfigFilesPresent(): Promise<void> {
+  const missing: string[] = [];
+  for (const rel of REQUIRED_BUILD_CONFIG_FILES) {
+    try {
+      await access(rel);
+    } catch {
+      missing.push(rel);
+    }
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required build config file(s):\n  ${missing.join("\n  ")}\n\n` +
+      `These files control PostCSS / Tailwind / shadcn config. When any is ` +
+      `missing, Vite silently ships a CSS bundle without Tailwind utilities ` +
+      `and the UI collapses. Restore them (they live at the repo root) and ` +
+      `re-run the build. See v1.0.13.1 hotfix notes for the failure mode ` +
+      `this catches.`,
+    );
+  }
+}
+
+async function assertCssBundleNotEmpty(): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await readdir(CSS_ASSETS_DIR);
+  } catch (err) {
+    throw new Error(
+      `Client build produced no ${CSS_ASSETS_DIR} directory (${(err as Error).message}). ` +
+      `Expected Vite to emit hashed assets there.`,
+    );
+  }
+  const cssFiles = entries.filter((f) => f.endsWith(".css"));
+  if (cssFiles.length === 0) {
+    throw new Error(
+      `Client build emitted no CSS file into ${CSS_ASSETS_DIR}. ` +
+      `Expected an index-<hash>.css bundle.`,
+    );
+  }
+  for (const file of cssFiles) {
+    const p = join(CSS_ASSETS_DIR, file);
+    const s = await stat(p);
+    if (s.size < MIN_CSS_BUNDLE_BYTES) {
+      throw new Error(
+        `CSS bundle ${p} is ${s.size} bytes, below the minimum ${MIN_CSS_BUNDLE_BYTES} ` +
+        `bytes floor.\n\n` +
+        `A Tailwind-less CSS bundle is ~7 kB; a real build ships ~91 kB. ` +
+        `This almost always means PostCSS/Tailwind did not run -- check that ` +
+        `postcss.config.js and tailwind.config.ts are present at the repo ` +
+        `root, then rebuild. See v1.0.13.1 hotfix notes for context.`,
+      );
+    }
+  }
+}
 
 // server deps to bundle to reduce openat(2) syscalls
 // which helps cold start times
@@ -138,8 +219,16 @@ function assertKnownDeps(deps: string[]): void {
 async function buildAll() {
   await rm("dist", { recursive: true, force: true });
 
+  // v1.0.13.1 guard #1: required config files must exist before we build.
+  console.log("checking required build config files...");
+  await assertRequiredConfigFilesPresent();
+
   console.log("building client...");
   await viteBuild();
+
+  // v1.0.13.1 guard #2: CSS bundle must be at least MIN_CSS_BUNDLE_BYTES.
+  console.log("checking CSS bundle size...");
+  await assertCssBundleNotEmpty();
 
   console.log("building server...");
   const pkg = JSON.parse(await readFile("package.json", "utf-8"));

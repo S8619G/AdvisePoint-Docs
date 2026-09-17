@@ -67,8 +67,57 @@ const FETCH_RECONNECT_THRESHOLD = 1;
 const FETCH_DOWN_THRESHOLD = 7;
 let consecutiveFetchFails = 0;
 
+// v1.0.11.2: two extra suppression paths for the reconnect/down
+// escalation. Neither disables the poller; both stop the banner and
+// modal from lighting up during states where a health blip is
+// expected:
+//
+//   1. "Busy" reference counter -- incremented by long-running local
+//      operations (Restore, packaged export) so a brief health stall
+//      caused by the same operation doesn't scare the user. Refcount
+//      is symmetric: every setBusy(true) must be matched by
+//      setBusy(false), and the counter is clamped >= 0.
+//   2. Post-wake grace window -- if the wall clock jumps forward by
+//      more than the sleep threshold between ticks (laptop was
+//      suspended, screen locked, etc.), we give the health poller
+//      WAKE_GRACE_MS to recover before we're allowed to escalate.
+let _busyRefs = 0;
+export function setBusy(busy: boolean) {
+  if (busy) {
+    _busyRefs += 1;
+  } else if (_busyRefs > 0) {
+    _busyRefs -= 1;
+  }
+}
+export function isBusy(): boolean {
+  return _busyRefs > 0;
+}
+
+const WAKE_GRACE_MS = 15000;         // grace period after a detected wake
+const WAKE_JUMP_THRESHOLD_MS = 6000; // clock jump > this = suspected wake
+let _wakeGraceUntil = 0;
+let _lastTickAt = Date.now();
+export function noteHealthTick() {
+  const now = Date.now();
+  const gap = now - _lastTickAt;
+  _lastTickAt = now;
+  if (gap > WAKE_JUMP_THRESHOLD_MS) {
+    _wakeGraceUntil = now + WAKE_GRACE_MS;
+  }
+}
+export function inWakeGrace(): boolean {
+  return Date.now() < _wakeGraceUntil;
+}
+export function shouldSuppressEscalation(): boolean {
+  return isBusy() || inWakeGrace();
+}
+
 function noteFetchFailure() {
   consecutiveFetchFails += 1;
+  // Suppress escalation entirely when we're in a known-busy op or
+  // just after wake. The counter still climbs so a genuine dead
+  // server escalates the moment the suppression window ends.
+  if (shouldSuppressEscalation()) return;
   if (consecutiveFetchFails >= FETCH_DOWN_THRESHOLD) {
     setBackendHealth("down");
   } else if (consecutiveFetchFails >= FETCH_RECONNECT_THRESHOLD && _health === "up") {
