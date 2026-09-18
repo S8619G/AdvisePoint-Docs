@@ -41,6 +41,18 @@ for a binary until the source archive is also submitted and shared.
 
 ---
 
+## 1.2.7
+
+- Fixed persistent blank PDF regions after large scrollbar jumps and rapid
+  scrolling on the shared x64/ARM64 viewer.
+- Replaced visibility-dependent page discovery with scroll-position-driven
+  page loading and stable, per-page layout.
+- Added sized loading/rendering states and a Retry button for failed page
+  images, while keeping the mounted page buffer bounded.
+- Preserved reading position through zoom and resize. Explicit navigation
+  now jumps immediately so it cannot race a later manual scroll.
+- No database, launcher, updater, or native-runtime changes.
+
 ## 1.2.6
 
 **Upload-parser security fixes:** updates multer to 2.3.0 and pins the

@@ -48,6 +48,7 @@ import { useViewerPrefs } from "@/lib/viewer-prefs";
 // with print/zoom/page controls at parity with the PDF viewer.
 import { DocxViewerDialog } from "./DocxViewer";
 import { DocumentFileNameWithBadge } from "./DocumentFormatBadge";
+import { ContinuousPdfPages, type ContinuousPdfHandle } from "./ContinuousPdfPages";
 
 type PageInfo = {
   page_number: number;
@@ -174,7 +175,6 @@ function PdfPageViewerDialog({
   // like the page "filled the viewer". 2.2 makes the zoomed page clearly
   // dominant (roughly matches how the page fits at 100% on typical PDFs
   // where fit-to-height leaves horizontal breathing room).
-  const STACK_ZOOM_LEVEL = 2.2;
   const [stackZoomed, setStackZoomed] = useState(false);
 
   // v1.0.2 - Fit-mode auto-promotion. Fit renders the image at a reduced
@@ -412,8 +412,8 @@ function PdfPageViewerDialog({
 
   // v1.0.9 bounce-back fix: page-nav buttons (and keyboard shortcuts) are
   // "jump" gestures - they should re-anchor scroll in continuous mode.
-  // jumpToPage() flags the intent so the smooth-scroll effect fires; in
-  // Readable mode the flag is harmless (effect early-returns on !continuousFit).
+  // jumpToPage() moves the continuous viewport immediately; Readable mode
+  // continues to use the selected page's single image.
   const goPrev = () => jumpToPage(pageNumberRef.current - 1);
   const goNext = () => jumpToPage(pageNumberRef.current + 1);
 
@@ -536,295 +536,23 @@ function PdfPageViewerDialog({
   useEffect(() => { setImgLoading(true); }, [pageNumber]);
 
   // ------------------------------------------------------------------
-  // v1.0.9: continuous-scroll fit-mode viewer
-  //
-  // In Fit mode we now render a windowed vertical stack of pages
-  // [pageNumber-2 .. pageNumber+2] (clamped to [1, total]) inside a
-  // native-scrolling container instead of a single <img>. This means:
-  //   - Scrolling the wheel/trackpad flows the doc continuously.
-  //   - Ctrl+wheel still promotes to Readable (zoom hook stays out of
-  //     the way because we don't attach zoom.viewportRef in this mode).
-  //   - Next/Prev/search jumps use scroll-behavior: smooth via
-  //     scrollIntoView, so the transition matches PDF readers.
-  //   - As the user scrolls, IntersectionObserver reports the most-
-  //     visible page and we update pageNumber, which slides the window
-  //     (adds a page at the leading edge, removes one at the trailing
-  //     edge) without disturbing scroll position.
-  //
-  // Readable mode is completely unchanged - it still uses the zoom hook
-  // and renders one <img>.
+  // v1.2.7: the continuous viewer derives its mounted range directly from
+  // scrollTop and deterministic page geometry. Scrollbar jumps do not rely
+  // on old pages intersecting the viewport. The separate Readable view
+  // still uses the existing single-image zoom hook.
   // ------------------------------------------------------------------
 
-  // Only enter continuous mode when we actually have page images to render.
-  const continuousFit = fitMode === "fit" && currentPageRendered && totalPages > 0;
+  // v1.2.7: keep the continuous viewport mounted when the active page is
+  // still rendering. Missing pages have sized placeholders, not a mode flip.
+  const continuousFit = fitMode === "fit" && pages.length > 0 && totalPages > 0;
+  const continuousRef = useRef<ContinuousPdfHandle>(null);
 
-  // Distinguish "user is scrolling" from "we just called scrollIntoView"
-  // so the observer doesn't fight page changes triggered by clicks.
-  const programmaticScrollRef = useRef(false);
-  const clearProgrammaticSoon = useCallback(() => {
-    if (programmaticScrollRef.current) return;
-    programmaticScrollRef.current = true;
-    // Smooth scrolls finish within ~350ms in Chromium.
-    window.setTimeout(() => { programmaticScrollRef.current = false; }, 500);
-  }, []);
-
-  // v1.0.9 bounce-back fix. Only jump-style page changes (Next/Prev button,
-  // keyboard [ ] / PageUp / PageDown / ArrowLeft / ArrowRight, search-result
-  // click, page-number input) should re-anchor the scroll container to the
-  // top of the target page. Continuous natural scrolling drives pageNumber
-  // via IntersectionObserver too, and we must NOT scrollIntoView() in that
-  // case - doing so snaps the viewport back to the top of the page the user
-  // just scrolled into. This ref is set by jumpToPage() below and consumed
-  // once by the smooth-scroll effect.
-  const jumpIntentRef = useRef(false);
   const jumpToPage = useCallback((n: number) => {
     const total = statusRef.current?.total ?? pages.length ?? n;
     const target = Math.max(1, Math.min(total || n, n));
-    if (target === pageNumberRef.current) return;
-    jumpIntentRef.current = true;
+    continuousRef.current?.jumpToPage(target);
     setPageNumber(target);
   }, [pages.length]);
-
-  // Refs for each rendered page wrapper in the stack, keyed by page number.
-  // Populated by the ref callback on each page div.
-  const pageStackRefs = useRef<Map<number, HTMLDivElement>>(new Map());
-  const setPageStackRef = useCallback((pn: number, el: HTMLDivElement | null) => {
-    if (el) pageStackRefs.current.set(pn, el);
-    else pageStackRefs.current.delete(pn);
-  }, []);
-
-  // The scroll container for the continuous stack.
-  const stackContainerRef = useRef<HTMLDivElement | null>(null);
-
-  // Compute the currently visible window [start, end] inclusive.
-  const stackWindow = useMemo(() => {
-    if (!continuousFit) return { start: 0, end: 0 };
-    // v1.0.9.2: reverted to ±2 (5-page window). The v1.0.9.1.1 widen to
-    // ±3 was speculative and made the (now-removed) padding-compensation
-    // feedback loop worse. 5 pages is enough headroom for lazy image
-    // decode with the current IntersectionObserver rootMargin.
-    const half = 2;
-    const start = Math.max(1, pageNumber - half);
-    const end = Math.min(totalPages, pageNumber + half);
-    return { start, end };
-  }, [continuousFit, pageNumber, totalPages]);
-
-  const stackPageNumbers = useMemo(() => {
-    if (!continuousFit) return [] as number[];
-    const out: number[] = [];
-    for (let n = stackWindow.start; n <= stackWindow.end; n++) out.push(n);
-    return out;
-  }, [continuousFit, stackWindow.start, stackWindow.end]);
-
-  // v1.0.9 hotfix: track the container's own pixel height with a
-  // ResizeObserver so we can (a) constrain each page image to fit the
-  // viewport by default and (b) estimate document height for the
-  // virtualization spacers below.
-  const [containerHeight, setContainerHeight] = useState<number>(0);
-  useEffect(() => {
-    if (!continuousFit) return;
-    const el = stackContainerRef.current;
-    if (!el) return;
-    const update = () => setContainerHeight(el.clientHeight);
-    update();
-    if (typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(update);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [continuousFit]);
-
-  // v1.0.9 hotfix: track the average rendered page height so the
-  // virtualization spacers approximate the true document height. Seeded
-  // from the container height (each page "fits" the viewport by default,
-  // so container height is a solid starting estimate), then refined once
-  // real image heights come in. Kept in a ref because none of the
-  // computations that consume it need to trigger a re-render on their own
-  // - the parent re-render on stackWindow / pageNumber changes is enough.
-  const avgPageHeightRef = useRef<number>(0);
-  // Seed the average synchronously so spacers exist on first render and
-  // the scrollbar reflects the whole document immediately. v1.0.9.1.1:
-  // seed value depends on the current Zoom Page state - a zoomed page is
-  // taller than the viewport by STACK_ZOOM_LEVEL.
-  const seedPageHeight = containerHeight * (stackZoomed ? STACK_ZOOM_LEVEL : 1);
-  if (seedPageHeight > 0 && avgPageHeightRef.current === 0) {
-    avgPageHeightRef.current = seedPageHeight;
-  }
-  const measurePageHeights = useCallback(() => {
-    const heights: number[] = [];
-    for (const el of pageStackRefs.current.values()) {
-      const h = el.getBoundingClientRect().height;
-      if (h > 0) heights.push(h);
-    }
-    if (heights.length === 0) return;
-    const avg = heights.reduce((a, b) => a + b, 0) / heights.length;
-    // Only update if the estimate moved meaningfully to keep spacer math
-    // stable across renders.
-    if (Math.abs(avg - avgPageHeightRef.current) > 4) {
-      avgPageHeightRef.current = avg;
-    }
-  }, []);
-
-  // v1.0.9.1.1: when Zoom Page toggles, the previously-measured page
-  // heights are stale. Reset the average to the fresh seed so spacers
-  // recompute to the new page size, then remeasure after layout. Also
-  // scroll the current page back into view so the user's reading
-  // position isn't lost across the flip.
-  const prevStackZoomedRef = useRef<boolean>(false);
-  useEffect(() => {
-    if (!continuousFit) return;
-    if (prevStackZoomedRef.current === stackZoomed) return;
-    prevStackZoomedRef.current = stackZoomed;
-    if (containerHeight > 0) {
-      avgPageHeightRef.current = containerHeight * (stackZoomed ? STACK_ZOOM_LEVEL : 1);
-    }
-    // Suppress the IntersectionObserver during the re-anchor so it
-    // doesn't fight us with a setPageNumber call mid-scroll.
-    clearProgrammaticSoon();
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        measurePageHeights();
-        const el = pageStackRefs.current.get(pageNumberRef.current);
-        if (el) el.scrollIntoView({ behavior: "auto", block: "start" });
-      });
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stackZoomed, continuousFit]);
-
-  // v1.0.9 hotfix: virtualization spacer math. paddingTop reserves space
-  // for pages *above* the window (1..start-1); paddingBottom reserves
-  // space for pages *below* (end+1..totalPages). This gives the browser
-  // the real total scroll height, so the native scrollbar thumb size and
-  // position reflect the whole document instead of only the 5-page
-  // window. Also stops the scrollbar thumb from jerking to the middle as
-  // the window slides.
-  const spacerTop = continuousFit
-    ? Math.max(0, (stackWindow.start - 1)) * avgPageHeightRef.current
-    : 0;
-  const spacerBottom = continuousFit
-    ? Math.max(0, totalPages - stackWindow.end) * avgPageHeightRef.current
-    : 0;
-
-  // v1.0.9.2: the previous "paddingTop compensation" that lived here in
-  // v1.0.9.1 - v1.0.9.1.1 caused a runaway feedback loop. When natural
-  // scroll bumped pageNumber forward via IntersectionObserver,
-  // stackWindow.start went up by 1, this effect added `+H` to scrollTop,
-  // which the observer then interpreted as a fresh user scroll into the
-  // next page, which called setPageNumber again, and so on -- the
-  // viewport jumped page after page and could not be stopped.
-  //
-  // The compensation was solving a problem the browser already handles
-  // correctly: when paddingTop grows by H because the render window
-  // slid, the rendered pages' DOM offsets shrink by exactly H relative
-  // to their new (taller) padding, so their *absolute* scroll position
-  // stays the same. No manual scrollTop adjustment is needed. Removed.
-  //
-  // Page-height remeasurement after window slides now happens naturally
-  // via the <img onLoad> callback on newly-mounted pages.
-
-
-  // IntersectionObserver: whichever page is closest to the vertical center
-  // of the viewport becomes the active page.
-  useEffect(() => {
-    if (!continuousFit) return;
-    const container = stackContainerRef.current;
-    if (!container) return;
-    const io = new IntersectionObserver(
-      (entries) => {
-        if (programmaticScrollRef.current) return;
-        // Pick the entry with the largest intersectionRatio among those
-        // currently intersecting; skip when none are.
-        let bestPage: number | null = null;
-        let bestRatio = 0;
-        for (const e of entries) {
-          if (!e.isIntersecting) continue;
-          const pn = Number((e.target as HTMLElement).dataset.pageNumber);
-          if (!pn) continue;
-          if (e.intersectionRatio > bestRatio) {
-            bestRatio = e.intersectionRatio;
-            bestPage = pn;
-          }
-        }
-        if (bestPage != null && bestPage !== pageNumberRef.current) {
-          setPageNumber(bestPage);
-        }
-      },
-      {
-        root: container,
-        // v1.0.9 bounce-back fix: only consider a page "active" once its top
-        // has crossed the middle of the viewport (was -40%/-40%, which fired
-        // when the page center crossed the midline - too late for the header
-        // badge to feel natural). This also stops the observer from picking
-        // the *previous* page during the smooth-scroll re-anchor of a jump.
-        rootMargin: "0px 0px -55% 0px",
-        threshold: [0, 0.1, 0.25, 0.5],
-      },
-    );
-    for (const el of pageStackRefs.current.values()) io.observe(el);
-    return () => io.disconnect();
-    // Re-attach when the window changes (new pages get added, old ones
-    // unmount) so newly-mounted page elements get observed.
-  }, [continuousFit, stackWindow.start, stackWindow.end]);
-
-  // v1.0.9 bounce-back fix: re-anchor the scroll container ONLY on explicit
-  // page jumps (Next/Prev, keyboard, search jump). Natural scroll drives
-  // pageNumber via the IntersectionObserver too - in that case we must NOT
-  // scrollIntoView() or the viewport snaps back to the top of the page the
-  // user just scrolled into. jumpIntentRef is set by jumpToPage() and
-  // consumed here exactly once.
-  useEffect(() => {
-    if (!continuousFit) return;
-    if (!jumpIntentRef.current) return;
-    // Consume the intent up front so a re-run of this effect from any
-    // downstream state change can't fire a second scroll.
-    jumpIntentRef.current = false;
-    // Suppress the observer while the smooth-scroll animates through
-    // intermediate pages - otherwise it would fire setPageNumber for each
-    // page swept past, undoing the jump.
-    clearProgrammaticSoon();
-    // Two rAFs: wait for the newly-windowed page to mount before scrolling.
-    let cancelled = false;
-    requestAnimationFrame(() => {
-      if (cancelled) return;
-      requestAnimationFrame(() => {
-        if (cancelled) return;
-        const el = pageStackRefs.current.get(pageNumber);
-        if (!el) return;
-        el.scrollIntoView({ behavior: "smooth", block: "start" });
-      });
-    });
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pageNumber, continuousFit]);
-
-  // v1.0.9.1.1: Ctrl+wheel toggles Zoom Page within the continuous
-  // stack. deltaY < 0 (wheel up / pinch out) means zoom in -> stackZoomed
-  // = true. deltaY > 0 zooms out -> stackZoomed = false. Never drops out
-  // to the legacy Readable viewer.
-  const onStackWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
-    if (!(e.ctrlKey || e.metaKey)) return;
-    e.preventDefault();
-    if (e.deltaY < 0) setStackZoomed(true);
-    else if (e.deltaY > 0) setStackZoomed(false);
-  }, []);
-
-  // Reset scroll to the top of pageNumber when we (re)enter continuous mode
-  // or switch documents.
-  useEffect(() => {
-    if (!continuousFit) return;
-    const container = stackContainerRef.current;
-    if (!container) return;
-    // Wait for pages to render then align to the current page.
-    const t = window.setTimeout(() => {
-      const el = pageStackRefs.current.get(pageNumber);
-      if (!el) return;
-      clearProgrammaticSoon();
-      el.scrollIntoView({ behavior: "auto", block: "start" });
-    }, 20);
-    return () => window.clearTimeout(t);
-    // Intentionally omit pageNumber - the effect above handles subsequent
-    // page changes with smooth behavior.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [continuousFit, documentId]);
 
   // ------------------------------------------------------------------
   // Search input local key handling (Enter / Shift+Enter to navigate)
@@ -1018,98 +746,11 @@ ${imgsHtml}
               </div>
             )}
             {!loading && !error && continuousFit && (
-              // v1.0.9.1: virtualized continuous-scroll Fit viewer.
-              //
-              //   - Each page is constrained to fit the viewport by default
-              //     (max-height keyed off the container's own height via a
-              //     CSS custom property), so opening a PDF shows page 1 in
-              //     full, matching the prior Fit behavior.
-              //   - The stack is virtualized: only the current window
-              //     (~5 pages centered on `pageNumber`) is rendered, but
-              //     top/bottom spacers reserve the full document height so
-              //     the native scrollbar thumb reflects true position in
-              //     the whole document instead of only the window.
-              //   - Zoom hook is NOT attached - native scroll owns the
-              //     vertical axis. Ctrl+wheel still promotes to Readable.
-              <div
-                ref={stackContainerRef}
-                className="absolute inset-0 overflow-y-auto overflow-x-hidden bg-muted/30 scroll-smooth"
-                onWheel={onStackWheel}
-                style={{
-                  // Exposed to child page wrappers so each page can be
-                  // constrained to the viewport height by default.
-                  ["--viewer-h" as any]: containerHeight ? `${containerHeight}px` : "100%",
-                }}
-                data-testid="viewer-continuous-stack"
-              >
-                {/* Top spacer: reserves height for pages 1..(start-1). */}
-                <div
-                  aria-hidden="true"
-                  style={{ height: `${spacerTop}px` }}
-                  data-testid="stack-spacer-top"
-                />
-                <div className="flex flex-col items-center gap-0">
-                  {stackPageNumbers.map((pn, idx) => {
-                    const info = pages.find((p) => p.page_number === pn);
-                    if (!info) return null;
-                    return (
-                      <div key={pn} className="w-full flex flex-col items-center">
-                        {idx > 0 && (
-                          <div
-                            className="my-3 flex items-center gap-2 text-[10px] uppercase tracking-wider text-muted-foreground/70 w-full max-w-[90%]"
-                            aria-hidden="true"
-                          >
-                            <span className="h-px flex-1 bg-border" />
-                            <span className="px-1 tabular-nums">Page {pn}</span>
-                            <span className="h-px flex-1 bg-border" />
-                          </div>
-                        )}
-                        <div
-                          ref={(el) => setPageStackRef(pn, el)}
-                          data-page-number={pn}
-                          data-testid={`stack-page-${pn}`}
-                          className="px-4 py-2 flex items-center justify-center w-full"
-                        >
-                          <img
-                            src={`/api/documents/${documentId}/pages/${pn}.jpg`}
-                            alt={`Page ${pn}`}
-                            loading="lazy"
-                            draggable={false}
-                            width={info.width}
-                            height={info.height}
-                            onLoad={measurePageHeights}
-                            className="max-w-full w-auto h-auto shadow-md bg-white"
-                            style={{
-                              // v1.0.9.1: cap each page image at the
-                              // container height (minus a small pad for
-                              // page-break chip breathing room) so the
-                              // page fits the viewport by default.
-                              // v1.0.9.1.1: when "Zoom Page" is active,
-                              // multiply the cap by STACK_ZOOM_LEVEL so
-                              // the page overflows the viewport and the
-                              // user can read it at magnified size while
-                              // still scrolling continuously through the
-                              // whole document. Aspect ratio preserved via
-                              // the width/height attrs.
-                              maxHeight: stackZoomed
-                                ? `calc((var(--viewer-h) - 32px) * ${STACK_ZOOM_LEVEL})`
-                                : "calc(var(--viewer-h) - 32px)",
-                              aspectRatio: `${info.width} / ${info.height}`,
-                              imageRendering: "-webkit-optimize-contrast",
-                            }}
-                          />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-                {/* Bottom spacer: reserves height for pages (end+1)..total. */}
-                <div
-                  aria-hidden="true"
-                  style={{ height: `${spacerBottom}px` }}
-                  data-testid="stack-spacer-bottom"
-                />
-              </div>
+              <ContinuousPdfPages key={documentId} ref={continuousRef}
+                documentId={documentId} pages={pages} totalPages={totalPages}
+                initialPage={pageNumber} zoomed={stackZoomed}
+                onZoom={setStackZoomed} onPageChange={setPageNumber}
+                renderStatus={status?.status ?? "pending"} />
             )}
             {!loading && !error && !continuousFit && (
               <div

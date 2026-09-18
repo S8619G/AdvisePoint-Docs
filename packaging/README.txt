@@ -416,6 +416,18 @@ matched, and the source document. Your search terms are
 highlighted in amber in the result text so you can spot them at a
 glance. Click "Show metadata" to see the full record.
 
+PDF PAGE SCROLLING:
+
+Drag the vertical scrollbar, use the mouse wheel, or enter a page number
+to move through a rendered PDF. The viewer loads the pages at the current
+scroll position and a small nearby buffer, including after large jumps.
+Page-number, Next/Previous, and search-result jumps move immediately.
+
+A brief "Loading page" message can appear while a page image loads.
+If an image fails to load, use its "Retry page" button. "Rendering page"
+means the local renderer is still preparing that page. Zoom Page and
+window resizing preserve the reading position.
+
 DOCUMENT VIEWER (in-document search):
    Click a result to open the source document in the viewer. A
    small badge in the top-right of the viewer tells you the file
@@ -800,5 +812,5 @@ past restores.
 VERSION
 -------
 
-AdvisePoint Docs 1.2.6
+AdvisePoint Docs 1.2.7
 Bundled Node.js: 20.18.1
