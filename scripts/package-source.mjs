@@ -15,7 +15,7 @@
 // Usage:
 //   node scripts/package-source.mjs --output ../AdvisePoint-Docs-v1.0.13.1-source.zip
 
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, cpSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -36,7 +36,6 @@ const REQUIRED_SOURCE_PATHS = [
   "packaging/pdf-engine/arm64/SHA256SUMS",
   "packaging/pdf-engine/x64/THIRD-PARTY.md",
   "packaging/pdf-engine/arm64/THIRD-PARTY.md",
-  "packaging/test-v131.cjs",
   "packaging/pdf-engine/x64/qpdf30.dll",
   "packaging/pdf-engine/x64/libgcc_s_seh-1.dll",
   "packaging/pdf-engine/x64/libstdc++-6.dll",
@@ -50,6 +49,8 @@ const REQUIRED_SOURCE_PATHS = [
   "postcss.config.js",
   "tailwind.config.ts",
   "components.json",
+  "docs/RELEASE-NOTES.md",
+  "docs/TESTING-GUIDE.md",
   "package.json",
   "package-lock.json",
   // Runtime tree roots
@@ -84,6 +85,13 @@ const EXCLUDES = [
   ".git",
   "**/*.tsbuildinfo",
   "verification",
+  "docs",
+  "packaging/test-v131.cjs",
+  "packaging/local-test.cjs",
+  "packaging/runtime-log.cjs",
+  "packaging/LOCAL-TEST-README.txt",
+  "packaging/tools",
+  "scripts/local-candidate.test.mjs",
   // One-off personal maintenance tools are not part of future release source.
   "packaging/reset-library.cjs",
   "packaging/cleanup-test-data.cjs",
@@ -154,6 +162,11 @@ try {
     `tar ${tarExcludeArgs.map((a) => JSON.stringify(a)).join(" ")} -cf - . ` +
     `| tar -xf - -C ${JSON.stringify(stageRoot)}`,
   ], repoRoot);
+
+  // Keep current documentation, not historical candidate reports or plans.
+  mkdirSync(join(stageRoot, "docs"), { recursive: true });
+  for (const name of ["RELEASE-NOTES.md", "TESTING-GUIDE.md"])
+    cpSync(join(repoRoot, "docs", name), join(stageRoot, "docs", name));
 
   // Re-verify inside the staged tree; guarantees the emitted zip is complete.
   for (const rel of REQUIRED_SOURCE_PATHS) {

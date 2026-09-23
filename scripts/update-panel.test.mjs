@@ -39,7 +39,7 @@ async function open() {
   const page = await browser.newPage({ viewport: { width: 1366, height: 900 } });
   const state = { phase: "preparing", message: "Downloading and validating the package.", startedAt: Date.now(), offline: false };
   await page.route("https://api.github.com/**", r => r.fulfill({ json: {
-    tag_name: "v1.3.2", html_url: "https://github.com/S8619G/advisepoint-docs/releases/tag/v1.3.2",
+    tag_name: "v1.3.3", html_url: "https://github.com/S8619G/advisepoint-docs/releases/tag/v1.3.3",
     name: "Future test release", body: "Test only", assets: [],
   } }));
   await page.route("**/api/render/busy", r => r.fulfill({ json: { busy: false } }));
@@ -74,7 +74,7 @@ test("slow validation keeps live UI busy without a false launch failure", async 
 test("manual downloads always open the release page, not an arbitrary ZIP", async () => {
   const { page } = await open();
   try {
-    assert.match(await page.getByTestId("link-panel-update-download").getAttribute("href"), /\/releases\/tag\/v1\.3\.2$/);
+    assert.match(await page.getByTestId("link-panel-update-download").getAttribute("href"), /\/releases\/tag\/v1\.3\.3$/);
   } finally { await page.close(); }
 });
 test("local-ZIP validation and failure are visible without a fake disconnect countdown", async () => {

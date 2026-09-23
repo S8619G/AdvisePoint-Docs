@@ -32,11 +32,13 @@ test("active print preparation holds off actual server idle shutdown",{skip:!fix
     await fetch(base+"/api/heartbeat");
     await delay(11500);
     assert.equal((await fetch(base+"/api/health")).status,200);
-    assert.match(output,/idle shutdown held:.*print preparation active/);
+    assert.match(output,/keeping local service running/);
     assert.equal((await fetch(base+`/api/rendered-print-jobs/${id}/cancel`,{method:"POST",headers,body:"{}"})).status,200);
-    // Once the job exits, normal idle shutdown is allowed again.
-    for(let n=0;n<120&&server.exitCode===null;n++)await delay(100);
-    assert.equal(server.exitCode,0);assert.match(output,/no browser heartbeat.*shutting down/);
+    // v1.3.2: finishing the job must not revive heartbeat-based shutdown.
+    await delay(11500);
+    assert.equal(server.exitCode,null);
+    assert.equal((await fetch(base+"/api/health")).status,200);
+    assert.doesNotMatch(output,/no browser heartbeat.*shutting down/);
   }finally{
     db.close();writeFileSync(workerFile,saved);
     if(server&&server.exitCode===null){server.kill();await new Promise(r=>server.once("exit",r));}

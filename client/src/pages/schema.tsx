@@ -30,7 +30,7 @@ const FIELD_GROUPS = [
     tint: "primary",
     fields: [
       ["product_family", "string", "Acme MFP Series"],
-      ["product_model", "string (required)", "TASKalfa 5054ci"],
+      ["product_model", "string (optional)", "TASKalfa 5054ci"],
       ["product_version", "semver", "3.2.0"],
       ["firmware_version", "string", "2FX_S000.006.021"],
       ["platform", "string[]", "windows, macos, embedded"],
@@ -126,21 +126,15 @@ export default function SchemaPage() {
           <UpdateCheckPanel />
           <LibraryStoragePanel />
           <ViewerPrefsPanel />
-          {/* v1.0.15: reinstall action for the seeded Welcome Guide.
-              v1.2.4: paired with the Manage Values panel in a two-column
-              grid; each is a compact one-action card and neither warrants
-              a full-width row of its own. Collapses to a single column on
-              small screens. */}
-          <div className="grid gap-4 md:grid-cols-2">
-            <WelcomeGuidePanel />
-            <ManageValuesPanel />
+          <div className="grid gap-4 md:grid-cols-2" data-testid="maintenance-diagnostics-row">
+            <LibraryScanPanel />
+            <DiagnosticsPanel />
           </div>
-          <LibraryScanPanel />
-          <DiagnosticsPanel />
         </TabsContent>
 
         <TabsContent value="formats" className="space-y-6">
           <DocumentTypeManager />
+          <ManageValuesPanel />
           {/* v1.1.0 (item 9): filename codes appear BELOW the existing list,
               separated by a clear divider. The divider is a plain <hr> so it
               stays out of the DocumentTypeManager card and does not affect
@@ -160,6 +154,7 @@ export default function SchemaPage() {
           <RecoveryPanel />
           <DuplicatesPanel />
           <RenderFailuresPanel />
+          <WelcomeGuidePanel />
         </TabsContent>
 
         <TabsContent value="developer" className="space-y-4">

@@ -71,6 +71,6 @@ el("pc").onclick=async()=>{
   finally{button.disabled=false;}
 };
 window.addEventListener("pagehide",()=>{void finish().catch(()=>{});});
-const heartbeat=setInterval(()=>void fetch("/api/heartbeat",{method:"POST"}).catch(()=>{}),30000);
+const heartbeat=setInterval(()=>void fetch("/api/heartbeat",{method:"GET"}).catch(()=>{}),30000);
 window.addEventListener("pagehide",()=>clearInterval(heartbeat));
 void prepare();

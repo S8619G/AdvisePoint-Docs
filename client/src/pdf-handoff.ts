@@ -47,7 +47,7 @@ el("fallback").onclick=async()=>{
   }catch{el("error").textContent="Cleanup could not be confirmed. Close and reopen Print to retry.";el("error").hidden=false;el<HTMLButtonElement>("fallback").disabled=false;}
 };
 const heartbeat=setInterval(()=>{
-  void fetch("/api/heartbeat",{method:"POST"}).catch(()=>{});
+  void fetch("/api/heartbeat",{method:"GET"}).catch(()=>{});
   void fetch(`/api/pdf/print-jobs/${job}/touch`,{method:"POST",headers}).catch(()=>{});
 },30000);
 window.addEventListener("pagehide",()=>{void finish().catch(()=>{});});

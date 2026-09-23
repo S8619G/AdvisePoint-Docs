@@ -12,7 +12,12 @@ import type { Request } from 'express';
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
-import { rawDb } from "./storage";
+import { rawDb, isDbClosedForRestore } from "./storage";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { registerApplicationLifecycle } from "./application-lifecycle";
+import { isBackupInFlight } from "./backup-scheduler";
+import { hasActiveEditSessions } from "./editInbox";
 import { backfillMissingLocations } from "./locate";
 import { bootState, envSnapshot, logRotate, withPhase } from "./boot";
 import { logInstallLocationAtBoot } from "./install-location";
@@ -116,31 +121,9 @@ export function log(message: string, source = "express") {
 }
 
 // -------------------------------------------------------------------
-// Browser-tab heartbeat + idle-shutdown watcher
-//
-// The browser client pings /api/heartbeat every ~5 seconds while its tab is
-// open. If we go longer than IDLE_SHUTDOWN_MS without a heartbeat AND we've
-// received at least one heartbeat since startup, we shut down the server so
-// the launcher's console can close on its own.
-//
-// Set RAG_NO_IDLE_SHUTDOWN=1 to disable (useful for headless testing).
-//
-// v0.9.28: The previous 15s idle timeout was far too aggressive for a portable
-// desktop app that spends much of its life in a background tab. A user who
-// Alt-Tabbed to Teams, minimized the window, or let the screen lock for more
-// than 15 seconds would come back to a dead server (the browser heartbeat also
-// pauses while the tab is hidden — see client/src/lib/heartbeat.ts). The
-// symptom is the BackendDownOverlay firing seemingly at random. Raising the
-// default to 10 minutes matches how techs actually use the tool.
-//
-// v1.1.6: the elapsed-time test moved into IdleWatchdog so it can tell a
-// suspended machine from an absent browser. Sleeping the computer for longer
-// than the idle window used to kill the server every time: node and the
-// browser freeze together, no heartbeats arrive, but the wall clock keeps
-// running, so the first tick after wake saw hours of "idleness" and exited
-// before the tab could ping again. The watchdog now treats a tick that
-// arrives far later than the interval as proof the process was not running,
-// and restarts the idle clock from the moment of resume.
+// v1.3.2: Heartbeats are diagnostic only. Browser timers can stop while
+// Windows stays awake. Neither an absent heartbeat nor a process timer gap
+// proves that the tab closed, so neither is permitted to stop the service.
 // -------------------------------------------------------------------
 const IDLE_SHUTDOWN_MS = parseInt(process.env.RAG_IDLE_SHUTDOWN_MS || "600000", 10);
 const IDLE_CHECK_MS = 10000;
@@ -152,63 +135,46 @@ const idleWatchdog = new IdleWatchdog({
 
 app.get("/api/heartbeat", (_req, res) => {
   const ts = Date.now();
-  idleWatchdog.heartbeat(ts);
+  if (idleWatchdog.heartbeat(ts)) log("browser heartbeat restored; local service remained available");
   res.json({ ok: true, ts });
 });
 
-// v1.1.7: log the render-busy hold at most once per busy interval so
-// server.log doesn't fill with the same line every 10 s while a long batch
-// finishes. Reset once we've actually exited the busy state.
-let renderBusyHoldLogged = false;
-
-if (process.env.RAG_NO_IDLE_SHUTDOWN !== "1") {
+{
   idleWatchdog.start(Date.now());
   setInterval(() => {
     const result = idleWatchdog.tick(Date.now());
     if (result.action === "resumed") {
-      // Logged because this is the one event that explains an otherwise
-      // puzzling gap in server.log, and because it confirms the sleep
-      // handling is doing its job on a real machine.
+      // Log the observed scheduling gap without inferring its cause.
       if (result.suspendedMs > 0) {
         log(
-          `resumed after ${Math.round(result.suspendedMs / 1000)}s suspended — ` +
-            `idle timer reset, waiting for the browser`,
+          `process timer gap ${Math.round(result.suspendedMs / 1000)}s; heartbeat observation reset (cause unknown)`,
         );
       } else {
-        log("system clock moved backwards — idle timer reset");
+        log("system clock moved backwards; heartbeat observation reset");
       }
       return;
     }
-    if (result.action === "shutdown") {
-      // v1.1.7: hold off idle shutdown while renders are still in flight. The
-      // render queue lives in RAM, so exiting here would abandon queued and
-      // in-progress documents (they show as interrupted after next boot's
-      // reconcile pass). The tab is already gone -- nobody to prompt -- so we
-      // just wait. The next tick reruns this branch; when the queue drains
-      // the shutdown fires normally. The busy check lives at the call site
-      // deliberately so IdleWatchdog stays pure and testable (no queue
-      // state injected). Backoff log is emitted at most once per busy state
-      // to keep server.log readable across long-lived queues.
-      const snap = getRenderQueueSnapshot();
-      const printing = isRenderedPrintBusy();
-      const busy = snap.running || snap.queue_depth > 0 || printing || isPdfCompatibilityBusy();
-      if (busy) {
-        if (!renderBusyHoldLogged) {
-          const inFlight = (snap.running ? 1 : 0) + snap.queue_depth;
-          log(
-            `idle shutdown held: ${inFlight} document${inFlight === 1 ? "" : "s"} still rendering${printing ? "; print preparation active" : ""}; will retry on next tick`,
-          );
-          renderBusyHoldLogged = true;
-        }
-        return;
-      }
-      renderBusyHoldLogged = false;
-      log(`no browser heartbeat for ${Math.round(result.idleMs / 1000)}s — shutting down`);
-      // Give the log line a moment to flush, then exit cleanly.
-      setTimeout(() => process.exit(0), 200);
+    if (result.action === "missing") {
+      log(`no browser heartbeat for ${Math.round(result.idleMs / 1000)}s; keeping local service running`);
     }
   }, IDLE_CHECK_MS).unref();
 }
+
+registerApplicationLifecycle(app, httpServer, () => {
+  const snap = getRenderQueueSnapshot();
+  let updating = false;
+  if (process.env.LOCALAPPDATA) {
+    const dir = join(process.env.LOCALAPPDATA, "AdvisePoint Docs");
+    updating = existsSync(join(dir, ".updating"));
+    try {
+      const status = JSON.parse(readFileSync(join(dir, "update-status.json"), "utf8"));
+      updating ||= ["preparing", "installing"].includes(status.phase);
+    } catch { /* No updater status is normal before the first update. */ }
+  }
+  return snap.running || snap.queue_depth > 0 || isRenderedPrintBusy() ||
+    isPdfCompatibilityBusy() || isBackupInFlight() || isDbClosedForRestore() ||
+    hasActiveEditSessions() || updating;
+}, () => process.exit(0));
 
 // v0.9.16: log method/path/status/duration only. Previous versions logged the
 // full JSON response body, which meant search results and ingested document

@@ -244,9 +244,6 @@ try {
   }
   rmSync(join(appRoot,"pdf-engine"),{recursive:true,force:true});
   cpSync(engineSource,join(appRoot,"pdf-engine"),{recursive:true});
-  cpSync(join(repoRoot,"packaging","test-v131.cjs"),join(appRoot,"test-v131.cjs"));
-  writeFileSync(join(appRoot,"Start isolated v1.3.1 test.bat"),
-    '@echo off\r\ncd /d "%~dp0"\r\n"node\\node.exe" "test-v131.cjs"\r\npause\r\n');
 
   // v1.0.8: EXTRA_RUNTIME_DEPS retired. Direct deps added since v1.0.0
   // (e.g. iconv-lite, safer-buffer for RTF) are now bundled into
@@ -376,18 +373,17 @@ try {
       const line = (render.stdout || "").trim().split("\n").pop() || "";
       console.log(`[package-windows] rendered Welcome Guide -- ${line}`);
     } else {
-      console.warn(
-        "[package-windows] render-welcome-guide.py failed; shipping the " +
-        "existing on-disk PDF (may be stale). " +
+      throw new Error(
+        "[package-windows] Guide generation failed; refusing a stale guide. " +
         `Exit code: ${render.status}. Stderr:\n${render.stderr || "(empty)"}`,
       );
     }
-  }
+  } else { throw new Error("Required Welcome Guide generator is missing."); }
 
   if (existsSync(welcomeSrc)) {
     cpSync(welcomeSrc, welcomeDst, { recursive: true });
   } else {
-    console.warn(
+    throw new Error(
       "[package-windows] packaging/welcome-guide/ is missing -- " +
       "the shipped zip will NOT include the seed Welcome Guide PDF. " +
       "Run scripts/render-welcome-guide.py and copy the PDF into " +
@@ -506,31 +502,17 @@ try {
   rmSync(join(appRoot, "dist.bak"), { recursive: true, force: true });
 
   const mode = JSON.parse(readFileSync(join(repoRoot, "dist", "build-mode.json"), "utf8"));
-  if (args["local-test"] !== "1" && mode.local_test)
+  if (mode.local_test || args["local-test"])
     throw Error("Production packaging requires a normal build (unset VITE_APD_LOCAL_TEST).");
-  if (args["local-test"] === "1") {
-    const mode = JSON.parse(readFileSync(join(repoRoot, "dist", "build-mode.json"), "utf8"));
-    if (!mode.local_test) throw Error("Rebuild with VITE_APD_LOCAL_TEST=1 before packaging a candidate.");
-    writeFileSync(join(appRoot, "LOCAL_TEST_ONLY"), "1.3.0\n");
-    cpSync(join(repoRoot, "packaging", "local-test.cjs"), join(appRoot, "local-test.cjs"));
-    cpSync(join(repoRoot, "packaging", "runtime-log.cjs"), join(appRoot, "runtime-log.cjs"));
-    writeFileSync(join(appRoot, "CANDIDATE"), "13\n");
-    cpSync(join(appRoot, "dist", "index.cjs"), join(appRoot, "dist", "application.cjs"));
-    writeFileSync(join(appRoot, "dist", "index.cjs"), 'require("../local-test.cjs");\n');
-    const launch = '@echo off\r\ncd /d "%~dp0"\r\n"node\\node.exe" "local-test.cjs"\r\npause\r\n';
-    writeFileSync(join(appRoot, "Start AdvisePoint Docs.bat"), launch);
-    // Do not replace the user's production shortcut or offer a local ZIP updater.
-    for (const name of ["Update AdvisePoint Docs.bat", "Setup Icon (run once).bat"]) {
-      writeFileSync(join(appRoot, name), '@echo off\r\necho Disabled in this local-test candidate. Use Start AdvisePoint Docs.bat.\r\npause\r\n');
-    }
-    cpSync(join(repoRoot, "packaging", "LOCAL-TEST-README.txt"), join(appRoot, "READ ME FIRST - LOCAL TEST.txt"));
-  }
 
   // Standing shipping policy: one-off maintenance tools are never end-user
   // content. Remove inherited copies too: the baseline can be the prior release.
   // This operates ONLY on the disposable packaging stage, never an installation
   // or library. Keep runtime code, legal notices, and both launcher folders.
   const unshippedPaths = [
+    "test-v131.cjs", "Start isolated v1.3.1 test.bat",
+    "local-test.cjs", "runtime-log.cjs", "LOCAL_TEST_ONLY", "CANDIDATE",
+    "READ ME FIRST - LOCAL TEST.txt", "tools",
     "reset-library.cjs", "Reset library (backup first).bat",
     "cleanup-test-data.cjs", "Clean prototype and test data (backup first).bat",
     "START-FRESH.txt",

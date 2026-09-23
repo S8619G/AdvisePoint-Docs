@@ -169,6 +169,10 @@ interface EditSession {
 
 const sessions = new Map<string, EditSession>();
 
+export function hasActiveEditSessions(): boolean {
+  return [...sessions.values()].some(s => s.status !== "ended" || s.reingestInFlight);
+}
+
 /**
  * Look up an existing session for this document (in any state). Used
  * by startEditSession to avoid spawning a second Word window on top of

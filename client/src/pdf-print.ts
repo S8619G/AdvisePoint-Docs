@@ -210,7 +210,7 @@ window.addEventListener("pagehide",()=>{void finish().catch(()=>{});});
 // Keep the prototype alive while this standalone tab is active. It is not
 // a fix for suspended browser tabs and never touches production heartbeats.
 const heartbeat=setInterval(()=>{
-  void fetch("/api/heartbeat",{method:"POST"}).catch(()=>{});
+  void fetch("/api/heartbeat",{method:"GET"}).catch(()=>{});
   void fetch(`/api/pdf/print-jobs/${job}/touch`,{method:"POST",headers:{"X-APD-PDF-Action":"open-original"}}).catch(()=>{});
 },30_000);
 window.addEventListener("pagehide",()=>clearInterval(heartbeat),{once:true});

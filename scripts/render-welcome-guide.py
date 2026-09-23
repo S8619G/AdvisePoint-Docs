@@ -19,6 +19,8 @@ import os
 import re
 import sys
 from datetime import date
+from reportlab import rl_config
+rl_config.invariant = 1
 from pathlib import Path
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
@@ -463,7 +465,7 @@ def _render_pass(readme_path, out_path, version, revision, rev_date, body_total,
 
     chapters = _parse_chapters(text)
     # We drop the very first "AdvisePoint Docs" title chapter; it's the cover.
-    chapters = [c for c in chapters if c["title"].upper() != "ADVISEPOINT DOCS"]
+    chapters = [c for c in chapters if c["title"].upper() not in ("ADVISEPOINT DOCS", "VERSION")]
 
     # Chapter callouts to inject after certain sections
     callouts = _make_callouts(styles, doc.width)
@@ -504,8 +506,10 @@ def _render_pass(readme_path, out_path, version, revision, rev_date, body_total,
         "Each entry points to the chapter that covers it in full.",
         styles["body"]))
     story.append(Spacer(1, 6))
-    for topic, chapter_ref in INDEX:
-        row = f'<b>{topic}</b> \u2014 <font color="#5a5a5a">{chapter_ref}</font>'
+    # Generate from actual chapter order; no stale hard-coded numbers.
+    for number, chapter in enumerate(chapters, start=1):
+        topic = _title_case(chapter["title"])
+        row = f'<b>{topic}</b>: <font color="#5a5a5a">Chapter {number}</font>'
         story.append(Paragraph(row, styles["body"]))
 
     # -------- Colophon --------
@@ -523,8 +527,8 @@ def _render_pass(readme_path, out_path, version, revision, rev_date, body_total,
         styles["body"]))
     story.append(Spacer(1, 12))
     story.append(Paragraph(
-        "For issues or suggestions, use the in-app feedback path or update to the "
-        "latest release from Settings &gt; Updates.", styles["body"]))
+        "For diagnosis, use Settings &gt; System &gt; Diagnostics. "
+        "Update controls are in Settings &gt; System.", styles["body"]))
 
     # Build with per-pass page counting
     page_counter = {"n": 0, "first_body_page": None}
@@ -831,8 +835,8 @@ def _make_callouts(styles, width):
             "help", "Help \u2014 Sizing the library folder",
             body("Uploaded documents live under %LOCALAPPDATA%\\AdvisePoint Docs, "
                  "not inside the app folder. If your system drive is tight, "
-                 "make sure %LOCALAPPDATA% has room for roughly three to four "
-                 "times the total size of the documents you plan to index."),
+                 "check Settings &gt; System &gt; Library storage for the actual "
+                 "size. Allow separate space for temporary processing and backups."),
             width,
         ),
         "QUICK START": Callout(
@@ -882,7 +886,8 @@ def _make_callouts(styles, width):
             body("Choose Merge if you want to add documents from a backup without "
                  "changing what's already in the library. Every wipe restore keeps "
                  "a pre-restore snapshot next to your data folder, so a mistake is "
-                 "always recoverable with the app closed."),
+                 "recoverable while that snapshot remains intact. Keep an "
+                 "independent backup and stop the service before manual recovery."),
             width,
         ),
         "TROUBLESHOOTING": Callout(
@@ -916,7 +921,7 @@ GLOSSARY = [
     ("Document Type",
      "A metadata category applied at upload time (Service Guide, Admin Guide, "
      "Release Notes, etc.). Used for filtering searches. Names are stored in "
-     "Title Case, and the list is editable in Settings > Document types."),
+     "Title Case, and the list is editable in Settings &gt; Formats &gt; Document types."),
     ("Keeper",
      "In duplicate handling, the document chosen to remain in the library while the "
      "other copies are moved to quarantine."),
@@ -935,14 +940,14 @@ GLOSSARY = [
      "\"MZ Series\"). Independent from Product model \u2014 the two filters do not "
      "narrow each other."),
     ("Product Model",
-     "The specific product a document describes (e.g. \"MZ9500ci\"). Required at "
-     "upload time; the primary filtering axis for search."),
+     "The specific product a document describes (e.g. \"MZ9500ci\"). Optional at "
+     "upload time; useful for filtering search results."),
     ("Quarantine",
      "The <font face='Courier'>deleted\\</font> folder under the data directory where "
      "removed documents are stored non-destructively until you Restore them or "
      "delete them permanently."),
     ("Recovery Panel",
-     "The Settings &gt; Recovery view listing quarantined documents and pre-restore "
+     "The Settings &gt; Backup / Restore &gt; Recovery view listing retained documents and pre-restore "
      "snapshots, with per-item Restore and Delete actions and an opt-in auto-cleanup "
      "toggle for duplicates."),
     ("Sha-256",
@@ -1003,18 +1008,22 @@ def main():
     # Search only after the VERSION heading so we don't pick up numbers in
     # sample paths above (e.g. "Node.js 20.18.1").
     text = readme.read_text(encoding="utf-8")
-    version = "1.0.14"
+    version = None
     ver_section = re.search(r"VERSION\s*\n[-=]+\s*\n+(.+)", text)
     if ver_section:
         m = re.search(r"AdvisePoint Docs\s+(\d+\.\d+\.\d+(?:\.\d+)?)", ver_section.group(1))
         if m:
             version = m.group(1)
+    source_version = re.search(r'APP_VERSION = "([^"]+)"',
+                              (root / "client/src/version.ts").read_text()).group(1)
+    if not version or version != source_version:
+        raise ValueError("Guide and application versions must match.")
     # Document revision defaults to app version; override with arg 2. Date is today.
     revision = sys.argv[2] if len(sys.argv) > 2 else version
-    try:
-        rev_date = date.today().strftime("%B %-d, %Y")
-    except ValueError:
-        rev_date = date.today().strftime("%B %d, %Y").replace(" 0", " ")
+    guide_date = re.search(r"^Guide date: (.+)$", text, re.MULTILINE)
+    if not guide_date:
+        raise ValueError("README must specify a stable Guide date.")
+    rev_date = guide_date.group(1).strip()
     render(readme, out, version, revision, rev_date)
     print(f"Wrote {out} (app v{version}, doc rev {revision}, {rev_date})")
 

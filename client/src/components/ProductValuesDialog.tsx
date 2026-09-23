@@ -252,7 +252,7 @@ export function ProductValuesDialog({
       >
         <DialogContent className="max-w-2xl">
           <DialogHeader>
-            <DialogTitle>Manage product values</DialogTitle>
+            <DialogTitle>Manage Product Lists</DialogTitle>
             <DialogDescription>
               Rename a value everywhere it is used, or merge two values that should be one.
               Changes apply to every document using the value.

@@ -27,13 +27,12 @@ export function ManageValuesPanel() {
       <CardHeader>
         <CardTitle className="flex items-center gap-2 text-sm">
           <Tags className="h-4 w-4 text-primary" />
-          Manage values
+          Manage Product Lists
         </CardTitle>
         <CardDescription className="text-xs">
           Rename, merge, or delete Product model and Product family values
-          across every document at once. Deletes never lose a document -- you
-          pick another value to merge into, or clear the field on those
-          documents.
+          across the library. Deleting a value reassigns or clears the field;
+          documents are kept.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -45,7 +44,7 @@ export function ManageValuesPanel() {
           className="gap-1.5"
         >
           <Tags className="h-3.5 w-3.5" />
-          Manage values
+          Manage Product Lists
         </Button>
       </CardContent>
       <ProductValuesDialog open={open} onOpenChange={setOpen} />

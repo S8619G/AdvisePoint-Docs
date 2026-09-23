@@ -54,15 +54,22 @@ async function pingHealth(): Promise<boolean> {
 export function BackendDownOverlay() {
   const [health, setHealthState] = useState<BackendHealth>(getBackendHealth());
   const [retrying, setRetrying] = useState(false);
+  const [stopped, setStopped] = useState(false);
   const failCountRef = useRef(0);
 
   // Subscribe to global backend health state (also set by any failed fetch).
   useEffect(() => subscribeBackendHealth(setHealthState), []);
+  useEffect(() => {
+    const onStop = () => setStopped(true);
+    window.addEventListener("apd-application-stopped", onStop);
+    return () => window.removeEventListener("apd-application-stopped", onStop);
+  }, []);
 
   // Health poller. Runs continuously. A healthy response resets the fail
   // counter and (if the app thought it was disconnected) flips back to "up".
   // Failures escalate reconnecting -> down at the thresholds above.
   useEffect(() => {
+    if (stopped) return;
     let cancelled = false;
 
     const tick = async () => {
@@ -102,12 +109,13 @@ export function BackendDownOverlay() {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, []);
+  }, [stopped]);
 
   const handleRetry = async () => {
     setRetrying(true);
     const ok = await pingHealth();
     if (ok) {
+      setStopped(false);
       failCountRef.current = 0;
       setBackendHealth("up");
       queryClient.invalidateQueries();
@@ -116,6 +124,20 @@ export function BackendDownOverlay() {
   };
 
   // "reconnecting": slim non-blocking banner across the top.
+  if (stopped) return (
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-background/95 p-6"
+      data-testid="application-stopped" role="status">
+      <div className="max-w-md rounded-lg border bg-card p-6 space-y-4">
+        <h2 className="text-lg font-semibold">AdvisePoint Docs is stopped</h2>
+        <p className="text-sm text-muted-foreground">
+          The local service was stopped intentionally. Library data is unchanged.
+          This tab can be closed. Use Start AdvisePoint Docs to start it again.
+        </p>
+        <button className="rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground"
+          onClick={handleRetry} disabled={retrying}>Check again</button>
+      </div>
+    </div>
+  );
   if (health === "reconnecting") {
     return (
       <div
@@ -159,15 +181,14 @@ export function BackendDownOverlay() {
               AdvisePoint Docs isn't responding
             </h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              The local service that stores your documents has stopped.
+              The browser cannot reach the local service.
             </p>
           </div>
         </div>
         <div id="backend-down-body" className="p-6 space-y-3 text-sm">
           <p>
-            The local AdvisePoint Docs service has shut down, so this page
-            can't reach its data. This can happen after the app is minimized
-            or the screen locks for a long time.
+            The local service may be restarting, stopped or unavailable.
+            Missing browser heartbeats do not stop the service.
           </p>
           <div className="rounded-md bg-muted/60 p-3 space-y-1">
             <p className="font-medium">To recover:</p>

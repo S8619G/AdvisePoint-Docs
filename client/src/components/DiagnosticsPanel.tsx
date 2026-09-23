@@ -3,6 +3,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button";
 import { FileArchive, Loader2, Download } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
+import { StopApplicationButton } from "@/components/StopApplicationButton";
 
 // v0.9.31 - Diagnostics bundle export panel (Settings > About tab).
 //
@@ -71,7 +72,7 @@ export function DiagnosticsPanel() {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <Button
             onClick={exportLogs}
             disabled={busy}
@@ -100,6 +101,7 @@ export function DiagnosticsPanel() {
           The database file, page images, and any uploaded PDFs are <span className="font-medium">not</span>{" "}
           included in the zip.
         </p>
+        <StopApplicationButton />
       </CardContent>
     </Card>
   );
