@@ -1,6 +1,7 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect,
   useMemo, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
+import { NativePdfPage } from "./NativePdfPage";
 import { buildPdfPageLayout, pdfPageAtOffset, pdfVisibleWindow,
   type PdfPageSize, type PdfPageSlot } from "@/lib/pdf-page-layout";
 
@@ -10,6 +11,7 @@ type Props = {
   initialPage: number; zoomed: boolean; onZoom: (zoomed:boolean) => void;
   onPageChange: (page:number) => void;
   renderStatus: string;
+  nativePdf?: boolean;
 };
 
 function PageImage({src, page, width, height}: {
@@ -49,7 +51,7 @@ function PageImage({src, page, width, height}: {
 // image-height measurement feedback, or timed suppression of user scrolling.
 export const ContinuousPdfPages = forwardRef<ContinuousPdfHandle, Props>(
 function ContinuousPdfPages({documentId,pages,totalPages,initialPage,zoomed,
-  onZoom,onPageChange,renderStatus}, ref) {
+  onZoom,onPageChange,renderStatus,nativePdf=false}, ref) {
   const container = useRef<HTMLDivElement>(null);
   const [size,setSize] = useState({width:0,height:0});
   const [top,setTop] = useState(0);
@@ -159,8 +161,12 @@ function ContinuousPdfPages({documentId,pages,totalPages,initialPage,zoomed,
           </div>}
           <div className="py-2 flex justify-center w-full">
             {rendered.has(slot.page)
-              ? <PageImage src={`/api/documents/${documentId}/pages/${slot.page}.jpg`}
-                  page={slot.page} width={slot.imageWidth} height={slot.imageHeight} />
+              ? nativePdf ? <NativePdfPage documentId={documentId}
+                  page={slot.page} width={slot.imageWidth} height={slot.imageHeight}
+                  pixelBudget={Math.floor(32_000_000/Math.max(1,window.end-window.start+1))}
+                  priority={Math.abs(slot.top-top)} className="bg-white shadow-md" />
+                : <PageImage src={`/api/documents/${documentId}/pages/${slot.page}.jpg`}
+                    page={slot.page} width={slot.imageWidth} height={slot.imageHeight} />
               : <div className="flex items-center justify-center bg-background text-muted-foreground text-sm"
                   style={{width:slot.imageWidth,height:slot.imageHeight}} role="status">
                   {renderStatus === "pending" || renderStatus === "rendering"

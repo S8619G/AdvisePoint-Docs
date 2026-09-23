@@ -344,7 +344,7 @@ export function LibraryScanPanel() {
                 </code>
                 . Other copies of this file stay in the library.
               </span>
-              <span className="mt-2 block font-medium text-red-600 dark:text-red-400">This cannot be undone.</span>
+              <span className="mt-2 block">Restore it from Settings → Backup/Restore → Removed documents until it is permanently deleted there. Other library copies remain unchanged.</span>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

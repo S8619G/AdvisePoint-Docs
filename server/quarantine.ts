@@ -60,7 +60,8 @@ function moveInto(src: string, dest: string): boolean {
       if (st.isDirectory()) {
         mkdirSync(dest, { recursive: true });
         for (const entry of readdirSync(src)) {
-          moveInto(join(src, entry), join(dest, entry));
+          if (!moveInto(join(src, entry), join(dest, entry)))
+            throw new Error("Could not preserve every page file.");
         }
       } else {
         copyFileSync(src, dest);
@@ -101,9 +102,14 @@ export function quarantineDocument(id: string, reason: string): QuarantineResult
   const chunks = storage.getChunksForDoc(id) as any[];
   writeFileSync(join(dir, "document.json"), JSON.stringify(doc, null, 2), "utf8");
   writeFileSync(join(dir, "chunks.json"), JSON.stringify(chunks, null, 2), "utf8");
+  // Native PDFs have geometry rows but no image files. Preserve those rows.
+  writeFileSync(join(dir, "page-rows.json"), JSON.stringify(storage.listPages(id)), "utf8");
+  writeFileSync(join(dir, "render-status.json"), JSON.stringify(storage.getRenderStatus(id) ?? null), "utf8");
 
   const pageDir = pageDirForDoc(id);
+  const hadPages = !!pageDir && existsSync(pageDir);
   const movedPages = pageDir ? moveInto(pageDir, join(dir, "pages")) : false;
+  if(hadPages && !movedPages)throw new Error("Page preservation failed; document rows were not removed.");
 
   let movedOriginal = false;
   const ext = typeof doc.original_ext === "string" ? doc.original_ext.toLowerCase().replace(/^\./, "") : "";
@@ -111,7 +117,11 @@ export function quarantineDocument(id: string, reason: string): QuarantineResult
     try {
       const src = originalFilePath(id, ext);
       movedOriginal = moveInto(src, join(dir, `original.${ext}`));
-    } catch { /* not retained; nothing to move */ }
+      if(!movedOriginal)throw new Error("Retained document preservation failed.");
+    } catch (error) {
+      if(movedPages && pageDir)moveInto(join(dir,"pages"),pageDir);
+      throw error;
+    }
   }
 
   writeFileSync(

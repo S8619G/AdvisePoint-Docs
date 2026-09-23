@@ -1,5 +1,138 @@
 # AdvisePoint Docs — Change Log
 
+## v1.3.1 (September 23, 2026)
+
+Adds automatic browser-free preparation of eligible restricted PDFs with one
+retained PDF, fixes DE-prefix title splitting, Document Type usage counts and
+recoverable deletion wording, and preserves native PDF recovery geometry.
+Simplifies whole-document PDF opening and removes the successful-open alert.
+Full x64/ARM64 packages retain normal update controls and omit reset/delete-all
+utilities. See `AdvisePoint-Docs-v1.3.1-release-notes.md`.
+
+## v1.3.0 (final packages, September 22, 2026)
+
+Final production-mode packaging restores the normal port-5000 working-library
+launcher and update controls, preserving candidate 13 PDF behavior. Adds a
+separate, confirmed prototype/test retirement utility with fixed-path identity
+checks, verified recovery copies and staged removal. Includes the backup-first
+working-library reset in both architectures. No automatic reset or cleanup.
+See the consolidated v1.3.0 release notes and START-FRESH.txt.
+
+### Historical candidate development
+
+The entries below describe earlier development stages, not current launch
+settings or new field certifications. Later candidates supersede earlier
+printing behavior; final packages are not isolated local-test packages.
+
+Candidate 13 corrects native ranges in encrypted, print-permitted manuals:
+create a temporary selected-page image PDF when direct page copying is
+unavailable, rather than silently opening the full original. Unrestricted
+subsets still copy directly. Print prohibition/quality permissions remain
+enforced; library originals are unchanged. Cancellation, cleanup, time and
+memory guards cover the added preparation path.
+
+Candidate 12 corrects native PDF subsets above 50 pages: copy only selected
+PDF pages instead of handing the entire original to the reader. No page-image
+rendering is introduced. Large whole-native-document jobs keep direct handoff;
+the protected fallback described here is superseded by candidate 13.
+
+Candidate 11 fixes print-range number editing: select-all on focus/click,
+empty drafts during editing and validation on blur/Print. Viewer shortcuts
+yield to editable controls, including the zero key. Background page changes
+no longer reset the selected print mode or range. Both PDF flows are covered.
+
+Candidate 10 hands print selections over 50 pages to the unchanged original,
+when available, without image-PDF preparation. Smaller selections are unchanged.
+Rendered imports retain originals without changing viewer mode; older entries
+can attach their exact source using SHA-256 verification. The text-viewer toolbar
+adds an availability-gated Download original PDF icon. Original bytes, filenames,
+permissions, backup safety and candidate-9 fallback hardening are preserved.
+
+Candidate 9 isolates rendered-print preparation in a dedicated child process.
+Ready now requires a clean exit after PDF validation; successful jobs are not
+forcibly terminated. Failure/cancel/timeout cleanup waits for confirmed exit.
+Persistent phase, progress, memory, native-stderr and exit diagnostics support
+recovery investigations. Active preparation holds off idle shutdown. The
+candidate-8 lossless optimization and earlier dialog/updater safeguards remain.
+Candidate 9 passed two reported ARM64 full-manual attempts; candidate 10 still
+needs native Windows field testing. Updates remain disabled.
+
+Candidate 8 accelerates rendered-PDF preparation with guarded native pixel
+access and grouped lossless RGB packing. Unsupported native layouts/access
+fall back to the previous conversion. Compression, resolution, page order,
+completion checks and print cleanup remain unchanged. The 724-page app-level
+test completed in 68.7 seconds with a byte-identical output PDF; laptop
+performance still needs validation. Both architectures remain local-test only.
+
+Candidate 7 moves both PDF preparation flows into an in-app dialog that remains
+open after the reader handoff. Done/Close/Escape release job-owned resources
+without touching library documents, downloaded copies or closing the reader.
+Active transfers and file locks defer deletion with retry. Retained selections
+use PDF handoff even for small ranges, with permission protections preserved.
+Browser-neutral controls target Chrome, Edge and Firefox on x64/ARM64; Windows
+field acceptance remains pending. The 724-page sandbox rerun passes in 85.3
+seconds with the same 642 MiB image-PDF output, not a size/speed optimization.
+
+Candidate 6 removes the redundant browser confirmation before both PDF print
+flows. Current page, ranges and All pages go directly to preparation/preview,
+preserving selection, safeguards and explicit reader/printing choices.
+This focused change does not reduce PDF size or browser loading time.
+
+Candidate 5 replaces whole-manual HTML image printing with sequential,
+lossless temporary-PDF preparation in a worker. Complete-page verification,
+progress, cancel/retry, bounded output, timeouts and explicit Chrome/download/
+PC-reader handoff prevent incomplete jobs being labelled ready. The 724-page
+test manual completes in 92 seconds; Windows preview acceptance is pending.
+Stored library images and retained-PDF printing are unchanged.
+
+Candidate 4 isolates fallback PDF drawing/WebP encoding in a dedicated worker
+while preserving the serial queue, 240 DPI/q88 images and parent database writes.
+Worker deadlines, failure recovery and deletion cancellation prevent stuck or
+late render jobs. Full-manual testing reduced active-render PDF delivery from
+37.9 seconds to 0.7 seconds with byte-identical rendered images. The sandbox
+gate passes; Windows active-render acceptance remains pending.
+
+Candidate 3 removes the 20-page retained-PDF print cap. Large jobs use PDF
+handoff rather than full-manual raster images; protected ranges preserve the
+original and show explicit range instructions. In-app preparation warns at
+one minute and stops at two minutes, offering the PC PDF app only on request.
+Rendered-page printing was unchanged in candidate 3. The active-render responsiveness
+test reproduced a 37.9-second PDF delivery delay, addressed by candidate 4.
+
+Candidate 2 adds explicit rendered-page fallback for eligible copy-restricted
+PDFs, with a storage/preparation warning and legacy searchable-text behavior.
+The supplied 724-page manual renders fully; extracted text matches v1.2.8.
+Normal startup now records bounded persistent upload and console logs, with
+per-file correlation and diagnostics inclusion. The separate test library is
+preserved; no publication, updates, migration or automatic reset is enabled.
+Candidate 3 extends retained-PDF printing without changing fallback storage.
+
+Integrated tested PDF Prototype 0.4 into the v1.2.8 source baseline. New PDFs
+retain original bytes, searchable embedded text and page geometry; bounded
+in-memory rendering replaces permanent page-image generation for new imports.
+Added compact PDF print preview, original-file download/open, selected-section
+copy/print and a library-storage breakdown. Existing image-based PDFs and
+DOCX/RTF workflows remain supported without automatic migration. Backup/restore
+verifies retained originals. The v1.2.8 updater implementation is preserved.
+
+Matching x64/ARM64 candidates use a separate test library and port 5101.
+Updates and production shortcut setup are disabled; nothing was published.
+A separate, explicitly confirmed reset BAT preserves a verified backup and
+the complete old folder before starting fresh. No existing user data was reset.
+The current verification report records candidate-7 regression coverage;
+npm audit reports zero findings. Fourteen pre-existing TypeScript
+diagnostics remain. Native Windows acceptance and publication are pending.
+
+## v1.2.8 (field-test candidate, September 18, 2026)
+
+Architecture-aware automatic package selection and asset-bound checksums;
+download/preflight before server shutdown; verified managed-file recovery and
+restart attempts after failed replacement; real progress/error reporting instead
+of a premature disconnect countdown. Manual download links now open the release
+page. Existing ARM64 installations must use the matching local ZIP once to
+install this updater. PDF rendering and browser-heartbeat policy are unchanged.
+Publication awaits Windows field-test approval.
+
 Consolidated history of functional releases, newest first. Each entry summarizes
 what changed for someone using the application; the full per-version release
 notes live alongside this file in `docs/`.

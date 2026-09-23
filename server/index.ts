@@ -18,6 +18,8 @@ import { bootState, envSnapshot, logRotate, withPhase } from "./boot";
 import { logInstallLocationAtBoot } from "./install-location";
 import { appendBackupLogSessionStart } from "./backup-log";
 import { IdleWatchdog } from "./idle-watchdog";
+import { isRenderedPrintBusy } from "./rendered-print";
+import {isPdfCompatibilityBusy} from "./pdf-compat";
 import {
   getRenderQueueSnapshot,
   reconcilePersistedRenderStatuses,
@@ -30,6 +32,13 @@ import { APP_VERSION } from "../client/src/version";
 
 const app = express();
 const httpServer = createServer(app);
+app.use((req, res, next) => {
+  if (process.env.APD_LOCAL_TEST === "1" &&
+      (/^\/api\/(?:updater|update)(?:\/|$)/.test(req.path))) {
+    return res.status(403).json({ message: "Updates are disabled in this local-test candidate." });
+  }
+  next();
+});
 
 declare module "http" {
   interface IncomingMessage {
@@ -181,12 +190,13 @@ if (process.env.RAG_NO_IDLE_SHUTDOWN !== "1") {
       // state injected). Backoff log is emitted at most once per busy state
       // to keep server.log readable across long-lived queues.
       const snap = getRenderQueueSnapshot();
-      const busy = snap.running || snap.queue_depth > 0;
+      const printing = isRenderedPrintBusy();
+      const busy = snap.running || snap.queue_depth > 0 || printing || isPdfCompatibilityBusy();
       if (busy) {
         if (!renderBusyHoldLogged) {
           const inFlight = (snap.running ? 1 : 0) + snap.queue_depth;
           log(
-            `idle shutdown held: ${inFlight} document${inFlight === 1 ? "" : "s"} still rendering; will retry on next tick`,
+            `idle shutdown held: ${inFlight} document${inFlight === 1 ? "" : "s"} still rendering${printing ? "; print preparation active" : ""}; will retry on next tick`,
           );
           renderBusyHoldLogged = true;
         }

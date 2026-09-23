@@ -21,7 +21,8 @@
 // hundreds of MB with page renders.
 
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { copyFileSync } from "node:fs";
+import { copyFileSync, lstatSync, openSync, readSync, closeSync, readFileSync, constants } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join, resolve, basename } from "node:path";
 import { tmpdir } from "node:os";
 import { pipeline } from "node:stream/promises";
@@ -353,6 +354,9 @@ export function currentBackupRawSize(): {
   db_bytes: number;
   pages_bytes: number;
   pages_file_count: number;
+  original_bytes: number;
+  wal_bytes: number;
+  shm_bytes: number;
 } {
   let db_bytes = 0;
   try {
@@ -361,10 +365,14 @@ export function currentBackupRawSize(): {
     }
   } catch { /* ignore */ }
   const pagesInfo = directorySize(getPagesDirForBackup());
+  const size = (p:string) => {try {return statSync(p).size;} catch {return 0;}};
   return {
     db_bytes,
     pages_bytes: pagesInfo.bytes,
     pages_file_count: pagesInfo.files,
+    original_bytes: directorySize(getOriginalsDir()).bytes,
+    wal_bytes: size(`${DB_FILE_PATH}-wal`),
+    shm_bytes: size(`${DB_FILE_PATH}-shm`),
   };
 }
 
@@ -554,6 +562,36 @@ export function cleanupStaged(staged: StagedImport): void {
   try { rmSync(staged.dir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
+/** Retained PDFs are required library data, not a disposable render cache.
+ * Check them before restoring or allowing backup retention to prune archives.
+ * Older image-only databases need no originals and remain compatible.
+ */
+export function verifyRetainedPdfs(dbPath: string, originalsDir: string): Map<string,string> {
+  const db = new Database(dbPath, {readonly:true, fileMustExist:true});
+  const hashes = new Map<string,string>();
+  try {
+    const columns = db.prepare("PRAGMA table_info(documents)").all() as {name:string}[];
+    if (!columns.some(c=>c.name==="original_ext")) return hashes;
+    const docs = db.prepare("SELECT id FROM documents WHERE original_ext='pdf'").all() as {id:string}[];
+    for (const {id} of docs) {
+      if (!/^[A-Za-z0-9_-]+$/.test(id) || !originalsDir) throw Error("Backup is missing a required retained PDF.");
+      const file = join(originalsDir, `${id}.pdf`);
+      const st = lstatSync(file);
+      if (!st.isFile() || st.isSymbolicLink()) throw Error("Invalid retained PDF in backup.");
+      const fd = openSync(file,"r");
+      const hash = createHash("sha256");
+      try {
+        const buffer = Buffer.alloc(1024*1024);
+        let bytes = readSync(fd,buffer,0,buffer.length,null);
+        if (!bytes || !buffer.subarray(0,Math.min(bytes,1024)).includes(Buffer.from("%PDF-"))) throw Error("Invalid retained PDF header.");
+        do { hash.update(buffer.subarray(0,bytes)); bytes=readSync(fd,buffer,0,buffer.length,null); } while(bytes);
+      } finally { closeSync(fd); }
+      hashes.set(id,hash.digest("hex"));
+    }
+    return hashes;
+  } finally {db.close();}
+}
+
 /**
  * Wipe-and-Replace: current DB and pages/ are renamed to .bak-<ts>, then
  * the staged copies are moved into place. Callers should have already
@@ -676,6 +714,7 @@ export async function verifyBackupArchiveFile(zipPath: string): Promise<VerifyRe
   let staged: StagedImport | null = null;
   try {
     staged = await stageImport(zipPath);
+    verifyRetainedPdfs(staged.dbPath, staged.originalsDir);
     return verifyDatabaseFile(staged.dbPath, staged.manifest);
   } catch (err) {
     return {
@@ -694,6 +733,7 @@ export async function verifyBackupArchiveFile(zipPath: string): Promise<VerifyRe
 
 export function importWipeReplace(staged: StagedImport): { bak_dir: string; verified: VerifyResult } {
   if (!staged.dbPath) throw new Error("Backup is missing db/data.db");
+  const incomingPdfs = verifyRetainedPdfs(staged.dbPath, staged.originalsDir);
 
   const dataDir = getDataDirForBackup();
   const currentDb = DB_FILE_PATH;
@@ -724,6 +764,10 @@ export function importWipeReplace(staged: StagedImport): { bak_dir: string; veri
     if (staged.originalsDir) copyDirRecursive(staged.originalsDir, join(newDir, "originals"));
 
     const assembled = verifyDatabaseFile(newDb, staged.manifest ?? null);
+    const assembledPdfs = verifyRetainedPdfs(newDb, join(newDir,"originals"));
+    for (const [id,hash] of incomingPdfs) {
+      if (assembledPdfs.get(id)!==hash) throw Error("Retained PDF did not copy intact.");
+    }
     const assembledPages = countFiles(join(newDir, "pages"));
     if (!assembled.ok) {
       throw new Error(
@@ -842,6 +886,7 @@ export function importWipeReplace(staged: StagedImport): { bak_dir: string; veri
  */
 export function importMerge(staged: StagedImport): { documents_imported: number; chunks_imported: number; pages_files_copied: number; snapshot: string | null } {
   if (!staged.dbPath) throw new Error("Backup is missing db/data.db");
+  verifyRetainedPdfs(staged.dbPath, staged.originalsDir);
 
   // v1.0.12.3 - verify before attaching. A corrupt backup attached to the
   // live connection can fail mid-transaction, and a merge writes directly
@@ -974,30 +1019,28 @@ export function importMerge(staged: StagedImport): { documents_imported: number;
           ins.run(...vals);
         }
       }
+      // Retained originals must be copied before the row transaction commits.
+      // Never overwrite an existing file, including an orphan from an earlier
+      // failed restore. A failure rolls back the rows rather than reporting a
+      // successful merge with missing PDF bytes.
+      if (staged.originalsDir && existsSync(staged.originalsDir)) {
+        const liveOriginals=getOriginalsDir();
+        ensureDir(liveOriginals);
+        for (const entry of readdirSync(staged.originalsDir,{withFileTypes:true})) {
+          const m=/^([A-Za-z0-9_-]+)\.([A-Za-z0-9]+)$/.exec(entry.name);
+          if (!entry.isFile() || !m || !importedDocIds.has(m[1])) continue;
+          const src=join(staged.originalsDir,entry.name), dst=join(liveOriginals,entry.name);
+          const sourceHash=createHash("sha256").update(readFileSync(src)).digest("hex");
+          if (!existsSync(dst)) copyFileSync(src,dst,constants.COPYFILE_EXCL);
+          if (lstatSync(dst).isSymbolicLink() ||
+              createHash("sha256").update(readFileSync(dst)).digest("hex")!==sourceHash)
+            throw Error("Retained original copy failed verification; merge rows were not committed.");
+        }
+      }
     });
     tx();
   } finally {
     try { rawDb.exec("DETACH DATABASE bkp"); } catch { /* ignore */ }
-  }
-
-  // 5. Copy retained originals ONLY for docs we just imported. Docs
-  //    that already existed on live keep their own original file.
-  if (staged.originalsDir && existsSync(staged.originalsDir)) {
-    const liveOriginals = getOriginalsDir();
-    ensureDir(liveOriginals);
-    for (const entry of readdirSync(staged.originalsDir, { withFileTypes: true })) {
-      if (!entry.isFile()) continue;
-      const m = /^([^.]+)\.([A-Za-z0-9]+)$/.exec(entry.name);
-      if (!m) continue;
-      const srcDocId = m[1];
-      const ext = m[2];
-      if (!importedDocIds.has(srcDocId)) continue;
-      const s = join(staged.originalsDir, entry.name);
-      const d = join(liveOriginals, `${srcDocId}.${ext}`);
-      try {
-        copyFileSync(s, d);
-      } catch { /* skip individual failures */ }
-    }
   }
 
   // 6. Copy page images ONLY for docs we just imported. Same rule.

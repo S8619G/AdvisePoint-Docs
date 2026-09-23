@@ -15,6 +15,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { UpdateCheck, cmpVersion, type LatestRelease } from "@/lib/updateCheck";
+import { LOCAL_TEST } from "@/build-mode";
 
 // Manual "Check for updates" panel, mounted under Settings.
 //
@@ -113,7 +114,7 @@ async function launchInAppUpdater(): Promise<LaunchResult> {
 type LaunchState =
   | { phase: "idle" }
   | { phase: "launching" }
-  | { phase: "launched"; secondsLeft: number }
+  | { phase: "launched"; startedAt: number }
   | { phase: "failed"; message: string; kind: LaunchResult["kind"] };
 
 // v1.0.9: last-attempt sentinel diagnostic. Reads the .updating sentinel state
@@ -149,59 +150,23 @@ async function clearLastAttempt(): Promise<boolean> {
 }
 
 export function UpdateCheckPanel() {
+  return LOCAL_TEST ? (
+    <Card data-testid="local-test-update-notice">
+      <CardHeader><CardTitle>v1.3.0 local-test candidate</CardTitle>
+        <CardDescription>Update checks and installation are disabled. This test library is separate from your working installation.</CardDescription>
+      </CardHeader>
+    </Card>
+  ) : <EnabledUpdateCheckPanel />;
+}
+
+function EnabledUpdateCheckPanel() {
   const [status, setStatus] = useState<Status>("idle");
   const [release, setRelease] = useState<LatestRelease | null>(null);
   const [lastCheckedMs, setLastCheckedMs] = useState<number | null>(readCachedFetchTime());
   const [launch, setLaunch] = useState<LaunchState>({ phase: "idle" });
   const [lastAttempt, setLastAttempt] = useState<LastAttempt | null>(null);
   const [dismissedAttempt, setDismissedAttempt] = useState(false);
-
-  // After the launcher .bat spawns, updater.cjs takes ~10 s to acquire the
-  // release list and post the shutdown handshake. We show a visible countdown
-  // to reassure the user something is happening. When it hits zero, the
-  // BackendDownOverlay will already be showing because the server has died.
-  useEffect(() => {
-    if (launch.phase !== "launched") return;
-    if (launch.secondsLeft <= 0) return;
-    const t = setTimeout(() => {
-      setLaunch((prev) =>
-        prev.phase === "launched" ? { phase: "launched", secondsLeft: prev.secondsLeft - 1 } : prev,
-      );
-    }, 1000);
-    return () => clearTimeout(t);
-  }, [launch]);
-
-  // v0.9.36.1: launch verification. The server returns 200 as soon as it
-  // successfully calls spawn(), but on Windows the spawned .bat can still
-  // fail at the OS layer (e.g. the pre-v0.9.36.1 quoting bug where
-  // `start` couldn't parse the launcher path with spaces in it). In that
-  // case the server stays alive, no updater window appears, and the user
-  // is left staring at a fake countdown. Detect this by polling /api/health
-  // 20 s after "launched" — by then updater.cjs should have released the
-  // port. If the server is still responsive, treat the launch as failed
-  // and surface the manual-download fallback with an actionable message.
-  useEffect(() => {
-    if (launch.phase !== "launched") return;
-    if (launch.secondsLeft > 0) return;
-    const t = setTimeout(async () => {
-      try {
-        const res = await fetch("/api/health", { cache: "no-store" });
-        if (!res.ok) return; // server dying — updater is doing its thing
-        // Server is still alive after the countdown. Launch never took effect.
-        setLaunch({
-          phase: "failed",
-          kind: "error",
-          message:
-            "The updater didn't start. Close this app manually, then use Download below to install v" +
-            (release?.tag?.replace(/^v/, "") ?? "the latest release") +
-            " by extracting the zip on top of your current install folder.",
-        });
-      } catch {
-        // Fetch threw — server likely dead as expected.
-      }
-    }, 15000);
-    return () => clearTimeout(t);
-  }, [launch, release]);
+  const [updateProgress, setUpdateProgress] = useState("Preparing and validating the update…");
 
   // v1.1.7: pre-upgrade render-busy warning. The render queue lives in RAM,
   // so restarting the app while it is working abandons queued and in-progress
@@ -216,7 +181,8 @@ export function UpdateCheckPanel() {
     setLaunch({ phase: "launching" });
     const result = await launchInAppUpdater();
     if (result.kind === "ok") {
-      setLaunch({ phase: "launched", secondsLeft: 5 });
+      setUpdateProgress("Preparing and validating the update…");
+      setLaunch({ phase: "launched", startedAt: Date.now() });
     } else if (result.kind === "missing") {
       setLaunch({
         phase: "failed",
@@ -310,7 +276,7 @@ export function UpdateCheckPanel() {
         size: number;
       }
     | { phase: "launching" }
-    | { phase: "launched"; secondsLeft: number }
+    | { phase: "launched"; startedAt: number }
     | { phase: "error"; message: string };
 
   const [localZip, setLocalZip] = useState<LocalZipState>({ phase: "idle" });
@@ -385,7 +351,8 @@ export function UpdateCheckPanel() {
         });
         return;
       }
-      setLocalZip({ phase: "launched", secondsLeft: 5 });
+      setUpdateProgress("Preparing and validating the update…");
+      setLocalZip({ phase: "launched", startedAt: Date.now() });
     } catch (err) {
       setLocalZip({
         phase: "error",
@@ -394,17 +361,48 @@ export function UpdateCheckPanel() {
     }
   }, [localZip]);
 
-  // Reuse the same countdown pattern the online-update path uses.
+  // The server intentionally remains alive throughout download/preflight.
+  // Poll real updater status instead of treating a live server as a failure.
   useEffect(() => {
-    if (localZip.phase !== "launched") return;
-    if (localZip.secondsLeft <= 0) return;
-    const t = setTimeout(() => {
-      setLocalZip((prev) =>
-        prev.phase === "launched" ? { phase: "launched", secondsLeft: prev.secondsLeft - 1 } : prev,
-      );
-    }, 1000);
-    return () => clearTimeout(t);
-  }, [localZip]);
+    const active = launch.phase === "launched" ? launch : localZip.phase === "launched" ? localZip : null;
+    if (!active) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        const res = await fetch("/api/updater/status", { cache: "no-store" });
+        if (res.ok) {
+          const data = await res.json();
+          if (cancelled) return;
+          if (data.startedAt >= active.startedAt - 5000) {
+            setUpdateProgress(data.message || "Update in progress…");
+            if (data.phase === "failed") {
+              if (launch.phase === "launched") setLaunch({ phase: "failed", kind: "error", message: data.message });
+              else setLocalZip({ phase: "error", message: data.message });
+              return;
+            }
+            if (data.phase === "complete") {
+              setLaunch({ phase: "idle" });
+              setLocalZip({ phase: "idle" });
+              setStatus("idle");
+              return;
+            }
+          } else if (Date.now() - active.startedAt > 60000) {
+            // No updater status is different from a slow but active download.
+            const message = "No update progress was received. Check the updater log before trying again; do not extract files over a running installation.";
+            if (launch.phase === "launched") setLaunch({ phase: "failed", kind: "error", message });
+            else setLocalZip({ phase: "error", message });
+            return;
+          }
+        }
+      } catch {
+        if (!cancelled) setUpdateProgress("The application is restarting. Waiting for it to reconnect…");
+      }
+      if (!cancelled) timer = setTimeout(poll, 2000);
+    };
+    void poll();
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [launch, localZip]);
 
   const onCheck = useCallback(async () => {
     setStatus("checking");
@@ -576,7 +574,7 @@ export function UpdateCheckPanel() {
                 ) : launch.phase === "launched" ? (
                   <>
                     <Loader2 className="h-3 w-3 animate-spin" />
-                    Closing in {launch.secondsLeft}s…
+                    Update in progress…
                   </>
                 ) : (
                   <>
@@ -585,7 +583,7 @@ export function UpdateCheckPanel() {
                 )}
               </Button>
               <a
-                href={release.zipUrl || release.htmlUrl}
+                href={release.htmlUrl}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-1 rounded px-2 py-1 text-[11px] hover:bg-amber-500/20"
@@ -605,9 +603,7 @@ export function UpdateCheckPanel() {
             </div>
             {launch.phase === "launched" && (
               <div className="pl-5 pt-1 text-[11px] opacity-80" data-testid="text-updater-countdown">
-                Update AdvisePoint Docs is running in a new window. This app will disconnect
-                shortly — the updater will download and swap the new build, then relaunch
-                automatically.
+                {updateProgress} The server stays available until package checks pass.
               </div>
             )}
             {launch.phase === "failed" && (
@@ -615,7 +611,7 @@ export function UpdateCheckPanel() {
                 className="pl-5 pt-1 text-[11px] text-destructive"
                 data-testid="text-updater-launch-failed"
               >
-                Couldn&apos;t start the in-app updater: {launch.message}
+                Update did not complete: {launch.message}
               </div>
             )}
           </div>
@@ -641,13 +637,13 @@ export function UpdateCheckPanel() {
             <RefreshCw className={`mr-2 h-3.5 w-3.5 ${status === "checking" ? "animate-spin" : ""}`} />
             {status === "checking" ? "Checking…" : "Check now"}
           </Button>
-          <span className="text-[11px] text-muted-foreground">
+          <span className="min-w-0 break-words text-[11px] text-muted-foreground">
             Reads {" "}
             <a
               href="https://github.com/S8619G/AdvisePoint-Docs/releases/latest"
               target="_blank"
               rel="noopener noreferrer"
-              className="underline hover:text-foreground"
+              className="break-all underline hover:text-foreground"
             >
               github.com/S8619G/AdvisePoint-Docs
             </a>
@@ -771,9 +767,7 @@ export function UpdateCheckPanel() {
               className="mt-2 rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-xs text-muted-foreground"
               data-testid="local-zip-launched"
             >
-              Update AdvisePoint Docs is running in a new window. This app will disconnect shortly—the
-              updater will swap the new build and relaunch automatically. Closing in{" "}
-              {localZip.secondsLeft}s…
+              {updateProgress} The server stays available until package checks pass.
             </div>
           )}
 

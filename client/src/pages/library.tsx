@@ -7,8 +7,9 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 // v1.2.4: `Tags` icon dropped from this import -- Manage Values moved out of
 // the Library toolbar into Settings > About (see ManageValuesPanel).
-import { Trash2, Boxes, Book, Layers, Copy, Printer, BookOpen, FileText, Pencil, ChevronDown, ChevronUp, ArrowUpDown, Search as SearchIcon, X as XIcon, Loader2, RotateCcw } from "lucide-react";
+import { Trash2, Boxes, Book, Layers, Copy, Printer, Download, BookOpen, FileText, Pencil, ChevronDown, ChevronUp, ArrowUpDown, Search as SearchIcon, X as XIcon, Loader2, RotateCcw } from "lucide-react";
 import { Highlight } from "@/lib/highlight";
+import { SelectedTextActions } from "@/components/SelectedTextActions";
 import { Input } from "@/components/ui/input";
 import { FixTitleButton } from "@/components/FixTitleButton";
 import { Textarea } from "@/components/ui/textarea";
@@ -87,6 +88,8 @@ interface Doc {
   // reads this to badge legacy DOCX rows with a "Re-upload to view"
   // affordance so users know why the rich viewer isn't available.
   original_ext?: string | null;
+  has_original_pdf?: boolean;
+  pdf_prepared?: boolean;
 }
 
 export default function Library() {
@@ -1341,7 +1344,9 @@ function DocSearchBar({
 }
 
 function DocDetail({ id }: { id: string }) {
-  const { data, isLoading } = useQuery<{ document: Doc; chunks: any[] }>({ queryKey: ["/api/documents", id] });
+  const { data, isLoading } = useQuery<{ document: Doc; chunks: any[] }>({
+    queryKey: ["/api/documents", id], staleTime: 0, refetchOnWindowFocus: true,
+  });
   const qc = useQueryClient();
   const { toast } = useToast();
   // v0.9.36: pull the doc-type registry so we can render the accent dot
@@ -1528,14 +1533,14 @@ function DocDetail({ id }: { id: string }) {
                 <AlertDialogTitle>Delete this document?</AlertDialogTitle>
                 <AlertDialogDescription asChild>
                   <div className="space-y-2">
-                    <p>This will permanently remove:</p>
+                    <p>This will remove the following from the active library:</p>
                     <ul className="list-disc pl-5 space-y-1">
                       <li>The document file and its extracted text</li>
                       <li>All rendered pages and thumbnails</li>
                       <li>Search index entries (this document will no longer appear in Query results)</li>
                       <li>Any document-specific settings (Product Model, Document Type, custom metadata)</li>
                     </ul>
-                    <p className="font-semibold text-destructive">This action cannot be undone.</p>
+                    <p>You can restore this document in Settings → Backup/Restore → Removed documents. Manually removed documents are kept until you permanently delete them there; scheduled backup retention does not expire them.</p>
                   </div>
                 </AlertDialogDescription>
               </AlertDialogHeader>
@@ -1657,6 +1662,9 @@ function DocDetail({ id }: { id: string }) {
                   : undefined
               }
               highlightQuery={docSearchQuery}
+              originalPdfUrl={data.document.has_original_pdf
+                ? `/api/documents/${encodeURIComponent(id)}/original?download=1` : undefined}
+              pdfPrepared={data.document.pdf_prepared}
             />
           )}
         </div>
@@ -1746,7 +1754,10 @@ function DocDetail({ id }: { id: string }) {
       )}
       <PageViewerDialog
         open={pageViewerOpen}
-        onOpenChange={setPageViewerOpen}
+        onOpenChange={(open) => {
+          setPageViewerOpen(open);
+          if (!open) void qc.invalidateQueries({queryKey:["/api/documents", id]});
+        }}
         documentId={data.document.id}
         documentTitle={data.document.title}
         documentTitleColor={data.document.title_color ?? null}
@@ -1855,6 +1866,8 @@ function SectionPane({
   onPrev,
   onNext,
   onViewPages,
+  originalPdfUrl,
+  pdfPrepared,
   highlightQuery,
 }: {
   section: { title: string; page_start: number | null; page_end: number | null; chunks: any[] };
@@ -1865,6 +1878,8 @@ function SectionPane({
   onPrev?: () => void;
   onNext?: () => void;
   onViewPages?: () => void;
+  originalPdfUrl?: string;
+  pdfPrepared?: boolean;
   // v0.9.28: raw query string from the in-document search bar. When present,
   // matching terms in the section body are wrapped in <mark> so the user
   // sees the exact text the results panel is drawing from.
@@ -1982,6 +1997,18 @@ function SectionPane({
                   <TooltipContent side="top">View original pages</TooltipContent>
                 </Tooltip>
               )}
+              {originalPdfUrl && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <a href={originalPdfUrl} download
+                      className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      data-testid="button-download-original-pdf" aria-label={pdfPrepared ? "Download compatible PDF" : "Download original PDF"}>
+                      <Download className="h-4 w-4" aria-hidden="true" />
+                    </a>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">{pdfPrepared ? "Download compatible PDF" : "Download original PDF"}</TooltipContent>
+                </Tooltip>
+              )}
             </div>
           </TooltipProvider>
         </div>
@@ -1998,11 +2025,13 @@ function SectionPane({
             className="mx-auto max-w-[68ch] whitespace-pre-wrap text-[13.5px] leading-[1.7] text-foreground"
             data-testid="text-section-body"
           >
+            <SelectedTextActions title={manualTitle} citation={citation}>
             {highlightQuery && highlightQuery.length > 0 ? (
               <Highlight text={body} query={highlightQuery} />
             ) : (
               body
             )}
+            </SelectedTextActions>
           </div>
           <div className="mx-auto mt-6 flex max-w-[68ch] items-center justify-between gap-3 border-t border-border/60 pt-4 text-xs text-muted-foreground">
             <button

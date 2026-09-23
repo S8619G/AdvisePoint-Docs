@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 
 export type ExtractResult = {
+  pages?: {page_number:number;width:number;height:number}[];
   text: string;
   page_count: number | null;
   format: "pdf" | "docx" | "text" | "markdown";
@@ -90,14 +91,14 @@ const pending = new Map<
 >();
 
 function attachWorker(w: Worker): void {
-  w.on("message", (msg: { id: string; ok: boolean; result?: ExtractResult; error?: string }) => {
+  w.on("message", (msg: { id: string; ok: boolean; result?: ExtractResult; error?: string; code?: string }) => {
     const p = pending.get(msg.id);
     if (!p) return; // stray message — ignore
     pending.delete(msg.id);
     if (msg.ok && msg.result) {
       p.resolve(msg.result);
     } else {
-      p.reject(new Error(msg.error ?? "unknown extraction error"));
+      p.reject(Object.assign(new Error(msg.error ?? "unknown extraction error"), {code:msg.code}));
     }
   });
 
@@ -141,6 +142,7 @@ function ensureWorker(): Worker {
 export function extractTextFromFile(
   filename: string,
   buffer: Buffer,
+  renderedFallback = false,
 ): Promise<ExtractResult> {
   return new Promise<ExtractResult>((resolvePromise, rejectPromise) => {
     const id = randomUUID();
@@ -156,7 +158,7 @@ export function extractTextFromFile(
 
     try {
       const w = ensureWorker();
-      w.postMessage({ id, filename, buffer: view }, [view]);
+      w.postMessage({ id, filename, buffer: view, renderedFallback }, [view]);
     } catch (err) {
       pending.delete(id);
       rejectPromise(err instanceof Error ? err : new Error(String(err)));

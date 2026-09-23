@@ -25,7 +25,8 @@ export interface DocumentTypeRegistry {
 }
 
 export function useDocumentTypes() {
-  return useQuery<DocumentTypeRegistry>({ queryKey: ["/api/document-types"] });
+  return useQuery<DocumentTypeRegistry>({ queryKey: ["/api/document-types"],
+    staleTime:0,refetchOnMount:"always",refetchOnWindowFocus:true });
 }
 
 export function documentTypeLabel(

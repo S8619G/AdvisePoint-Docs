@@ -49,6 +49,8 @@ import { useViewerPrefs } from "@/lib/viewer-prefs";
 import { DocxViewerDialog } from "./DocxViewer";
 import { DocumentFileNameWithBadge } from "./DocumentFormatBadge";
 import { ContinuousPdfPages, type ContinuousPdfHandle } from "./ContinuousPdfPages";
+import { PdfPageSurface } from "./PdfPageSurface";
+import { PrintPreparationDialog } from "./PrintPreparationDialog";
 
 type PageInfo = {
   page_number: number;
@@ -133,6 +135,8 @@ function PdfPageViewerDialog({
   initialPage,
 }: Props) {
   const [pages, setPages] = useState<PageInfo[]>([]);
+  const [nativePdf, setNativePdf] = useState(false);
+  const [pdfPrepared,setPdfPrepared] = useState(false);
   const [status, setStatus] = useState<RenderStatus | null>(null);
   const [pageNumber, setPageNumber] = useState<number>(initialPage ?? 1);
   const [loading, setLoading] = useState(true);
@@ -205,7 +209,7 @@ function PdfPageViewerDialog({
   // getContentSize() so the smart-scroll math knows the real rendered size
   // (Readable at zoom=1 has the img bigger than the viewport, so it must
   // pan based on image height not viewport height).
-  const imgRef = useRef<HTMLImageElement | null>(null);
+  const imgRef = useRef<HTMLCanvasElement | HTMLImageElement | null>(null);
   const zoom = useZoomPan({
     enabled: true,
     wheelAction: fitMode === "readable" ? "smart" : "page",
@@ -364,6 +368,8 @@ function PdfPageViewerDialog({
       const pj = await pagesResp.json();
       const sj = await statusResp.json();
       setPages(Array.isArray(pj?.pages) ? pj.pages : []);
+      setNativePdf(pj?.viewer === "pdf-native");
+      setPdfPrepared(!!pj?.pdf_prepared);
       setStatus(sj);
       setError(null);
     } catch (e: any) {
@@ -377,6 +383,8 @@ function PdfPageViewerDialog({
     if (!open) return;
     setLoading(true);
     setPages([]);
+    setNativePdf(false);
+    setPdfPrepared(false);
     setStatus(null);
     setError(null);
     setPageNumber(initialPage ?? 1);
@@ -486,7 +494,8 @@ function PdfPageViewerDialog({
       // (Escape closes the panel below; nav keys go to result list handlers.)
       const active = document.activeElement as HTMLElement | null;
       const inSearchInput = active === searchInputRef.current;
-      if (inSearchInput) return;
+      // Number fields need 0 and arrow keys for editing, not zoom/navigation.
+      if (inSearchInput || active?.matches("input, textarea, select") || active?.isContentEditable) return;
 
       // Escape closes search panel when open; otherwise let the dialog close.
       if (e.key === "Escape") {
@@ -584,107 +593,46 @@ function PdfPageViewerDialog({
   // Print dialog state (unchanged from v0.9.17)
   // ------------------------------------------------------------------
   const [printOpen, setPrintOpen] = useState(false);
+  const [preparationUrl, setPreparationUrl] = useState<string|null>(null);
+  const [printCleanupNotice, setPrintCleanupNotice] = useState("");
+  useEffect(()=>{if(!open)setPreparationUrl(null);},[open]);
   // v1.1.0: "all" added so printing a whole document is one click instead of
   // switching to Range and hand-typing 1..totalPages.
   const [printMode, setPrintMode] = useState<"current" | "all" | "range">("current");
-  const [printFrom, setPrintFrom] = useState<number>(1);
-  const [printTo, setPrintTo] = useState<number>(1);
-
-  useEffect(() => {
-    if (printOpen) {
-      setPrintMode("current");
-      setPrintFrom(pageNumber);
-      setPrintTo(pageNumber);
-    }
-  }, [printOpen, pageNumber]);
+  // Keep editable drafts, just like page jump: clearing a number must not
+  // immediately insert 1 and fight the next keystroke.
+  const [printFrom, setPrintFrom] = useState("1");
+  const [printTo, setPrintTo] = useState("1");
+  const normalizePrintPage = (draft: string) => {
+    const value = Number(draft);
+    return draft.trim() && Number.isInteger(value) && value > 0
+      ? Math.min(totalPages || value, value)
+      : pageNumber;
+  };
 
   const doPrint = () => {
-    if (!totalPages) return;
-    let from: number, to: number;
-    if (printMode === "current") {
-      from = to = pageNumber;
-    } else if (printMode === "all") {
-      // v1.1.0: whole document. The >100-page confirm below still applies, so a
-      // 500-page manual cannot silently launch a huge print job.
-      from = 1;
-      to = totalPages;
-    } else {
-      from = Math.max(1, Math.min(totalPages, printFrom | 0));
-      to = Math.max(1, Math.min(totalPages, printTo | 0));
-      if (from > to) [from, to] = [to, from];
-    }
-    const count = to - from + 1;
-    if (count > 100 && !window.confirm(`Print ${count} pages?`)) return;
-
-    const safeTitle = documentTitle.replace(/[<>]/g, "");
-    const urls: string[] = [];
-    for (let n = from; n <= to; n++) {
-      urls.push(`/api/documents/${documentId}/pages/${n}.jpg`);
-    }
-    const titleText =
-      count === 1
-        ? `${safeTitle} \u2014 Page ${from}`
-        : `${safeTitle} \u2014 Pages ${from}\u2013${to}`;
-    const imgsHtml = urls
-      .map(
-        (u, i) =>
-          `<div class="page"><img data-idx="${i}" src="${u}" alt="Page ${from + i}"></div>`
-      )
-      .join("");
-    const html = `<!doctype html><html><head><meta charset="utf-8">
-<title>${titleText}</title>
-<style>
-  @page { margin: 12mm; }
-  html, body { margin: 0; padding: 0; background: #fff; font-family: system-ui, sans-serif; }
-  .status { position: fixed; top: 0; left: 0; right: 0; padding: 8px 12px;
-            background: #fef3c7; color: #92400e; font-size: 13px; text-align: center;
-            border-bottom: 1px solid #fde68a; }
-  .page { display: flex; align-items: center; justify-content: center;
-          min-height: 100vh; page-break-after: always; }
-  .page:last-child { page-break-after: auto; }
-  img { max-width: 100%; max-height: 100vh; height: auto; width: auto; display: block; }
-  @media print {
-    .status { display: none; }
-    .page { min-height: auto; }
-  }
-</style></head><body>
-<div class="status" id="status">Loading ${count} page${count === 1 ? "" : "s"}\u2026</div>
-${imgsHtml}
-<script>
-  var imgs = Array.prototype.slice.call(document.querySelectorAll('img'));
-  var loaded = 0, total = imgs.length, printed = false;
-  var status = document.getElementById('status');
-  function tick() {
-    loaded++;
-    if (status) status.textContent = 'Loading ' + loaded + ' / ' + total + '\u2026';
-    if (loaded >= total && !printed) {
-      printed = true;
-      if (status) status.textContent = 'Ready to print.';
-      setTimeout(function(){ window.focus(); window.print(); }, 150);
-    }
-  }
-  imgs.forEach(function(img){
-    if (img.complete && img.naturalWidth > 0) tick();
-    else {
-      img.addEventListener('load', tick);
-      img.addEventListener('error', tick);
-    }
-  });
-  window.addEventListener('afterprint', function(){ window.close(); });
-<\/script></body></html>`;
-    const w = window.open("", "_blank", "width=900,height=1100");
-    if (!w) {
-      window.open(urls[0], "_blank");
-      return;
-    }
-    w.document.open();
-    w.document.write(html);
-    w.document.close();
+    if(!totalPages)return;
+    let from=printMode==="all"?1:printMode==="current"?pageNumber:normalizePrintPage(printFrom);
+    let to=printMode==="all"?totalPages:printMode==="current"?pageNumber:normalizePrintPage(printTo);
+    if(from>to)[from,to]=[to,from];
+    // Both flows go directly to preparation; opening/printing remains an explicit action there.
+    const route=nativePdf?"/api/pdf/print":"/api/rendered-print";
+    const printUrl=new URL(`${route}/${encodeURIComponent(documentId)}`,window.location.origin);
+    printUrl.searchParams.set("from",String(from));printUrl.searchParams.set("to",String(to));
+    printUrl.searchParams.set("embedded","1");printUrl.searchParams.set("job",crypto.randomUUID());
+    setPrintCleanupNotice("");setPreparationUrl(printUrl.href);
     setPrintOpen(false);
   };
 
   const handlePrintButton = () => {
     if (!currentPageRendered) return;
+    // Initialize only when opening, not when continuous-view page tracking
+    // changes behind the menu while the user is editing a range.
+    if (!printOpen) {
+      setPrintMode("current");
+      setPrintFrom(String(pageNumber));
+      setPrintTo(String(pageNumber));
+    }
     setPrintOpen((v) => !v);
   };
 
@@ -750,7 +698,7 @@ ${imgsHtml}
                 documentId={documentId} pages={pages} totalPages={totalPages}
                 initialPage={pageNumber} zoomed={stackZoomed}
                 onZoom={setStackZoomed} onPageChange={setPageNumber}
-                renderStatus={status?.status ?? "pending"} />
+                renderStatus={status?.status ?? "pending"} nativePdf={nativePdf} />
             )}
             {!loading && !error && !continuousFit && (
               <div
@@ -772,14 +720,13 @@ ${imgsHtml}
                         <Loader2 className="h-5 w-5 animate-spin" />
                       </div>
                     )}
-                    <img
+                    <PdfPageSurface
+                      nativePdf={nativePdf}
                       key={pageNumber}
                       ref={imgRef}
-                      src={`/api/documents/${documentId}/pages/${pageNumber}.jpg`}
-                      alt={`Page ${pageNumber}`}
-                      loading="lazy"
-                      draggable={false}
-                      onLoad={() => {
+                      documentId={documentId}
+                      page={pageNumber}
+                      onReady={() => {
                         setImgLoading(false);
                         // v0.9.27 - Land at the requested edge once the new
                         // image has real dimensions. landAtRef is set by the
@@ -798,14 +745,13 @@ ${imgsHtml}
                           });
                         }
                       }}
-                      onError={() => setImgLoading(false)}
                       className={
                         fitMode === "fit"
                           ? "max-w-full max-h-full h-auto w-auto shadow-md bg-white will-change-transform"
                           : "max-w-full h-auto shadow-md bg-white will-change-transform"
                       }
-                      width={currentPageInfo?.width}
-                      height={currentPageInfo?.height}
+                      width={currentPageInfo?.width ?? 1200}
+                      height={currentPageInfo?.height ?? 1600}
                       style={{
                         aspectRatio: currentPageInfo ? `${currentPageInfo.width} / ${currentPageInfo.height}` : undefined,
                         transform: zoom.transform,
@@ -819,7 +765,6 @@ ${imgsHtml}
                         // get from image-rendering: pixelated.
                         imageRendering: "-webkit-optimize-contrast",
                       }}
-                      data-testid={`img-page-${pageNumber}`}
                     />
                   </>
                 ) : status?.status === "missing" ? (
@@ -946,7 +891,7 @@ ${imgsHtml}
         </div>
 
         {/* Footer */}
-        <div className="shrink-0 border-t border-border px-5 py-3 flex items-center justify-between gap-3 bg-background">
+        <div className="shrink-0 border-t border-border px-5 py-3 flex flex-wrap items-center justify-between gap-3 bg-background">
           <button
             type="button"
             onClick={goPrev}
@@ -956,7 +901,7 @@ ${imgsHtml}
           >
             <ChevronLeft className="h-3.5 w-3.5" /> Previous
           </button>
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <div className="order-last w-full min-w-0 flex flex-wrap items-center justify-center gap-2 text-xs text-muted-foreground md:order-none md:w-auto md:flex-1">
             {/* v0.9.18: zoom cluster */}
             <div className="flex items-center gap-1 mr-2 pr-2 border-r border-border/60" data-testid="zoom-toolbar">
               <button
@@ -1096,6 +1041,21 @@ ${imgsHtml}
               <SearchIcon className="h-3.5 w-3.5" /> Search
             </button>
             {/* Print button with popover (unchanged) */}
+            {nativePdf && <button type="button" data-testid="button-open-original-pdf"
+              className="inline-flex items-center rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent"
+              title="Open a temporary copy in the Windows default PDF app; the retained original is unchanged."
+              onClick={async(e)=>{
+                const button=e.currentTarget;button.disabled=true;
+                try{
+                  const r=await fetch(`/api/pdf/open-original/${encodeURIComponent(documentId)}`,{
+                    method:"POST",headers:{"X-APD-PDF-Action":"open-original"}});
+                  if(!r.ok){
+                    const data=await r.json();
+                    throw new Error(data.message || "Could not open the PDF app.");
+                  }
+                }catch{alert("Could not open the PDF app. Use the print preview's Download original PDF option instead.");}
+                finally{button.disabled=false;}
+              }}>{pdfPrepared ? "Open compatible PDF" : "Open original PDF"}</button>}
             <div className="relative ml-1">
               <button
                 type="button"
@@ -1161,7 +1121,12 @@ ${imgsHtml}
                       min={1}
                       max={totalPages || undefined}
                       value={printFrom}
-                      onChange={(e) => setPrintFrom(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                      aria-label="From page"
+                      disabled={printMode !== "range"}
+                      onFocus={(e) => e.currentTarget.select()}
+                      onClick={(e) => e.currentTarget.select()}
+                      onChange={(e) => setPrintFrom(e.target.value)}
+                      onBlur={() => setPrintFrom(String(normalizePrintPage(printFrom)))}
                       className="w-16 rounded-md border border-border bg-background px-2 py-1 text-xs tabular-nums outline-none focus:ring-1 focus:ring-primary/30"
                       data-testid="input-print-from"
                     />
@@ -1171,7 +1136,12 @@ ${imgsHtml}
                       min={1}
                       max={totalPages || undefined}
                       value={printTo}
-                      onChange={(e) => setPrintTo(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                      aria-label="To page"
+                      disabled={printMode !== "range"}
+                      onFocus={(e) => e.currentTarget.select()}
+                      onClick={(e) => e.currentTarget.select()}
+                      onChange={(e) => setPrintTo(e.target.value)}
+                      onBlur={() => setPrintTo(String(normalizePrintPage(printTo)))}
                       className="w-16 rounded-md border border-border bg-background px-2 py-1 text-xs tabular-nums outline-none focus:ring-1 focus:ring-primary/30"
                       data-testid="input-print-to"
                     />
@@ -1179,8 +1149,9 @@ ${imgsHtml}
                   {printMode === "range" && (
                     <div className="mt-2 pl-6 text-muted-foreground">
                       {(() => {
-                        const a = Math.min(printFrom, printTo);
-                        const b = Math.max(printFrom, printTo);
+                        if (!printFrom.trim() || !printTo.trim()) return "Enter a start and end page";
+                        const a = Math.min(normalizePrintPage(printFrom), normalizePrintPage(printTo));
+                        const b = Math.max(normalizePrintPage(printFrom), normalizePrintPage(printTo));
                         const n = Math.max(0, Math.min(totalPages || b, b) - Math.max(1, a) + 1);
                         return `${n} page${n === 1 ? "" : "s"}`;
                       })()}
@@ -1217,6 +1188,8 @@ ${imgsHtml}
             Next <ChevronRight className="h-3.5 w-3.5" />
           </button>
         </div>
+        {printCleanupNotice&&<p role="status" className="px-5 py-2 text-xs text-muted-foreground">{printCleanupNotice}</p>}
+        {preparationUrl&&<PrintPreparationDialog url={preparationUrl} onDone={message=>{setPreparationUrl(null);setPrintCleanupNotice(message);}}/>}
       </DialogContent>
     </Dialog>
   );

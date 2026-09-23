@@ -57,7 +57,7 @@ export function UpdateBanner() {
             <ExternalLink className="h-3 w-3" />What's new
           </a>
           <a
-            href={release.zipUrl || release.htmlUrl}
+            href={release.htmlUrl}
             target="_blank"
             rel="noopener noreferrer"
             className="rounded bg-amber-500/20 px-2 py-1 font-medium hover:bg-amber-500/30 inline-flex items-center gap-1"

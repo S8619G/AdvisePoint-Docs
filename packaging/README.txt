@@ -1,6 +1,95 @@
 AdvisePoint Docs
 ================
 
+v1.3.1
+-------------------------
+September 23 PDF-controls revision: the whole-document print handoff has one
+Open PDF action plus Download. Successful opening in the PC PDF app no longer
+shows a pop-up message; opening failures still show an error.
+
+Eligible copy-restricted PDFs are prepared automatically by a bundled open-source
+PDF engine, without Chrome, Edge or Firefox. Import only documents you are
+authorized to use. Opening-password and no-print restrictions are not bypassed.
+After page and text validation, only the compatible PDF is retained, not two PDFs.
+The file you selected is untouched. Normal PDFs remain byte-identical.
+Conversion is bounded to 150 MiB, 2,000 pages and ten minutes. A refused conversion
+keeps an explicit rendered-page fallback where permitted; it is never automatic.
+Compatible PDFs can retain links and bookmarks, but the in-app page viewer has
+not gained link navigation or a bookmark panel. Use your PDF reader for those.
+The DEALER/DEVICE/DESIGN filename spacing issue is corrected.
+Document Type counts refresh after library changes.
+Deletion wording now explains recovery. Native PDF recovery restores page
+geometry as well as the file, including compatible-PDF provenance.
+Manually removed documents do not have a day-based expiry: restore them in
+Settings > Backup/Restore > Removed documents until permanently deleted there.
+
+This final build uses the normal working library and port 5000.
+For isolated acceptance testing, run "Start isolated v1.3.1 test.bat" instead.
+It uses port 5102 and a separate "AdvisePoint Docs v1.3.1 Test" data folder.
+It leaves production and v1.3.0 test data untouched; updates cannot run there.
+Normal update controls are restored. Extract into a new folder for first use.
+No library is automatically reset, converted or deleted.
+Protected native PDFs no longer silently open the full original for ranges.
+Unrestricted ranges copy selected PDF pages directly. Print-permitted encrypted
+PDFs produce temporary selected-page image PDFs at their allowed print quality.
+No-print files remain blocked. Stored originals are unchanged. Whole native
+manuals keep direct handoff. Choose All pages in the prepared subset's reader.
+Print-range number entry: click to select the whole number,
+clear it and type a new page. Zero and arrow keys edit fields instead of
+triggering viewer shortcuts. Background page tracking preserves the range.
+Rendered selections of 51 or more pages open the unchanged original PDF.
+Selections of 1-50 pages keep the existing preparation flow.
+New rendered imports also keep their original. Older image-only imports can
+attach their exact source file after fingerprint verification, without reimport.
+The extracted-text toolbar now has a Download original PDF icon, visible only
+when the retained original is available. It saves the intact source file.
+Both PDF print flows prepare inside the viewer, without an extra browser
+confirmation or preparation tab. The dialog stays open after reader handoff.
+Click Done after finishing in the reader: job-owned temporary files are
+released, with retry if a transfer or file lock prevents removal. Library
+documents and downloaded copies remain; the reader tab is not closed.
+Rendered-PDF preparation runs in a separate process. Ready
+requires a complete file and a clean process exit. A worker failure should
+leave the library server available for retry. Progress/exit diagnostics are
+saved automatically. Faster lossless pixel conversion is preserved.
+
+NEW IN 1.3.0
+New PDF imports retain their original PDF bytes, searchable embedded text
+and page geometry. PDF.js renders a bounded in-memory page window locally;
+there are no permanent page images for these imports. Existing image-only
+documents remain supported, untouched and unconverted.
+The compact print preview, original-PDF download and Open original PDF use
+retained-PDF viewer behavior. External-reader edits affect only a
+temporary copy, not the library. Selection copy/print and the Settings storage
+breakdown are included. Retained PDFs no longer have a 20-page printing cap.
+All in-app selections use a PDF handoff. Selections use a
+temporary PDF or the unchanged original for whole-manual printing. Click
+Open PDF to print, then use that PDF reader's Print button. Protected ranges
+prepare selected-page image PDFs when printing is permitted. If you explicitly
+open the original instead, select the original page range in that reader.
+Rendered-page printing prepares a temporary PDF one saved image at a time.
+Wait for all selected pages to be ready, then choose Open prepared PDF,
+Download, or Open in PC PDF app. Nothing prints automatically. Missing pages
+stop preparation instead of being skipped. Cancel and Prepare again recover
+from failures. A one-minute warning, ten-minute deadline and 1 GiB temporary
+output budget apply; allow 1.2 GiB free disk space. This does not change the
+library images or add OCR. Use Fit to paper for very old rendered libraries.
+PDF fallback drawing and encoding now
+run in a dedicated worker so viewer requests are not blocked by that work.
+Image quality and the one-document-at-a-time queue remain unchanged.
+Opening-password files are rejected before import. Copy-restricted PDFs that
+permit full-quality printing can be imported with an explicit rendered-page
+fallback. Its confirmation explains legacy searchable-text extraction,
+slower preparation and larger library/backup storage. This mode stores page
+images alongside the unchanged original; keep your source file. PDF permission
+settings are not changed. Scanned documents still require OCR before import.
+
+Persistent bounded upload journals record each import. Settings > Export diagnostics includes upload
+filenames, sizes, correlation IDs, stages and results; no separate diagnostic
+launcher is needed. The upload journal excludes document text and metadata.
+Review exported diagnostics before sharing. Existing documents are preserved
+unless a separately confirmed maintenance operation is performed.
+
 A local search tool for technical manuals and admin guides.
 Everything runs on your own laptop. No internet connection required
 after install.
@@ -17,8 +106,9 @@ Check these before you install so nothing surprises you later.
 
 Operating system
 
-  * Windows 10 (64-bit) or Windows 11 (64-bit) on an Intel or AMD
-    x64 processor. This build is x64 only.
+  * Use the x64 package on supported Intel or AMD 64-bit Windows
+    systems, or the ARM64 package on Windows ARM64 systems.
+    Do not mix packages or copy one architecture over the other.
 
 Disk space
 
@@ -135,11 +225,13 @@ You have two ways to install a new build:
 
   * IN-APP UPDATER (recommended for point releases)
     Open Settings > System. If a newer release is on GitHub the
-    panel shows the version and release notes. Click "Install and
-    restart" and the app fetches, verifies, and swaps in the new
-    build for you. If a background server is still running from an
-    old launch, the updater identifies it and offers to shut it
-    down cleanly first; it never touches an unrelated process that
+    panel shows the version and release notes. Click "Update now"
+    and the app chooses the package for the installed architecture.
+    It downloads, checks the selected package's SHA-256, extracts
+    and validates version and architecture BEFORE stopping the
+    server. A bad download leaves the running application available.
+    Once validation passes, it shuts down cleanly and installs.
+    It never touches an unrelated process that
     happens to use port 5000. When the swap is complete the updater
     relaunches the app automatically - no extra window to close, no
     manual restart.
@@ -156,10 +248,23 @@ You have two ways to install a new build:
 
 Whichever path you use, your database, uploaded documents, saved
 searches, and settings under %LOCALAPPDATA%\AdvisePoint Docs\ are
-never replaced. The previous application build is retained
-temporarily as dist.bak so the updater can restore it automatically
-if the swap fails. Each successful update replaces the prior
-dist.bak; backup folders do not accumulate.
+never replaced. During replacement the updater keeps a verified
+recovery copy of managed application files, including launchers,
+modules and version markers. A failed replacement restores them
+and tries to restart the previous application if it stopped it.
+If recovery cannot finish, its folder is retained and update.log
+identifies it; do not delete that folder or overlay more files.
+The existing dist.bak is also retained after successful updates.
+
+IMPORTANT WHEN INSTALLING 1.3.1 FROM AN OLDER BUILD:
+The currently installed updater performs that first upgrade.
+On ARM64, download AdvisePoint-Docs-v1.3.1-arm64.zip, leave it
+zipped, and select Settings > System > Install from a local zip.
+Click "Upgrade to v1.3.1 now" after validation. Architecture-aware
+automatic selection is present in the v1.2.8 and later updater.
+For manual downloads on either architecture, the application opens
+the release page rather than guessing which download is suitable.
+Windows field testing is required before public release.
 
 POST-RESTORE GUIDANCE (new in 1.2.3)
 
@@ -812,5 +917,5 @@ past restores.
 VERSION
 -------
 
-AdvisePoint Docs 1.2.7
+AdvisePoint Docs 1.3.1
 Bundled Node.js: 20.18.1

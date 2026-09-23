@@ -26,6 +26,21 @@ import { spawnSync } from "node:child_process";
 const REQUIRED_SOURCE_PATHS = [
   // Build tooling
   "script/build.ts",
+  "server/pdf-compat.ts",
+  "server/workers/pdf-compat.cjs",
+  "server/workers/compat-inspect.cjs",
+  "server/workers/compat-inspection-process.cjs",
+  "packaging/pdf-engine/x64/qpdf.exe",
+  "packaging/pdf-engine/arm64/qpdf.exe",
+  "packaging/pdf-engine/x64/SHA256SUMS",
+  "packaging/pdf-engine/arm64/SHA256SUMS",
+  "packaging/pdf-engine/x64/THIRD-PARTY.md",
+  "packaging/pdf-engine/arm64/THIRD-PARTY.md",
+  "packaging/test-v131.cjs",
+  "packaging/pdf-engine/x64/qpdf30.dll",
+  "packaging/pdf-engine/x64/libgcc_s_seh-1.dll",
+  "packaging/pdf-engine/x64/libstdc++-6.dll",
+  "packaging/pdf-engine/x64/libwinpthread-1.dll",
   "scripts/package-windows.mjs",
   "scripts/package-source.mjs",
   "scripts/bump-version.mjs",
@@ -40,6 +55,17 @@ const REQUIRED_SOURCE_PATHS = [
   // Runtime tree roots
   "client",
   "server",
+  "server/workers/render-worker.cjs",
+  "server/render-worker-client.ts",
+  "server/workers/rendered-print-worker.cjs",
+  "server/workers/print-pixels.cjs",
+  "server/rendered-print.ts",
+  "server/pdf-handoff.ts",
+  "client/src/pdf-handoff.ts",
+  "scripts/pdf-handoff.test.mjs",
+  "scripts/rendered-print.test.mjs",
+  "client/src/rendered-print.ts",
+  "client/src/components/PrintPreparationDialog.tsx",
   "shared",
   // Windows packaging assets consumed by scripts/package-windows.mjs
   "packaging/Start AdvisePoint Docs.bat",
@@ -57,6 +83,19 @@ const EXCLUDES = [
   "build-out",
   ".git",
   "**/*.tsbuildinfo",
+  "verification",
+  // One-off personal maintenance tools are not part of future release source.
+  "packaging/reset-library.cjs",
+  "packaging/cleanup-test-data.cjs",
+  "packaging/Reset library (backup first).bat",
+  "packaging/Clean prototype and test data (backup first).bat",
+  "packaging/START-FRESH.txt",
+  "scripts/reset-library.test.cjs",
+  "scripts/cleanup-test-data.test.cjs",
+  ".DS_Store",
+  "__MACOSX",
+  "Thumbs.db",
+  "desktop.ini",
 ];
 
 function usage() {
@@ -125,7 +164,7 @@ try {
 
   // Zip it.
   const outName = basename(output);
-  run("bash", ["-c", `rm -f ${JSON.stringify(output)} && cd ${JSON.stringify(scratch)} && zip -qr ${JSON.stringify(output)} advisepoint-src/`]);
+  run("bash", ["-c", `rm -f ${JSON.stringify(output)} && cd ${JSON.stringify(scratch)} && zip -X9qr ${JSON.stringify(output)} advisepoint-src/`]);
 
   console.log(`Created ${outName}`);
   console.log(`stage: ${stageRoot}`);

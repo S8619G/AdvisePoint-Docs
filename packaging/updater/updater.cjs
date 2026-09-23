@@ -49,12 +49,14 @@ const apiUrl = process.env.APD_UPDATE_API_URL || DEFAULT_API_URL;
 // AFTER we've relaunched (or after any error path). While the sentinel is
 // present the launcher suppresses its non-zero-exit crash window.
 const updateSentinelPath = path.join(logDir, ".updating");
+let ownsSentinel = false;
 
 fs.mkdirSync(logDir, { recursive: true });
 
 function writeUpdateSentinel() {
   try {
     fs.writeFileSync(updateSentinelPath, `${new Date().toISOString()} pid=${process.pid}\n`, "utf8");
+    ownsSentinel = true;
     log(`Update sentinel written: ${updateSentinelPath}`);
   } catch (err) {
     log(`WARN could not write update sentinel: ${err && err.message}`);
@@ -62,6 +64,7 @@ function writeUpdateSentinel() {
 }
 
 function clearUpdateSentinel() {
+  if (!ownsSentinel) return;
   try {
     if (fs.existsSync(updateSentinelPath)) {
       fs.unlinkSync(updateSentinelPath);
@@ -77,6 +80,7 @@ function timestamp() {
 }
 
 function log(message) {
+  if (/failed|mismatch|not found|refusing|cancelled/i.test(message)) lastFailure = message;
   const line = `[${timestamp()}] ${message}`;
   console.log(message);
   fs.appendFileSync(logPath, `${line}\n`, "utf8");
@@ -183,7 +187,39 @@ function isTrustedAssetUrl(value) {
   }
 }
 
-async function fetchLatestRelease() {
+function readInstalledArch(root = installRoot) {
+  const marker = path.join(root, "ARCH");
+  const arch = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").trim().toLowerCase() : "x64";
+  if (!["x64", "arm64"].includes(arch)) throw new Error(`Unsupported installed architecture: ${arch}`);
+  return arch;
+}
+
+function selectReleaseAsset(release, arch) {
+  if (!["x64", "arm64"].includes(arch)) throw new Error(`Unsupported installed architecture: ${arch}`);
+  const candidates = [];
+  for (const asset of Array.isArray(release.assets) ? release.assets : []) {
+    // Only binary product names, never source/debug archives or a lone arbitrary ZIP.
+    const match = String(asset?.name || "").match(
+      /^advisepoint[._-]?docs(?:[._-]v?(\d+(?:\.\d+)*))?(?:[._-](x64|arm64))?\.zip$/i,
+    );
+    if (!match || !isTrustedAssetUrl(asset.browser_download_url) ||
+        !Number.isSafeInteger(asset.size) || asset.size <= 0) continue;
+    if (match[1] && compareVersions(match[1], release.tag_name) !== 0) continue;
+    const assetArch = match[2]?.toLowerCase();
+    if (assetArch ? assetArch !== arch : arch !== "x64") continue;
+    candidates.push({ asset, rank: (assetArch ? 2 : 0) + (match[1] ? 1 : 0) });
+  }
+  candidates.sort((a, b) => b.rank - a.rank || a.asset.name.localeCompare(b.asset.name));
+  if (!candidates.length) {
+    throw new Error(`No compatible ${arch} binary package was found. Open the release page and choose the ${arch} ZIP; source archives cannot be installed.`);
+  }
+  if (candidates[1]?.rank === candidates[0].rank) {
+    throw new Error(`Multiple equally matching ${arch} packages were found; refusing an ambiguous release.`);
+  }
+  return candidates[0].asset;
+}
+
+async function fetchLatestRelease(arch = readInstalledArch()) {
   const data = await requestBuffer(apiUrl, { maxBytes: 2 * 1024 * 1024 });
   let release;
   try {
@@ -194,6 +230,8 @@ async function fetchLatestRelease() {
   if (!release || !/^v?\d+\.\d+\.\d+(?:\.\d+)*$/.test(String(release.tag_name || ""))) {
     throw new Error("Latest release has an invalid version tag");
   }
+  /* Legacy broad selection is intentionally replaced: it could choose source
+     or x64 on ARM64. Retained historical explanation below.
   // v1.0.3: accept both the new canonical version-free filename and the
   // legacy versioned filename. New builds ship AdvisePoint-Docs.zip; the
   // versioned pattern remains supported for older releases and any future
@@ -271,13 +309,38 @@ async function fetchLatestRelease() {
       `API returned ${Array.isArray(release.assets) ? release.assets.length : 0} asset(s): ${rawList || "(none)"}`,
     );
   }
-  const hashMatch = String(release.body || "").match(/^\s*sha256:\s*([a-f0-9]{64})\s*$/im);
+  */
+  const asset = selectReleaseAsset(release, arch);
+  log(`Selected ${arch} release asset: ${asset.name}`);
+  // Bind integrity to this asset, never a release-wide hash for another ZIP.
+  let sha256 = null;
+  if (asset.digest != null) {
+    const match = String(asset.digest).match(/^sha256:([a-f0-9]{64})$/i);
+    if (!match) throw new Error(`Invalid SHA-256 digest for ${asset.name}`);
+    sha256 = match[1].toLowerCase();
+  }
+  const companion = (release.assets || []).find((item) => item.name === `${asset.name}.sha256`);
+  if (companion) {
+    if (!isTrustedAssetUrl(companion.browser_download_url)) throw new Error("Untrusted checksum URL");
+    const text = (await requestBuffer(companion.browser_download_url, { maxBytes: 4096 })).toString("utf8").trim();
+    const match = text.match(/^([a-f0-9]{64})[ \t]+\*?([^\r\n]+)$/i);
+    if (!match || match[2] !== asset.name) throw new Error(`Invalid checksum companion for ${asset.name}`);
+    if (sha256 && sha256 !== match[1].toLowerCase()) throw new Error("Asset digest and checksum companion disagree");
+    sha256 = match[1].toLowerCase();
+  }
+  // Legacy releases used one unmarked binary and one release-body hash.
+  // Never apply that ambiguous hash to an architecture-specific asset.
+  if (!sha256 && !/[-_.](?:x64|arm64)\.zip$/i.test(asset.name)) {
+    const match = String(release.body || "").match(/^\s*sha256:\s*([a-f0-9]{64})\s*$/im);
+    sha256 = match?.[1].toLowerCase() || null;
+  }
+  if (!sha256) throw new Error(`No asset-specific SHA-256 checksum was found for ${asset.name}`);
   return {
     version: String(release.tag_name).replace(/^v/i, ""),
     assetName: asset.name,
     assetUrl: asset.browser_download_url,
     assetSize: asset.size,
-    sha256: hashMatch ? hashMatch[1].toLowerCase() : null,
+    sha256,
   };
 }
 
@@ -361,11 +424,12 @@ async function requestServerShutdown() {
 // ended at "Update complete" and the user was left staring at a dead tab
 // with no idea whether the update or the relaunch had failed.
 async function waitForPortInUse(timeoutMs = 45_000) {
+  if (process.env.APD_UPDATE_NO_LAUNCH === "1") return false;
   const start = Date.now();
   const deadline = start + timeoutMs;
   while (Date.now() < deadline) {
-    if (await checkPort(5000)) {
-      log(`Port 5000 accepted connections after ${Date.now() - start} ms.`);
+    if (await identifyRunningApp()) {
+      log(`AdvisePoint Docs health check passed after ${Date.now() - start} ms.`);
       return true;
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
@@ -942,6 +1006,7 @@ const SYNC_PRESERVE_NAMES = new Set([
   // local runtime state, not shipped
   ".unblocked",
   ".updating",
+  ".update-lock",
   // transient artifacts owned by this updater's rollback logic
   "dist.bak",
   "node.old",
@@ -954,6 +1019,7 @@ function isPreservedName(name) {
   if (/\.log(\.\d+)?$/.test(lower)) return true;
   // dist.new-1234 / node.new-1234 from an interrupted prior run
   if (/^(dist|node)\.new-\d+$/.test(lower)) return true;
+  if (lower.startsWith(".update-recovery-")) return true;
   return false;
 }
 
@@ -1021,7 +1087,111 @@ function syncAppRoot(incomingRoot) {
   return summary;
 }
 
+// Snapshot precisely the files this update may overwrite. User-data preserve
+// rules apply recursively, and unknown existing files are never pruned.
+// This covers launcher/updater/native modules and version markers, not only
+// dist/. A failed rollback retains the verified recovery copy for manual repair.
+function createRecoverySnapshot(incomingRoot) {
+  const backup = fs.mkdtempSync(path.join(installRoot, ".update-recovery-"));
+  const entries = [];
+  const folders = [];
+  const digest = (file) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+  function copyVerified(source, target) {
+    const st = fs.lstatSync(source);
+    if (st.isSymbolicLink()) throw new Error(`Refusing symbolic link in managed application files: ${source}`);
+    if (st.isDirectory()) {
+      fs.mkdirSync(target, { recursive: true });
+      for (const name of fs.readdirSync(source)) copyVerified(path.join(source, name), path.join(target, name));
+    } else {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.copyFileSync(source, target);
+      if (digest(source) !== digest(target)) throw new Error(`Recovery copy verification failed: ${source}`);
+    }
+  }
+  function record(relative) {
+    const target = path.join(installRoot, relative);
+    const exists = fs.existsSync(target);
+    if (exists) copyVerified(target, path.join(backup, relative));
+    entries.push({ relative, exists });
+  }
+  function walk(dir, relative = "") {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if ((!relative && SYNC_SKIP_TOP_LEVEL.has(entry.name)) || isPreservedName(entry.name)) continue;
+      const rel = path.join(relative, entry.name);
+      const target = path.join(installRoot, rel);
+      if (fs.existsSync(target) && fs.lstatSync(target).isSymbolicLink()) throw new Error(`Refusing managed symlink: ${rel}`);
+      if (entry.isDirectory()) {
+        if (fs.existsSync(target) && !fs.statSync(target).isDirectory()) throw new Error(`Application path type conflict: ${rel}`);
+        if (!fs.existsSync(target)) folders.push(rel);
+        walk(path.join(dir, entry.name), rel);
+      } else if (entry.isFile()) {
+        if (fs.existsSync(target) && !fs.statSync(target).isFile()) throw new Error(`Application path type conflict: ${rel}`);
+        record(rel);
+      }
+    }
+  }
+  try {
+    record("dist");
+    record("VERSION");
+    record("NODE_VERSION");
+    const incomingMarker = path.join(incomingRoot, "NODE_VERSION");
+    const currentMarker = path.join(installRoot, "NODE_VERSION");
+    if (fs.existsSync(incomingMarker) && (!fs.existsSync(currentMarker) ||
+        fs.readFileSync(incomingMarker, "utf8").trim() !== fs.readFileSync(currentMarker, "utf8").trim())) {
+      record("node");
+    }
+    walk(incomingRoot);
+    fs.writeFileSync(path.join(backup, "recovery-manifest.json"), JSON.stringify({ entries, folders }, null, 2));
+    log(`Verified recovery snapshot ready: ${backup}`);
+  } catch (error) {
+    removePath(backup); // No install writes have occurred.
+    throw error;
+  }
+  return {
+    backup,
+    restore() {
+      if (process.env.APD_UPDATE_TEST_FAIL_RECOVERY === "1") throw new Error("Simulated recovery failure");
+      for (const { relative, exists } of entries.slice().reverse()) {
+        const target = path.join(installRoot, relative);
+        if (exists) {
+          // Preserve the verified backup even if restoring is interrupted.
+          if (fs.existsSync(target) && fs.statSync(target).isDirectory()) removePath(target);
+          copyVerified(path.join(backup, relative), target);
+        } else {
+          removePath(target);
+        }
+      }
+      for (const relative of folders.reverse()) {
+        const target = path.join(installRoot, relative);
+        if (fs.existsSync(target) && fs.readdirSync(target).length === 0) fs.rmdirSync(target);
+      }
+      log("Full application recovery verified; previous files and version restored.");
+    },
+  };
+}
+
 function replaceInstall(incomingRoot, latestVersion) {
+  if (!fs.existsSync(path.join(installRoot, "dist")) && fs.existsSync(path.join(installRoot, "dist.bak"))) {
+    renameWithRetry(path.join(installRoot, "dist.bak"), path.join(installRoot, "dist"));
+  }
+  const snapshot = createRecoverySnapshot(incomingRoot);
+  try {
+    replaceInstallFiles(incomingRoot, latestVersion);
+  } catch (error) {
+    try {
+      snapshot.restore();
+    } catch (recoveryError) {
+      error.recoveryUnsafe = true;
+      log(`Automatic file recovery failed: ${recoveryError.message}. Recovery files retained at ${snapshot.backup}`);
+    }
+    if (!error.recoveryUnsafe) removePath(snapshot.backup);
+    throw error;
+  }
+  try { removePath(snapshot.backup); }
+  catch (error) { log(`WARN completed update left recovery files at ${snapshot.backup}: ${error.message}`); }
+}
+
+function replaceInstallFiles(incomingRoot, latestVersion) {
   const currentDist = path.join(installRoot, "dist");
   const backupDist = path.join(installRoot, "dist.bak");
   const newDist = path.join(installRoot, `dist.new-${process.pid}`);
@@ -1057,6 +1227,7 @@ function replaceInstall(incomingRoot, latestVersion) {
     // Placement matters: this runs INSIDE the try, after the dist swap, so any
     // failure here still hits the catch below and rolls dist back to dist.bak.
     syncAppRoot(incomingRoot);
+    if (process.env.APD_UPDATE_TEST_FAIL_AFTER_SYNC === "1") throw new Error("Simulated failure after root sync");
 
     const currentNodeMarker = path.join(installRoot, "NODE_VERSION");
     const incomingNodeMarker = path.join(incomingRoot, "NODE_VERSION");
@@ -1078,6 +1249,7 @@ function replaceInstall(incomingRoot, latestVersion) {
       fs.renameSync(newNode, path.join(installRoot, "node"));
       removePath(oldNode);
       copyIfPresent(incomingNodeMarker, currentNodeMarker);
+      if (process.env.APD_UPDATE_TEST_FAIL_AFTER_NODE === "1") throw new Error("Simulated failure after runtime replacement");
     }
 
     fs.writeFileSync(path.join(installRoot, "VERSION"), `${latestVersion}\n`, "utf8");
@@ -1114,7 +1286,7 @@ function waitForEnter(message) {
   });
 }
 
-function launchApp() {
+async function launchApp() {
   if (process.platform !== "win32" || process.env.APD_UPDATE_NO_LAUNCH === "1") return;
   const launcher = path.join(installRoot, "Start AdvisePoint Docs.bat");
   const vbs = path.join(installRoot, "launcher", "run-hidden.vbs");
@@ -1162,22 +1334,26 @@ function launchApp() {
   // (e.g. hand-copied install). That path is imperfect (see the reason
   // for the APD_HIDDEN strip above) but keeps the app launching.
   if (fs.existsSync(vbs)) {
-    spawn("wscript.exe", [vbs], {
+    const child = spawn("wscript.exe", [vbs], {
       cwd: installRoot,
       detached: true,
       stdio: "ignore",
       windowsHide: true,
       env: cleanEnv,
-    }).unref();
+    });
+    await new Promise((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+    child.unref();
     return;
   }
-  spawn("cmd.exe", ["/c", launcher], {
+  const child = spawn("cmd.exe", ["/c", launcher], {
     cwd: installRoot,
     detached: true,
     stdio: "ignore",
     windowsHide: true,
     env: cleanEnv,
-  }).unref();
+  });
+  await new Promise((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+  child.unref();
 }
 
 // v1.0.9: --local-zip <path>. Parse once here so downstream code doesn't need
@@ -1205,11 +1381,13 @@ function parseArgv(argv) {
   return out;
 }
 
-async function main() {
+async function performUpdate() {
   const args = parseArgv(process.argv);
   // v1.0.12.1: tracks whether we actually relaunched the app, so the
   // top-level handler knows who owns clearing the update sentinel.
   let launched = false;
+  let shutdownRequested = false;
+  let installationComplete = false;
   log("=== Update check started ===");
   log(`Install root: ${installRoot}`);
   if (args.localZip) log(`Local-zip mode: ${args.localZip}`);
@@ -1220,37 +1398,12 @@ async function main() {
       console.log("The updater will not stop an unrelated server. Free port 5000, then run this updater again.");
       return 2;
     }
-    if (!(await ask("AdvisePoint Docs's background server is still running. Shut it down and continue? (Y/N) "))) {
-      log("Update cancelled; the running background server was left unchanged.");
-      return 2;
-    }
-    try {
-      // v1.0.8.3: drop the sentinel BEFORE requesting shutdown so the launcher's
-      // crash-window branch is suppressed the moment node exits.
-      writeUpdateSentinel();
-      log("Requesting a clean shutdown from AdvisePoint Docs.");
-      console.log("Requesting a clean shutdown from AdvisePoint Docs (waiting up to 30 seconds)...");
-      await requestServerShutdown();
-      if (!(await waitForPortRelease())) {
-        console.log("The background server did not release port 5000 within 30 seconds.");
-        console.log("You can try running this updater again in a minute, or open the update log at:");
-        console.log("  %LOCALAPPDATA%\\AdvisePoint Docs\\update.log");
-        console.log("and share the last section if the problem keeps happening.");
-        return 2;
-      }
-      log("Background server stopped.");
-    } catch (error) {
-      log(`Automatic shutdown failed: ${error.message}`);
-      console.log(`The background server could not be stopped: ${error.message}`);
-      console.log("You can try running this updater again in a minute, or open the update log at:");
-      console.log("  %LOCALAPPDATA%\\AdvisePoint Docs\\update.log");
-      console.log("and share the last section if the problem keeps happening.");
-      return 2;
-    }
   }
 
   const currentVersion = readCurrentVersion();
+  const installedArch = readInstalledArch();
   log(`Running version: v${currentVersion}`);
+  log(`Installed architecture: ${installedArch}. Validating update before shutdown.`);
 
   // v1.0.9: local-zip path. Skip fetchLatestRelease entirely; read the zip
   // bytes from disk and jump into the same extract+swap flow. The server
@@ -1293,10 +1446,10 @@ async function main() {
   } else {
     let latest;
     try {
-      latest = await fetchLatestRelease();
+      latest = await fetchLatestRelease(installedArch);
     } catch (error) {
       log(`Network/release check failed: ${error.message}`);
-      console.log("Could not reach GitHub. Check your internet connection and try again.");
+      console.log(error.message);
       return 3;
     }
     log(`Latest version available on GitHub: v${latest.version}`);
@@ -1333,17 +1486,13 @@ async function main() {
       console.log("Update failed. Your existing installation was preserved.");
       return 4;
     }
-    if (!latest.sha256) log("Release notes contain no sha256 line; size and ZIP CRC checks will be used.");
     expectedVersion = latest.version;
   }
 
   const tempBase = process.env.TEMP || os.tmpdir();
   fs.mkdirSync(tempBase, { recursive: true });
-  const stagingSuffix = expectedVersion || "local";
-  const zipPath = path.join(tempBase, `apd-update-${stagingSuffix}.zip`);
-  const stagingRoot = path.join(tempBase, `apd-update-${stagingSuffix}`);
-  removePath(zipPath);
-  removePath(stagingRoot);
+  const stagingRoot = fs.mkdtempSync(path.join(tempBase, "apd-update-"));
+  const zipPath = `${stagingRoot}.zip`;
 
   try {
     if (!args.localZip) {
@@ -1395,10 +1544,6 @@ async function main() {
       );
     }
     const incomingArch = fs.readFileSync(incomingArchPath, "utf8").trim().toLowerCase();
-    const installedArchPath = path.join(installRoot, "ARCH");
-    const installedArch = fs.existsSync(installedArchPath)
-      ? fs.readFileSync(installedArchPath, "utf8").trim().toLowerCase()
-      : "x64";
     if (incomingArch !== installedArch) {
       throw new Error(
         `Refusing cross-architecture upgrade: installed is ${installedArch}, ` +
@@ -1406,6 +1551,25 @@ async function main() {
           `or back up your data and reinstall by extracting the ${incomingArch} ` +
           `zip into a fresh folder.`,
       );
+    }
+
+    // All download, integrity, version and architecture gates have passed.
+    // Re-check identity now: the process on this port may have changed while
+    // downloading. Never stop a service merely because it uses port 5000.
+    log("Package validation complete; existing application has not been stopped.");
+    if (await checkPort(5000)) {
+      if (!(await identifyRunningApp())) throw new Error("Port 5000 belongs to an unrelated server; no files changed.");
+      if (!(await ask("Package verified. Shut down AdvisePoint Docs and install now? (Y/N) "))) {
+        log("Update cancelled; the running background server was left unchanged.");
+        return 2;
+      }
+      writeUpdateSentinel();
+      shutdownRequested = true;
+      writeStatus("installing", "Package verified. Restarting the application to install.");
+      log("Requesting a clean shutdown from AdvisePoint Docs.");
+      await requestServerShutdown();
+      if (!(await waitForPortRelease())) throw new Error("The background server did not stop in time. No application files were replaced.");
+      log("Background server stopped.");
     }
 
     // v1.0.12: last gate before we touch dist/. Port 5000 being free does
@@ -1420,6 +1584,7 @@ async function main() {
 
     log("Replacing application files.");
     replaceInstall(incomingRoot, incomingVersion);
+    installationComplete = true;
     log(`Update complete: v${currentVersion} -> v${incomingVersion}`);
 
     // v1.0.12.1: relaunch BEFORE the staging cleanup in the finally block.
@@ -1431,8 +1596,12 @@ async function main() {
     // temp files are the updater's own and are equally safe to remove after
     // the new server is up.
     if (await ask("Update complete. Launch AdvisePoint Docs now? (Y/N) ")) {
+      if (process.platform !== "win32" || process.env.APD_UPDATE_NO_LAUNCH === "1") {
+        log("Relaunch skipped on this test/non-Windows host.");
+        return { code: 0, launched: false };
+      }
       log("Relaunching AdvisePoint Docs.");
-      launchApp();
+      await launchApp();
       launched = true;
       if (await waitForPortInUse()) {
         log("Relaunched server is listening on port 5000.");
@@ -1441,25 +1610,46 @@ async function main() {
         // be starting. Logging it makes a silent failure to come back
         // diagnosable instead of invisible.
         log("WARN relaunched server was not listening within 45 s; start the app manually if it did not appear.");
+        lastFailure = "Update installed, but application health could not be verified after restart. Start AdvisePoint Docs manually and check update.log.";
+        return { code: 4, launched };
       }
     } else {
       log("Relaunch declined; leaving AdvisePoint Docs closed.");
     }
   } catch (error) {
     log(`Update failed: ${error.stack || error.message}`);
-    console.log("Update failed. Your existing installation was preserved.");
+    console.log(installationComplete ? "The update was installed, but relaunch failed. Start AdvisePoint Docs manually." : error.recoveryUnsafe
+      ? "Update failed and automatic recovery was incomplete. Do not delete the recovery folder; see update.log."
+      : "Update failed. Your existing installation was preserved.");
     // v1.0.12: surface the reason on screen. The stale-instance abort is
     // user-actionable ("close the app / restart Windows") and was previously
     // only visible by opening update.log.
     if (error && error.message) console.log(error.message);
-    return 4;
+    if (shutdownRequested && !error.recoveryUnsafe && !installationComplete) {
+      try {
+        launched = await recoverStoppedApp();
+      } catch (recoveryError) {
+        log(`Recovery launch failed: ${recoveryError.message}. Start AdvisePoint Docs manually.`);
+      }
+    }
+    lastFailure = installationComplete
+      ? "Update installed, but automatic restart failed. Start AdvisePoint Docs manually."
+      : error.recoveryUnsafe
+        ? "Update failed and recovery was incomplete. Do not delete recovery files. See update.log for the recovery folder."
+        : `${error.message} ${shutdownRequested ? (launched ? "The previous application was restarted." : "Start AdvisePoint Docs manually if it is not running.") : "No application files were replaced."}`;
+    return { code: 4, launched };
   } finally {
-    removePath(zipPath);
-    removePath(stagingRoot);
+    try { removePath(zipPath); removePath(stagingRoot); }
+    catch (error) { log(`WARN staging cleanup deferred: ${error.message}`); }
     // v1.0.9: local-zip mode cleans up the user-supplied temp file too. The
     // server dropped it in tempBase; it's safe to remove after either
     // success or failure.
-    if (args.localZip) removePath(args.localZip);
+    // Delete only app-owned upload staging, never a ZIP supplied by the user.
+    if (args.localZip && path.basename(path.dirname(path.resolve(args.localZip))).startsWith("apd-local-zip-") &&
+        path.dirname(path.dirname(path.resolve(args.localZip))) === path.resolve(os.tmpdir())) {
+      try { removePath(path.dirname(path.resolve(args.localZip))); }
+      catch (error) { log(`WARN upload cleanup deferred: ${error.message}`); }
+    }
   }
 
   // v1.0.11.4: report launched=true so the top-level handler knows to
@@ -1476,6 +1666,72 @@ async function main() {
   // leftover sentinel makes the NEXT ordinary launch think it is a
   // post-update boot.
   return { code: 0, launched };
+}
+
+async function recoverStoppedApp(deps = {}) {
+  const portBusy = deps.portBusy || (() => checkPort(5000));
+  const identify = deps.identify || identifyRunningApp;
+  const launch = deps.launch || launchApp;
+  const waitHealthy = deps.waitHealthy || waitForPortInUse;
+  if (await portBusy()) {
+    log(await identify() ? "Application is still running; no duplicate recovery launch." :
+      "Recovery not launched: port 5000 is occupied by another service.");
+    return false;
+  }
+  log("Restarting the preserved application after the failed update.");
+  await launch();
+  if (await waitHealthy()) {
+    log("Preserved application is healthy again.");
+    return true;
+  }
+  log("Recovery launch could not be verified. Start AdvisePoint Docs manually; see update.log.");
+  return false;
+}
+
+let statusStartedAt;
+let lastFailure = "";
+function writeStatus(phase, message) {
+  const file = path.join(logDir, "update-status.json");
+  const temp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temp, JSON.stringify({ phase, message, startedAt: statusStartedAt, updatedAt: Date.now() }));
+    fs.renameSync(temp, file);
+  } catch (error) {
+    console.error(`Could not record updater status: ${error.message}`);
+  }
+}
+
+async function main() {
+  // One updater per install. A stale lock can be replaced only when its PID
+  // is demonstrably gone; an unknown/permission-denied owner is never killed.
+  const lock = path.join(installRoot, ".update-lock");
+  if (fs.existsSync(lock)) {
+    const pid = Number(fs.readFileSync(lock, "utf8"));
+    if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Invalid update lock; inspect .update-lock before retrying.");
+    try {
+      process.kill(pid, 0);
+      throw new Error("Another update is already running.");
+    } catch (error) {
+      if (error.code !== "ESRCH") throw error;
+    }
+    fs.unlinkSync(lock);
+  }
+  fs.writeFileSync(lock, String(process.pid), { flag: "wx" });
+  statusStartedAt = Date.now();
+  writeStatus("preparing", "Downloading and validating the package. The application stays available until checks pass.");
+  try {
+    const result = await performUpdate();
+    const code = typeof result === "number" ? result : result.code;
+    writeStatus(code === 0 ? "complete" : "failed", code === 0
+      ? "Update check completed." : (lastFailure || "Update did not complete. The updater log contains the details."));
+    return result;
+  } catch (error) {
+    writeStatus("failed", error.message);
+    throw error;
+  } finally {
+    try { fs.unlinkSync(lock); }
+    catch (error) { log(`WARN update lock cleanup failed: ${error.message}`); }
+  }
 }
 
 if (require.main === module) {
@@ -1516,6 +1772,9 @@ module.exports = {
   // GitHub-hosted upgrade from v1.0.11 onward can be regression-tested
   // without performing a real update.
   fetchLatestRelease,
+  selectReleaseAsset,
+  readInstalledArch,
+  recoverStoppedApp,
   renameWithRetry,
   // v1.1.0: exported so the app-root sync that fixes the dropped
   // welcome-guide/ folder can be unit-tested (new-file and new-folder cases)

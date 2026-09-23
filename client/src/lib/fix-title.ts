@@ -45,6 +45,14 @@ const STANDALONE = new Set([
   'TASKalfa', 'ECOSYS', 'KYOCERA',                // family names
   'HyPAS', 'KCC', 'GEN',                          // platform / family shorthand
 ]);
+const LANGUAGE_CODES = new Set(['EN','FR','DE','ES','IT','JP','KO','ZH']);
+// A glued language marker must be followed by a complete code chain or revision,
+// not simply an uppercase letter in DEALER, DEVICE, DESIGN, ENGINE or ITALIAN.
+function languageTailIsCode(tail: string): boolean {
+  if (!tail || /^[0-9]/.test(tail) || /^(R|TB)\d/.test(tail) || /^[^A-Za-z]/.test(tail)) return true;
+  const code = /^(EN|FR|DE|ES|IT|JP|KO|ZH|OG|UG|SG|PG|MG|IG)/.exec(tail);
+  return !!code && languageTailIsCode(tail.slice(code[0].length));
+}
 
 /**
  * Lowercase single-letter language markers. ONLY recognized as an isolated
@@ -213,6 +221,7 @@ function splitWord(word: string, trace: Trace): string[] {
       // Only match when followed by end, uppercase, or digit -- so `ENOG`
       // yields EN then leaves OG for the next round.
       const after = word[s.length];
+      if (LANGUAGE_CODES.has(s) && !languageTailIsCode(word.slice(s.length))) continue;
       if (after === undefined || /[A-Z0-9]/.test(after) || !/[a-z]/.test(after)) {
         const rest = word.slice(s.length);
         trace && trace.push(`  ${word} → standalone "${s}" + rest "${rest}"`);

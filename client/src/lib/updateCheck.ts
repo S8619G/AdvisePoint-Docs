@@ -178,6 +178,7 @@ function writeCache(release: LatestRelease | null) {
 
 /** Get the latest release, using cache if fresh (<24h). Returns null on failure. */
 export async function getLatestRelease(forceRefresh = false): Promise<LatestRelease | null> {
+  if (import.meta.env.VITE_APD_LOCAL_TEST === "1") return null;
   const cached = readCache();
   // v0.9.34: bypass the freshness window on the very first call after an app
   // version change. Without this, upgrading from vN to vN+1 leaves any prior

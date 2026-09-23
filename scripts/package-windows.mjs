@@ -230,6 +230,23 @@ try {
 
   rmSync(join(appRoot, "dist"), { recursive: true, force: true });
   cpSync(join(repoRoot, "dist"), join(appRoot, "dist"), { recursive: true });
+  const engineSource=join(repoRoot,"packaging","pdf-engine",targetArch);
+  if(!existsSync(join(engineSource,"qpdf.exe")))throw Error("Bundled PDF engine missing");
+  for(const line of readFileSync(join(engineSource,"SHA256SUMS"),"utf8").trim().split(/\r?\n/)){
+    const match=/^([a-f0-9]{64})  ([A-Za-z0-9_+.-]+)$/.exec(line);
+    if(!match||sha256File(join(engineSource,match[2]))!==match[1])
+      throw Error("Bundled PDF engine differs from its tested manifest.");
+    const bytes=readFileSync(join(engineSource,match[2]));
+    const pe=bytes.readUInt32LE(0x3c),machine=bytes.readUInt16LE(pe+4);
+    if(bytes.subarray(pe,pe+4).toString("hex")!=="50450000"||
+       machine!==(targetArch==="arm64"?0xaa64:0x8664))
+      throw Error("Bundled PDF engine architecture mismatch.");
+  }
+  rmSync(join(appRoot,"pdf-engine"),{recursive:true,force:true});
+  cpSync(engineSource,join(appRoot,"pdf-engine"),{recursive:true});
+  cpSync(join(repoRoot,"packaging","test-v131.cjs"),join(appRoot,"test-v131.cjs"));
+  writeFileSync(join(appRoot,"Start isolated v1.3.1 test.bat"),
+    '@echo off\r\ncd /d "%~dp0"\r\n"node\\node.exe" "test-v131.cjs"\r\npause\r\n');
 
   // v1.0.8: EXTRA_RUNTIME_DEPS retired. Direct deps added since v1.0.0
   // (e.g. iconv-lite, safer-buffer for RTF) are now bundled into
@@ -488,8 +505,48 @@ try {
   rmSync(join(appRoot, "pages"), { recursive: true, force: true });
   rmSync(join(appRoot, "dist.bak"), { recursive: true, force: true });
 
+  const mode = JSON.parse(readFileSync(join(repoRoot, "dist", "build-mode.json"), "utf8"));
+  if (args["local-test"] !== "1" && mode.local_test)
+    throw Error("Production packaging requires a normal build (unset VITE_APD_LOCAL_TEST).");
+  if (args["local-test"] === "1") {
+    const mode = JSON.parse(readFileSync(join(repoRoot, "dist", "build-mode.json"), "utf8"));
+    if (!mode.local_test) throw Error("Rebuild with VITE_APD_LOCAL_TEST=1 before packaging a candidate.");
+    writeFileSync(join(appRoot, "LOCAL_TEST_ONLY"), "1.3.0\n");
+    cpSync(join(repoRoot, "packaging", "local-test.cjs"), join(appRoot, "local-test.cjs"));
+    cpSync(join(repoRoot, "packaging", "runtime-log.cjs"), join(appRoot, "runtime-log.cjs"));
+    writeFileSync(join(appRoot, "CANDIDATE"), "13\n");
+    cpSync(join(appRoot, "dist", "index.cjs"), join(appRoot, "dist", "application.cjs"));
+    writeFileSync(join(appRoot, "dist", "index.cjs"), 'require("../local-test.cjs");\n');
+    const launch = '@echo off\r\ncd /d "%~dp0"\r\n"node\\node.exe" "local-test.cjs"\r\npause\r\n';
+    writeFileSync(join(appRoot, "Start AdvisePoint Docs.bat"), launch);
+    // Do not replace the user's production shortcut or offer a local ZIP updater.
+    for (const name of ["Update AdvisePoint Docs.bat", "Setup Icon (run once).bat"]) {
+      writeFileSync(join(appRoot, name), '@echo off\r\necho Disabled in this local-test candidate. Use Start AdvisePoint Docs.bat.\r\npause\r\n');
+    }
+    cpSync(join(repoRoot, "packaging", "LOCAL-TEST-README.txt"), join(appRoot, "READ ME FIRST - LOCAL TEST.txt"));
+  }
+
+  // Standing shipping policy: one-off maintenance tools are never end-user
+  // content. Remove inherited copies too: the baseline can be the prior release.
+  // This operates ONLY on the disposable packaging stage, never an installation
+  // or library. Keep runtime code, legal notices, and both launcher folders.
+  const unshippedPaths = [
+    "reset-library.cjs", "Reset library (backup first).bat",
+    "cleanup-test-data.cjs", "Clean prototype and test data (backup first).bat",
+    "START-FRESH.txt",
+    ...["bl", "duck", "file-uri-to-path", "github-from-package", "lop",
+      "mammoth", "minimist", "option", "rc", "simple-concat", "sprintf-js",
+      "tar-fs"].map(name => `node_modules/${name}/test`),
+    ...["jszip", "mammoth", "minimist", "napi-build-utils", "pump",
+      "simple-get"].map(name => `node_modules/${name}/.github`),
+  ];
+  for (const rel of unshippedPaths)
+    rmSync(join(appRoot, rel), { recursive: true, force: true });
+  for (const rel of unshippedPaths)
+    if (existsSync(join(appRoot, rel))) throw Error(`Unwanted release content remains: ${rel}`);
+
   rmSync(output, { force: true });
-  run("zip", ["-qr", output, APP_FOLDER], scratch);
+  run("zip", ["-X9qr", output, APP_FOLDER], scratch);
 
   console.log(`Created ${basename(output)}`);
   console.log(`version: ${version}`);

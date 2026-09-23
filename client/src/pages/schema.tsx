@@ -2,6 +2,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { UpdateCheckPanel } from "@/components/UpdateCheckPanel";
+import { LibraryStoragePanel } from "@/components/LibraryStoragePanel";
 import { ViewerPrefsPanel } from "@/components/ViewerPrefsPanel";
 import { LibraryScanPanel } from "@/components/LibraryScanPanel";
 import { DuplicatesPanel } from "@/components/DuplicatesPanel";
@@ -123,6 +124,7 @@ export default function SchemaPage() {
           {/* The v1.2.4 panel already contains the installed-version row.
               Preserve that panel intact; there is no separate version card. */}
           <UpdateCheckPanel />
+          <LibraryStoragePanel />
           <ViewerPrefsPanel />
           {/* v1.0.15: reinstall action for the seeded Welcome Guide.
               v1.2.4: paired with the Manage Values panel in a two-column

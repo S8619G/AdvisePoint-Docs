@@ -63,6 +63,12 @@ test("parses the full 25-filename corpus character-for-character", () => {
   }
 });
 
+test("language prefixes do not break normal uppercase words",()=>{
+  for(const name of ["DEALER","DEVICE","DESIGN","DEALERSHIP","ENGINE","ITALIAN","Dealer","Device","Design"])
+    assert.equal(fixTitle(name+".pdf").title,name);
+  assert.equal(fixTitle("DEOGR2024.pdf").title,"DE OG R2024");
+  assert.equal(fixTitle("ENFRDE.pdf").title,"EN FR DE");
+});
 test("corpus fixture matches the shipped Doc-titles.txt corpus file", () => {
   const lines = readFileSync(join(here, "fix-title-corpus.txt"), "utf8")
     .split("\n").map((l) => l.trim()).filter(Boolean);

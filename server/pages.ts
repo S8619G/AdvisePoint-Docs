@@ -23,115 +23,8 @@
 import { mkdirSync, existsSync, writeFileSync, rmSync, readdirSync } from "node:fs";
 import { join, dirname, resolve, isAbsolute, sep } from "node:path";
 import { storage, rawDb } from "./storage";
-import type { DocumentPage } from "./storage";
-
-// v1.0.4: per-page and whole-job render timeouts. All configurable via env
-// vars so field techs can tune them without shipping a new build. Defaults
-// come from real-world observations:
-//   - 2 min/page: 240 DPI @ q88 renders of dense manual pages take 3-8 s
-//     on modern hardware, up to ~30 s on older laptops. 2 min is deep in
-//     the "something is genuinely wrong" tail.
-//   - 30 s for doc.getPage(n): usually microseconds. Anything over 30 s
-//     means pdfjs is wedged parsing a malformed xref or CFF font.
-//   - 60 s for pdfjs.getDocument().promise: the whole PDF must at least
-//     parse its header, xref, and encryption metadata within a minute.
-//   - 30 min whole-job wall clock: a 1000-page manual @ 5 s/page is ~80
-//     min, so this is a safety net for pathological docs, not a normal cap.
-//     If a legitimate huge manual needs more, raise the env var.
-// v1.0.5: default lowered from 120_000 -> 60_000 to shrink the abandoned-
-// promise window when withTimeout fires (pdfjs has no cancellation API, so
-// the losing promise keeps burning CPU until it finishes naturally). 60 s
-// is still deep in the "something is wrong" tail per the 240 DPI @ q88
-// notes above (3-30 s per page in the wild). Override via env var if a
-// legitimate slow page trips it. Full architectural fix (worker_threads
-// with actual cancellation) tracked as v1.0.7-candidate in BACKLOG.md.
-const RENDER_PAGE_TIMEOUT_MS = Number(process.env.RAG_RENDER_PAGE_TIMEOUT_MS) || 60_000;
-const RENDER_GETPAGE_TIMEOUT_MS = Number(process.env.RAG_RENDER_GETPAGE_TIMEOUT_MS) || 30_000;
-const RENDER_LOAD_TIMEOUT_MS = Number(process.env.RAG_RENDER_LOAD_TIMEOUT_MS) || 60_000;
-const RENDER_JOB_TIMEOUT_MS = Number(process.env.RAG_RENDER_JOB_TIMEOUT_MS) || 1_800_000;
-
-class RenderTimeoutError extends Error {
-  constructor(op: string, ms: number) {
-    super(`${op} timed out after ${ms}ms`);
-    this.name = "RenderTimeoutError";
-  }
-}
-
-// v1.0.4: race any pdfjs promise against a timer. On timeout throws a
-// RenderTimeoutError; the underlying pdfjs work may keep running in the
-// background (pdfjs has no cancellation API) but we stop awaiting it and
-// move on. The `finally` block on the loser side still gets a chance to
-// clean up when it eventually settles because we hold a reference.
-async function withTimeout<T>(
-  p: Promise<T>,
-  ms: number,
-  op: string,
-): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      p,
-      new Promise<T>((_, reject) => {
-        timer = setTimeout(() => reject(new RenderTimeoutError(op, ms)), ms);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-// Import pdfjs (legacy Node build) lazily so a broken install doesn't kill server
-// startup. Cached after first load. The cached module MUST be reused across calls
-// because pdfjs stashes some state at module scope.
-let _pdfjs: any | null = null;
-async function loadPdfjs() {
-  if (_pdfjs) return _pdfjs;
-  _pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs" as any);
-  return _pdfjs;
-}
-// @napi-rs/canvas is a prebuilt-binary canvas that avoids the Cairo/native build
-// pain of the classic `canvas` package. Ships prebuilds for Windows x64, macOS
-// (arm64 + x64), and Linux — matches our target platforms.
-let _canvasMod: any | null = null;
-function loadCanvas() {
-  if (_canvasMod) return _canvasMod;
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  _canvasMod = require("@napi-rs/canvas");
-
-  // v0.9.29: pdfjs 5.x decodes embedded raster images through
-  // `createImageBitmap` when it exists on the global scope. Node doesn't
-  // ship one, so pdfjs silently drops JPEG/PNG XObjects — text renders
-  // fine, but PowerPoint slides, screenshots, and product photos come
-  // out as blank rectangles. @napi-rs/canvas's `loadImage` accepts a
-  // Buffer/Uint8Array/Blob and returns something quacks-like-Image, which
-  // is all pdfjs actually needs to feed into ctx.drawImage. This polyfill
-  // is a no-op if the runtime already has one (browsers, future Node).
-  const g: any = globalThis;
-  if (typeof g.createImageBitmap !== "function") {
-    g.createImageBitmap = async (source: any) => {
-      // Blob (or Blob-alike) — read to Buffer first
-      let bytes: Buffer;
-      if (source && typeof source.arrayBuffer === "function") {
-        const ab = await source.arrayBuffer();
-        bytes = Buffer.from(ab);
-      } else if (source instanceof Uint8Array) {
-        bytes = Buffer.from(source.buffer, source.byteOffset, source.byteLength);
-      } else if (Buffer.isBuffer(source)) {
-        bytes = source;
-      } else if (source && source.data instanceof Uint8Array) {
-        // pdfjs sometimes hands us an ImageData-shaped wrapper — pass the pixel
-        // buffer through untouched. This path is rare (most bitmaps arrive as
-        // Blob), but skipping it drops the same slides all over again.
-        bytes = Buffer.from(source.data.buffer, source.data.byteOffset, source.data.byteLength);
-      } else {
-        throw new TypeError("createImageBitmap polyfill: unsupported source type");
-      }
-      return _canvasMod.loadImage(bytes);
-    };
-  }
-
-  return _canvasMod;
-}
+import {runRenderWorker} from "./render-worker-client";
+import {uploadLog} from "./upload-log";
 
 // Where do sidecar page images live? Honor RAG_PAGES_DIR if set, otherwise put
 // them next to the DB in `pages/`. Created lazily.
@@ -192,13 +85,14 @@ export function resolvePageImageOnDisk(
 // responding for tens of seconds. The React client's update-check ping timed
 // out, showed "Server disconnected" and the whole app looked broken.
 //
-// Serializing renders trades wall-clock time (they now finish one after the
-// other) for a responsive server. Combined with the setImmediate() yield
-// inside the per-page loop below, the health endpoint stays responsive even
-// mid-render.
+// v1.3.0 candidate 4: serialization remains, but yields alone did not prevent
+// large-file delivery starvation. PDF drawing and encoding now run in a
+// dedicated worker. The parent commits one page at a time and ACKs it.
 type RenderJob = { document_id: string; buffer: Buffer };
 const _renderQueue: RenderJob[] = [];
 let _renderRunning = false;
+let _activeRender: {done: Promise<void>; cancel: () => void} | null = null;
+const _cancelledRenders = new Set<string>();
 // v1.0.4: track the currently-running doc id so the header indicator can
 // name it. Cleared in the drain function's .finally() block.
 let _currentJobId: string | null = null;
@@ -209,21 +103,31 @@ function _drainRenderQueue(): void {
   if (!job) return;
   _renderRunning = true;
   _currentJobId = job.document_id;
+  const renderStarted = Date.now();
+  uploadLog("render_started",{document_id:job.document_id});
   renderInBackground(job.document_id, job.buffer)
     .catch((err) => {
+      if (_cancelledRenders.has(job.document_id) || !storage.getDocument(job.document_id)) return;
       console.error(`[pages] render failed for ${job.document_id}:`, err);
       try {
         storage.upsertRenderStatus({
           document_id: job.document_id,
           status: "error",
-          rendered: 0,
-          total: 0,
+          rendered: storage.listPages(job.document_id).length,
+          total: storage.getRenderStatus(job.document_id)?.total ?? 0,
           error: String(err?.message ?? err),
           updated_at: new Date().toISOString(),
         });
       } catch { /* ignore */ }
     })
     .finally(() => {
+      try {
+        const status = storage.getRenderStatus(job.document_id);
+        uploadLog("render_finished",{document_id:job.document_id,status:status?.status,
+          rendered:status?.rendered,pages:status?.total,elapsed_ms:Date.now()-renderStarted,
+          code:status?.status === "ready" && !status.error ? "READY" : "RENDER_INCOMPLETE"});
+      } catch { /* logging must not block the queue */ }
+      _cancelledRenders.delete(job.document_id);
       _renderRunning = false;
       _currentJobId = null;
       // Yield before starting the next job so the event loop gets a tick
@@ -253,10 +157,12 @@ export function getRenderQueueSnapshot(): {
   };
 }
 
-// Public API — returns immediately, work happens on the event loop.
+// Public API: returns immediately; CPU-heavy work runs in the renderer worker.
 // Idempotent: repeated calls for the same doc while a render is running are safe
 // (the second one sees status=rendering and returns early).
 export function scheduleRender(document_id: string, buffer: Buffer): void {
+  if (!isSafeDocIdForPathUse(document_id)) throw Error("Unsafe render document id");
+  if (_currentJobId === document_id) return;
   const existing = storage.getRenderStatus(document_id);
   if (existing && (existing.status === "rendering" || existing.status === "ready")) {
     return;
@@ -279,230 +185,23 @@ export function scheduleRender(document_id: string, buffer: Buffer): void {
 }
 
 async function renderInBackground(document_id: string, buffer: Buffer): Promise<void> {
-  // v1.0.4: enforce a whole-job wall clock so a single pathological document
-  // can never permanently starve the queue. Tracked with a Date-based check
-  // per page rather than a Promise.race on the outer function, so the
-  // *rest* of the doc can also short-circuit cleanly.
-  const jobStartedAt = Date.now();
-  const jobExpiresAt = jobStartedAt + RENDER_JOB_TIMEOUT_MS;
-
-  const pdfjs = await loadPdfjs();
-  const { createCanvas } = loadCanvas();
-
-  // Copy the buffer into a fresh Uint8Array — pdfjs takes ownership of the
-  // underlying storage and can zero it, and we don't want to disturb whatever
-  // handed us the buffer.
-  const bytes = new Uint8Array(buffer.length);
-  bytes.set(buffer);
-
-  // v0.9.29: PowerPoint-exported PDFs (and any PDF whose slides embed JPEG2000
-  // images) rendered text-only under v0.9.28 — slides came out blank where
-  // the paint cans, screenshots, and product photos should have been. Three
-  // fixes are needed together:
-  //   1. cMapUrl points at pdfjs's shipped CJK cmap tables so non-Latin
-  //      glyphs and embedded font subsets resolve. Without this some
-  //      slide-master glyphs silently drop and take the whole slide down.
-  //   2. standardFontDataUrl feeds pdfjs the 14 Base-14 substitute fonts
-  //      so Helvetica/Times fallbacks don't silently error out during layout.
-  //   3. wasmUrl points at pdfjs's OpenJPEG (JPX) and QCMS wasm modules.
-  //      Slides authored in PowerPoint routinely embed images as JP2/JPX,
-  //      and without the OpenJPEG wasm every one of them fails to decode
-  //      with "JpxError: OpenJPEG failed to initialize" and pdfjs paints
-  //      nothing where the image belongs. This is THE fix for the blank-
-  //      graphics complaint in the Color Optimizer deck.
-  // useSystemFonts stays off because the Node/napi-rs font stack can't
-  // resolve arbitrary system font names anyway — the pdfjs base fonts
-  // handle it more predictably.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const nodePath = require("node:path") as typeof import("node:path");
-  const pdfjsRoot = nodePath.dirname(require.resolve("pdfjs-dist/package.json"));
-  const cMapUrl = `${pdfjsRoot}/cmaps/`;
-  const standardFontDataUrl = `${pdfjsRoot}/standard_fonts/`;
-  const wasmUrl = `${pdfjsRoot}/wasm/`;
-
-  const loadingTask = pdfjs.getDocument({
-    data: bytes,
-    disableWorker: true,      // no worker thread — we render inline
-    isEvalSupported: false,   // safer, we don't need eval'd font code
-    useSystemFonts: false,    // v0.9.29: system-font fallback drops graphics on Windows
-    cMapUrl,
-    cMapPacked: true,
-    standardFontDataUrl,
-    wasmUrl,                  // v0.9.29: OpenJPEG/QCMS wasm for JP2/JPX images
+  const outDir = pageDirForDoc(document_id);
+  if (!outDir) throw Error("Unsafe render document id");
+  const active = runRenderWorker(document_id, buffer, {
+    page: (page, bytes) => {
+      if (!storage.getDocument(document_id)) throw Error("Render document no longer exists");
+      mkdirSync(outDir, {recursive: true});
+      const outPath = join(outDir, pageFileName(page.page_number));
+      writeFileSync(outPath, bytes);
+      storage.upsertPage({...page, image_path: outPath});
+    },
+    status: status => {
+      if (!storage.getDocument(document_id)) throw Error("Render document no longer exists");
+      storage.upsertRenderStatus(status);
+    },
   });
-  // v1.0.4: bound the initial PDF load. A malformed xref or encrypted-
-  // with-unsupported-cipher doc used to sit here forever. Widen back to
-  // `any` because pdfjs's legacy build lacks proper types and the rest
-  // of this file already treats doc/page as any.
-  const doc: any = await withTimeout(
-    loadingTask.promise,
-    RENDER_LOAD_TIMEOUT_MS,
-    `pdfjs.getDocument() for ${document_id}`,
-  );
-  const total = doc.numPages;
-
-  const outDir = join(resolvePagesDir(), document_id);
-  mkdirSync(outDir, { recursive: true });
-
-  const startedAt = new Date().toISOString();
-  storage.upsertRenderStatus({
-    document_id,
-    status: "rendering",
-    rendered: 0,
-    total,
-    error: null,
-    updated_at: startedAt,
-  });
-
-  // v0.9.21: 240 DPI @ pdfjs's default 72 DPI = 3.333x scale. Combined with
-  // WebP q88 this keeps 8-9 pt body text legible up through ~250% viewer
-  // zoom without visible compression smear. At q88 we're near WebP's
-  // diminishing-returns knee for text-on-white pages.
-  const scale = 240 / 72;
-  const webpQuality = 88;
-
-  // v1.0.4: track failures per page so we can (a) skip forward instead of
-  // aborting the whole doc, and (b) mark the doc's final status based on
-  // how much actually rendered. `firstFailure` gives the header render-
-  // status indicator a short human-readable reason for the failure list.
-  const failedPages: number[] = [];
-  let firstFailure: { page: number; error: string } | null = null;
-
-  let rendered = 0;
-  for (let n = 1; n <= total; n++) {
-    // v1.0.4: whole-job wall clock. If we've been at this for more than
-    // RENDER_JOB_TIMEOUT_MS, abandon the doc entirely so the queue can
-    // move to the next one. All remaining pages are marked failed for
-    // reporting.
-    if (Date.now() >= jobExpiresAt) {
-      for (let m = n; m <= total; m++) failedPages.push(m);
-      if (!firstFailure) {
-        firstFailure = {
-          page: n,
-          error: `whole-document render exceeded ${RENDER_JOB_TIMEOUT_MS}ms`,
-        };
-      }
-      break;
-    }
-
-    let page: any | null = null;
-    try {
-      // v1.0.4: pdfjs getPage() usually returns instantly but can wedge on
-      // malformed page objects. Bound it explicitly.
-      page = await withTimeout(
-        doc.getPage(n),
-        RENDER_GETPAGE_TIMEOUT_MS,
-        `doc.getPage(${n}) for ${document_id}`,
-      );
-      const viewport = page.getViewport({ scale });
-      const width = Math.ceil(viewport.width);
-      const height = Math.ceil(viewport.height);
-      const canvas = createCanvas(width, height);
-      const ctx = canvas.getContext("2d");
-      // WebP supports alpha but PDF pages often have transparent regions we
-      // want to see as white on screen, so paint a white background first.
-      ctx.fillStyle = "white";
-      ctx.fillRect(0, 0, width, height);
-
-      // v1.0.4: bound the actual render step. This is where hangs
-      // realistically happen — an infinite loop inside an XObject or a
-      // stuck OpenJPEG decode.
-      await withTimeout(
-        page.render({ canvasContext: ctx, viewport, canvas }).promise,
-        RENDER_PAGE_TIMEOUT_MS,
-        `page.render(${n}) for ${document_id}`,
-      );
-
-      // v1.0.5: bracket the synchronous WebP encoder with setImmediate
-      // yields. @napi-rs/canvas encodes in-thread; for a 2400x3200 px
-      // page that is 100-400 ms of pure event-loop block on top of
-      // whatever pdfjs just did. The yields give the health-check poll
-      // and any pending heartbeat a chance to land before/after the
-      // encode so the client-side reconnect threshold does not trip.
-      await new Promise<void>((r) => setImmediate(r));
-      const buf = canvas.toBuffer("image/webp", webpQuality);
-      await new Promise<void>((r) => setImmediate(r));
-      const outPath = join(outDir, pageFileName(n, "webp"));
-      writeFileSync(outPath, buf);
-
-      const pageRow: DocumentPage = {
-        document_id,
-        page_number: n,
-        image_path: outPath,
-        width,
-        height,
-        generated_at: new Date().toISOString(),
-      };
-      storage.upsertPage(pageRow);
-      rendered++;
-
-      // Update progress every 10 pages (or on the last one) to avoid write
-      // amplification for very long manuals. v1.0.4: the final "ready"
-      // decision moved out of the loop so partial-failure math has all the
-      // data it needs.
-      if (n % 10 === 0 || n === total) {
-        storage.upsertRenderStatus({
-          document_id,
-          status: "rendering",
-          rendered,
-          total,
-          error: failedPages.length > 0
-            ? `${failedPages.length} of ${total} pages failed so far`
-            : null,
-          updated_at: new Date().toISOString(),
-          failed_pages: failedPages.length > 0 ? JSON.stringify(failedPages) : null,
-          first_failed_page: firstFailure?.page ?? null,
-        });
-      }
-    } catch (err) {
-      // v1.0.4: log and skip forward instead of aborting the whole doc.
-      // The catch is intentionally broad because we can't recover any
-      // pdfjs error state anyway; the failure is per-page.
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`[pages] page ${n} of ${document_id} failed:`, message);
-      failedPages.push(n);
-      if (!firstFailure) {
-        firstFailure = { page: n, error: message };
-      }
-    } finally {
-      // pdfjs pages hold onto worker memory until cleaned up. Idempotent
-      // and safe on a partially-rendered page.
-      try { page?.cleanup?.(); } catch { /* ignore */ }
-    }
-
-    // v0.9.30: yield the event loop between pages so the HTTP server stays
-    // responsive (health checks, page image requests, chunk queries, etc.).
-    // Without this the per-page pdfjs+canvas work blocks the loop long
-    // enough to time out client-side polls on slower machines.
-    await new Promise<void>((r) => setImmediate(r));
-  }
-
-  // v1.0.4: final status decision. > 25% pages failed → status=error, so
-  // the header indicator flags this doc. Otherwise mark ready with a
-  // partial-failure note if some pages did fail.
-  const failureRate = total > 0 ? failedPages.length / total : 0;
-  const finalStatus: "ready" | "error" = failureRate > 0.25 ? "error" : "ready";
-  const finalError = failedPages.length === 0
-    ? null
-    : finalStatus === "error"
-      ? `${failedPages.length} of ${total} pages failed to render. First failure on page ${firstFailure?.page}: ${firstFailure?.error}`
-      : `${failedPages.length} of ${total} pages failed to render (partial). First failure on page ${firstFailure?.page}: ${firstFailure?.error}`;
-  storage.upsertRenderStatus({
-    document_id,
-    status: finalStatus,
-    rendered,
-    total,
-    error: finalError,
-    updated_at: new Date().toISOString(),
-    failed_pages: failedPages.length > 0 ? JSON.stringify(failedPages) : null,
-    first_failed_page: firstFailure?.page ?? null,
-  });
-
-  // Best-effort clean shutdown. Won't run if doc.getDocument() timed out
-  // above (we never got `doc` to close), but the outer .catch() in the
-  // drain function handles reporting for that case.
-  try { await doc.cleanup?.(); } catch { /* ignore */ }
-  try { await doc.destroy?.(); } catch { /* ignore */ }
+  _activeRender = active;
+  try {await active.done;} finally {if (_activeRender === active) _activeRender = null;}
 }
 
 // Remove all rendered pages for a doc, called from the DELETE handler.
@@ -642,6 +341,7 @@ export function reconcilePersistedPageImagePaths(): {
 
   const updates: { rowid: number; newPath: string }[] = [];
   for (const r of rows) {
+    if (r.image_path === "") continue; // Retained-PDF geometry is not a missing image.
     scanned += 1;
     if (existsSync(r.image_path)) continue;
     const resolved = resolvePageImageOnDisk(r.document_id, r.page_number);
@@ -713,6 +413,13 @@ export function purgePagesForDoc(document_id: string): void {
     // Refuse rather than deleting the pages root. Bad ids are a caller bug.
     console.error(`[pages] refusing purge for unsafe document id: ${JSON.stringify(document_id)}`);
     throw new Error("Refusing to purge pages for an unsafe document id");
+  }
+  for (let i = _renderQueue.length - 1; i >= 0; i--) {
+    if (_renderQueue[i].document_id === document_id) _renderQueue.splice(i, 1);
+  }
+  if (_currentJobId === document_id) {
+    _cancelledRenders.add(document_id);
+    _activeRender?.cancel();
   }
   try {
     if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });

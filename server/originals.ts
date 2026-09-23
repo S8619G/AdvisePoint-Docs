@@ -28,7 +28,9 @@
 // restore should include originals/ next to pages/. Both hooks live in
 // their respective modules and reference the helpers below.
 
-import { existsSync, mkdirSync, statSync, writeFileSync, rmSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, statSync, writeFileSync, rmSync, readdirSync,
+  lstatSync,readFileSync,openSync,closeSync,fsyncSync,linkSync,unlinkSync } from "node:fs";
+import {createHash,randomUUID} from "node:crypto";
 import { dirname, join } from "node:path";
 
 import { DB_FILE_PATH } from "./storage";
@@ -41,7 +43,7 @@ import { DB_FILE_PATH } from "./storage";
 // edit-in-place (server/editInbox.ts) for RTF documents. The stripper
 // throws away formatting on ingest for chunking, so we need the original
 // bytes to hand back to Word.
-const RETAINED_EXTENSIONS = new Set(["docx", "rtf"]);
+const RETAINED_EXTENSIONS = new Set(["pdf", "docx", "rtf"]);
 
 export function isRetainableExtension(ext: string): boolean {
   return RETAINED_EXTENSIONS.has(ext.toLowerCase().replace(/^\./, ""));
@@ -70,7 +72,7 @@ export function getOriginalsDir(): string {
 export function originalFilePath(documentId: string, ext: string): string {
   // Defensive: an id containing a path separator would be a bug elsewhere,
   // but reject rather than silently allow a directory escape.
-  if (/[\\/]/.test(documentId)) {
+  if (!/^[a-zA-Z0-9_-]+$/.test(documentId)) {
     throw new Error(`invalid document id for originals path: ${documentId}`);
   }
   const cleanExt = ext.toLowerCase().replace(/^\./, "");
@@ -104,6 +106,31 @@ export function saveOriginalIfRetainable(
   return ext;
 }
 
+/** Publish verified bytes without ever replacing another original. */
+export function saveVerifiedPdfOriginal(id:string,bytes:Buffer,expectedHash:string){
+  const hash=(b:Buffer)=>createHash("sha256").update(b).digest("hex");
+  if(hash(bytes)!==expectedHash)throw Error("Original fingerprint mismatch.");
+  const dir=getOriginalsDir(),target=originalFilePath(id,"pdf");
+  mkdirSync(dir,{recursive:true});
+  for(let at=dir;;at=dirname(at)){
+    if(lstatSync(at).isSymbolicLink())throw Error("Linked original paths are not supported.");
+    if(dirname(at)===at)break;
+  }
+  const verifyExisting=()=>{
+    const st=lstatSync(target);
+    if(!st.isFile()||st.isSymbolicLink()||hash(readFileSync(target))!==expectedHash)
+      throw Error("An existing original does not match.");
+  };
+  if(existsSync(target)){verifyExisting();return;}
+  const temp=originalFilePath(id,"pdf")+`.attach-${randomUUID()}.part`;
+  try{
+    const fd=openSync(temp,"wx",0o600);
+    try{writeFileSync(fd,bytes);fsyncSync(fd);}finally{closeSync(fd);}
+    if(hash(readFileSync(temp))!==expectedHash)throw Error("Stored original verification failed.");
+    try{linkSync(temp,target);}catch(e:any){if(e.code!=="EEXIST")throw e;verifyExisting();}
+  }finally{try{unlinkSync(temp);}catch{/* A leftover staged file is never advertised as an original. */}}
+}
+
 /**
  * Remove a retained original for a document. No-ops if the file doesn't
  * exist. Called from the delete-document flow.
@@ -134,6 +161,15 @@ export function originalExists(documentId: string, ext: string | null | undefine
   if (!RETAINED_EXTENSIONS.has(cleanExt)) return false;
   const p = originalFilePath(documentId, cleanExt);
   return existsSync(p);
+}
+
+/** Read-only availability check for the library's original-PDF download control. */
+export function originalPdfAvailable(documentId: string, ext: string | null | undefined): boolean {
+  if (ext !== "pdf") return false;
+  try {
+    const st = lstatSync(originalFilePath(documentId, "pdf"));
+    return st.isFile() && !st.isSymbolicLink() && st.size > 0;
+  } catch { return false; }
 }
 
 /**

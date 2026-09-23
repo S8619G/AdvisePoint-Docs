@@ -90,7 +90,11 @@ async function visible(p){
     const images=[...el.querySelectorAll("img")].filter(i=>{
       const r=i.getBoundingClientRect();return r.bottom>v.top+10&&r.top<v.bottom-10;
     });
-    return images.length>0&&images.every(i=>i.complete&&i.naturalWidth>0&&getComputedStyle(i).visibility==="visible");
+    const native=[...el.querySelectorAll('[data-testid^="native-page-"]')].filter(i=>{
+      const r=i.getBoundingClientRect();return r.bottom>v.top+10&&r.top<v.bottom-10;
+    });
+    return native.length>0 ? native.every(i=>i.dataset.state==="ready") :
+      images.length>0&&images.every(i=>i.complete&&i.naturalWidth>0&&getComputedStyle(i).visibility==="visible");
   },null,{timeout:15000});
 }
 async function wheel(p,stack,delta){
@@ -100,7 +104,7 @@ async function wheel(p,stack,delta){
   await p.waitForTimeout(80);
 }
 
-test("real rendered Welcome Guide survives a large native wheel jump",async()=>{
+test("real retained Welcome Guide survives a large native wheel jump",async()=>{
   const {p,stack,errors}=await open();
   try{
     await visible(p);
@@ -131,7 +135,7 @@ test("native scrollbar thumb drag loads the destination instead of stranding old
   try{
     // Explicit native scrollbar styling avoids hidden overlay scrollbars in CI.
     await p.addStyleTag({content:'[data-testid="viewer-continuous-stack"]::-webkit-scrollbar{width:18px}[data-testid="viewer-continuous-stack"]::-webkit-scrollbar-thumb{background:#666;min-height:24px}[data-testid="viewer-continuous-stack"]::-webkit-scrollbar-track{background:#ddd}'});
-    await p.waitForTimeout(100);
+    await p.waitForTimeout(300);
     const b=await stack.boundingBox();
     await p.mouse.move(b.x+b.width-9,b.y+10);await p.mouse.down();
     await p.mouse.move(b.x+b.width-9,b.y+b.height*.8,{steps:12});
@@ -194,6 +198,29 @@ test("not-yet-rendered pages retain continuous viewport and recover through poll
     await visible(p);
     await p.getByTestId("page-image-frame-400").locator("img").waitFor({state:"visible"});
     assert.equal(await p.getByTestId("input-page-jump").inputValue(),"400");
+  }finally{await p.close();}
+});
+
+test("rendered-page printing goes directly to preparation without a browser confirmation",async()=>{
+  const {p}=await open(true);
+  try{
+    await visible(p);
+    const dialogs=[];p.on("dialog",async d=>{dialogs.push(d.message());await d.dismiss();});
+    await p.evaluate(()=>{window.__printDestinations=[];window.open=(url)=>{window.__printDestinations.push(String(url));return null;};});
+    for(const [mode,from,to] of [["all",1,791],["range",5,200],["current",1,1]]){
+      await p.getByTestId("button-print-page").click();
+      await p.getByTestId(`radio-print-${mode}`).check();
+      if(mode==="range"){await p.getByTestId("input-print-from").fill("5");await p.getByTestId("input-print-to").fill("200");}
+      await p.getByTestId("button-print-confirm").click();
+      const urls=await p.evaluate(()=>window.__printDestinations);
+      assert.equal(dialogs.length,0,"No native confirmation dialog is allowed");
+      assert.equal(urls.length,0,"Preparation must not open a browser tab");
+      const target=new URL(await p.getByTestId("print-preparation-frame").getAttribute("src"));assert.match(target.pathname,/^\/api\/rendered-print\//);
+      assert.equal(target.searchParams.get("from"),String(from));assert.equal(target.searchParams.get("to"),String(to));
+      assert.equal(await p.getByTestId("popover-print-range").count(),0);
+      await p.getByTestId("print-preparation-done").click();
+      await p.getByTestId("print-preparation-dialog").waitFor({state:"hidden"});
+    }
   }finally{await p.close();}
 });
 

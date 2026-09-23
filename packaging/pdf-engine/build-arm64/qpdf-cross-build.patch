@@ -1,0 +1,20 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -189,7 +189,7 @@
+ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+ 
+ if(WIN32 AND NOT SKIP_OS_SECURE_RANDOM)
+-  list(APPEND CMAKE_REQUIRED_LIBRARIES Advapi32)
++  list(APPEND CMAKE_REQUIRED_LIBRARIES advapi32)
+ endif()
+ 
+ include(CheckCXXSourceCompiles)
+@@ -257,7 +257,7 @@
+ if(MINGW)
+   get_filename_component(MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+   execute_process(
+-    COMMAND gcc --print-file-name=CRT_glob.o
++    COMMAND ${CMAKE_C_COMPILER} --print-file-name=CRT_glob.o
+     OUTPUT_VARIABLE CRT_GLOB_O
+     OUTPUT_STRIP_TRAILING_WHITESPACE
+   )

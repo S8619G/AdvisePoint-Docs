@@ -1,6 +1,6 @@
 import { build as esbuild } from "esbuild";
 import { build as viteBuild } from "vite";
-import { rm, readFile, readdir, stat, mkdir, cp, mkdtemp, access } from "node:fs/promises";
+import { rm, readFile, readdir, stat, mkdir, cp, mkdtemp, access, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -225,6 +225,28 @@ async function buildAll() {
 
   console.log("building client...");
   await viteBuild();
+  // Retained-PDF viewing and printing must work entirely offline.
+  await mkdir("dist/public/pdfjs", {recursive:true});
+  for (const dir of ["cmaps","standard_fonts","wasm"]) {
+    await cp(`node_modules/pdfjs-dist/${dir}`, `dist/public/pdfjs/${dir}`, {recursive:true});
+  }
+  await cp("node_modules/pdfjs-dist/build/pdf.worker.min.mjs", "dist/public/pdfjs/pdf.worker.min.mjs");
+  await esbuild({
+    entryPoints:["client/src/pdf-handoff.ts"], platform:"browser", bundle:true,
+    format:"esm", target:"es2022", outfile:"dist/public/pdf-handoff.js", minify:true,
+  });
+  await esbuild({
+    entryPoints:["client/src/rendered-print.ts"], platform:"browser", bundle:true,
+    format:"esm", target:"es2022", outfile:"dist/public/rendered-print.js", minify:true,
+  });
+  await esbuild({
+    entryPoints:["client/src/pdf-print.ts"], platform:"browser", bundle:true,
+    format:"esm", target:"es2022", outfile:"dist/public/pdf-print.js", minify:true,
+  });
+  await esbuild({
+    entryPoints:["client/src/pdf-print-worker.ts"], platform:"browser", bundle:true,
+    format:"esm", target:"es2022", outfile:"dist/public/pdf-print-worker.js", minify:true,
+  });
 
   // v1.0.13.1 guard #2: CSS bundle must be at least MIN_CSS_BUNDLE_BYTES.
   console.log("checking CSS bundle size...");
@@ -277,6 +299,7 @@ async function buildAll() {
   // this build script is invoked from Linux/macOS.
   console.log("smoke-testing built server...");
   await smokeTestBuiltServer();
+  await writeFile("dist/build-mode.json", JSON.stringify({local_test:process.env.VITE_APD_LOCAL_TEST==="1"}));
 }
 
 async function smokeTestBuiltServer(): Promise<void> {

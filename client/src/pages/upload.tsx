@@ -453,6 +453,7 @@ export default function Upload() {
   }, [files, filenameCodes, shared.product_model, shared.product_family]);
 
   const invalidateAll = () => {
+    qc.invalidateQueries({ queryKey: ["/api/document-types"] });
     qc.invalidateQueries({ queryKey: ["/api/stats"] });
     qc.invalidateQueries({ queryKey: ["/api/documents"] });
     qc.invalidateQueries({ queryKey: ["/api/facets"] });
@@ -660,12 +661,13 @@ export default function Upload() {
 
   // -------- Upload one file --------
   // Wrapped so the batch loop can call it sequentially and update per-file status.
-  const uploadOne = async (entry: FileEntry, metaOverride: Meta): Promise<FileEntry> => {
+  const uploadOne = async (entry: FileEntry, metaOverride: Meta, rendered = false): Promise<FileEntry> => {
     const metadata: any = buildMetadataPayload(metaOverride, entry.file.name);
     try {
       const fd = new FormData();
       fd.append("file", entry.file);
       fd.append("metadata", JSON.stringify(metadata));
+      if (rendered) fd.append("pdf_import_mode","rendered");
       const res = await fetch("/api/upload", { method: "POST", body: fd });
       if (!res.ok) {
         // Try to pull a useful error message, but never leak raw HTML/stack traces.
@@ -673,6 +675,11 @@ export default function Upload() {
         try {
           const j = await res.json();
           if (j?.message) msg = j.message;
+          if (j?.fallback_available === true && !rendered) {
+            return {...entry,status:"error",message:msg,
+              result:{fallbackAvailable:true,retryMeta:metaOverride,upload_id:j.upload_id}};
+          }
+          if (j?.upload_id) msg += ` (Upload ${j.upload_id})`;
         } catch {
           /* not JSON — keep the HTTP code */
         }
@@ -684,12 +691,32 @@ export default function Upload() {
         status: "done",
         message: `Added ${data.chunks?.length ?? 0} excerpts${
           data.extraction?.page_count ? ` · ${data.extraction.page_count} pages` : ""
-        }`,
+        }${data.pdf_prepared ? " · Compatible PDF saved (one copy)" : ""}${data.rendering ? " · Page images are being prepared in the background" : ""}`,
         result: data,
       };
     } catch (err: any) {
       return { ...entry, status: "error", message: err?.message ?? "Upload failed" };
     }
+  };
+
+  const runRenderedFallback = async (key: string) => {
+    if (uploadingKey !== null) return;
+    const entry = files.find(f=>f.key === key);
+    if (!entry?.result?.fallbackAvailable) return;
+    setUploadingKey(key);
+    setFiles(prev=>prev.map(f=>f.key===key ? {...f,status:"uploading",message:"Importing with rendered pages…"} : f));
+    try {
+      const finished = await uploadOne(entry,entry.result.retryMeta,true);
+      if (finished.status === "done") {
+        setCompletedUploads(prev=>[finished.result,...prev]);
+        setFiles(prev=>prev.filter(f=>f.key!==key));
+        toast({title:"Document added",description:"Search is available. Page images are being prepared in the background."});
+      } else {
+        setFiles(prev=>prev.map(f=>f.key===key ? finished : f));
+        toast({title:"Rendered-page import failed",description:finished.message,variant:"destructive"});
+      }
+      invalidateAll();
+    } finally {setUploadingKey(null);}
   };
 
   // -------- Sequential batch loop --------
@@ -715,7 +742,7 @@ export default function Upload() {
     for (const entry of snapshot) {
       // Mark uploading
       setUploadingKey(entry.key);
-      setFiles((prev) => prev.map((f) => (f.key === entry.key ? { ...f, status: "uploading", message: "" } : f)));
+      setFiles((prev) => prev.map((f) => (f.key === entry.key ? { ...f, status: "uploading", message: "Importing; preparing a compatible PDF automatically if needed…" } : f)));
 
       // v1.1.8: three modes, each sends what its UI advertises. Prior to v1.1.8
       // this line was `isBatch ? emptyMeta() : shared`, which pre-dated the
@@ -871,6 +898,8 @@ export default function Upload() {
               onToggle={toggleExpanded}
               onPatchMeta={updateFileMeta}
               duplicateNames={duplicateNames}
+              onFallback={runRenderedFallback}
+              busy={pending}
             />
           )}
 
@@ -1240,7 +1269,11 @@ function FileList({
   onToggle,
   onPatchMeta,
   duplicateNames,
+  onFallback,
+  busy,
 }: {
+  onFallback: (key: string) => void;
+  busy: boolean;
   files: FileEntry[];
   isBatch: boolean;
   mode: UploadMode;
@@ -1325,6 +1358,8 @@ function FileList({
               onToggle={() => onToggle(f.key)}
               onPatchMeta={(patch) => onPatchMeta(f.key, patch)}
               isDuplicate={duplicateNames.has(stem)}
+              onFallback={()=>onFallback(f.key)}
+              busy={busy}
             />
           );
         })}
@@ -1340,7 +1375,11 @@ function FileRow({
   onToggle,
   onPatchMeta,
   isDuplicate,
+  onFallback,
+  busy,
 }: {
+  onFallback: () => void;
+  busy: boolean;
   entry: FileEntry;
   perFileMode: boolean;
   onRemove: () => void;
@@ -1351,6 +1390,7 @@ function FileRow({
   // — the user can still submit; the server will accept the upload.
   isDuplicate: boolean;
 }) {
+  const [fallbackOpen,setFallbackOpen] = useState(false);
   const sizeKb = (entry.file.size / 1024).toFixed(1);
   const sizeMb = (entry.file.size / 1024 / 1024).toFixed(1);
   const sizeText = entry.file.size > 1024 * 1024 ? `${sizeMb} MB` : `${sizeKb} KB`;
@@ -1418,6 +1458,28 @@ function FileRow({
         )}
       </div>
 
+      {entry.status === "error" && entry.result?.fallbackAvailable && (
+        <div className="flex flex-wrap gap-2 border-t p-3">
+          <Button type="button" disabled={busy} onClick={()=>setFallbackOpen(true)} data-testid="button-rendered-fallback">Import with rendered pages</Button>
+          <Button type="button" variant="outline" disabled={busy} onClick={onRemove}>Skip this file</Button>
+          <AlertDialog open={fallbackOpen} onOpenChange={setFallbackOpen}>
+            <AlertDialogContent data-testid="dialog-rendered-fallback">
+              <AlertDialogHeader>
+                <AlertDialogTitle>Import with rendered pages?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  {entry.file.name} restricts copying. If you are authorized to import it, this option uses the legacy searchable-text import and creates a stored image of every page.
+                  Your library and backups can become substantially larger, and a long manual can take several minutes to prepare.
+                  The original PDF is retained alongside the rendered pages for large print jobs. This uses additional storage and does not remove or change PDF restrictions.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Not now</AlertDialogCancel>
+                <AlertDialogAction disabled={busy} onClick={onFallback} data-testid="button-confirm-rendered-fallback">Import with rendered pages</AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        </div>
+      )}
       {perFileMode && entry.expanded && (
         <div className="space-y-4 border-t border-border p-3">
           <MetaForm

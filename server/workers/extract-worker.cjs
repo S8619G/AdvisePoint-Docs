@@ -76,15 +76,37 @@ function normalizePdfText(raw) {
 // -----------------------------------------------------------------------------
 // The actual extraction logic — moved verbatim from server/extract.ts.
 // -----------------------------------------------------------------------------
-async function extractTextFromFile(filename, buffer) {
+async function extractTextFromFile(filename, buffer, renderedFallback = false) {
   const lower = filename.toLowerCase();
 
   if (lower.endsWith(".pdf")) {
     const PDFParse = loadPdfParse();
     const parser = new PDFParse({ data: new Uint8Array(buffer) });
     try {
+      const info = await parser.getInfo({parsePageInfo:true});
+      // Inspect permissions before indexing any extracted content. Do not
+      // treat accessibility-only extraction as general copy permission.
+      const restricted = Array.isArray(info.permission) && !info.permission.includes(16);
+      const canPrint = !Array.isArray(info.permission) || (info.permission.includes(4) && info.permission.includes(2048));
+      // Compatibility mode is explicit user consent to the legacy 1.2.8
+      // searchable import. Never change encryption/permission bytes, accept
+      // opening passwords, or offer image conversion for print-disabled PDFs.
+      if ((restricted || renderedFallback) && !canPrint) {
+        const err = new Error("This PDF does not permit full-quality printing. Rendered-page import is unavailable; use an authorized unrestricted copy.");
+        err.code = "PDF_RENDER_RESTRICTED";
+        throw err;
+      }
+      if (restricted && !renderedFallback) {
+        const err = new Error("This PDF restricts copying. You can choose a legacy rendered-page import if authorized, or skip this file. No document was imported.");
+        err.code = "PDF_COPY_RESTRICTED";
+        throw err;
+      }
       const result = await parser.getText();
+      if (info.pages.length !== result.total) throw new Error("PDF page geometry is incomplete.");
       return {
+        pages: info.pages.map(p=>({
+          page_number:p.pageNumber, width:p.width * 240 / 72, height:p.height * 240 / 72,
+        })),
         text: normalizePdfText(result.text ?? ""),
         page_count:
           typeof result.total === "number"
@@ -156,11 +178,15 @@ parentPort.on("message", async (msg) => {
     if (typeof filename !== "string" || !(buffer instanceof ArrayBuffer)) {
       throw new Error("extract-worker: bad message shape");
     }
-    const result = await extractTextFromFile(filename, buffer);
+    const result = await extractTextFromFile(filename, buffer, msg.renderedFallback === true);
     parentPort.postMessage({ id, ok: true, result });
   } catch (err) {
-    const message = err && err.message ? String(err.message) : String(err);
-    parentPort.postMessage({ id, ok: false, error: message });
+    const password = err?.name === "PasswordException";
+    const code = password ? "PDF_PASSWORD_REQUIRED" : err?.code;
+    const message = password
+      ? "This PDF requires an opening password. Password-protected import is not supported in AdvisePoint Docs. No document was imported and no password was saved. If authorized, use a separate unlocked copy."
+      : err && err.message ? String(err.message) : String(err);
+    parentPort.postMessage({ id, ok: false, error: message, code });
   }
 });
 

@@ -200,6 +200,8 @@ CREATE TABLE IF NOT EXISTS documents (
   file_hash_sha256 TEXT,
   -- v1.0.6: see shared/schema.ts documents.original_ext for the full rationale.
   original_ext TEXT,
+  pdf_rendered INTEGER NOT NULL DEFAULT 0,
+  pdf_compatibility TEXT,
   ingested_at TEXT NOT NULL,
   pipeline_version TEXT NOT NULL DEFAULT 'advisepoint-docs-1.0.0',
   tags_json TEXT NOT NULL DEFAULT '[]',
@@ -365,6 +367,8 @@ const BUILTIN_DOCUMENT_TYPE_LABELS: Record<string, string> = {
     // which is exactly the signal the client uses to surface the "legacy
     // upload -- re-upload to view original formatting" banner.
     { col: "original_ext", ddl: "ALTER TABLE documents ADD COLUMN original_ext TEXT" },
+    { col: "pdf_rendered", ddl: "ALTER TABLE documents ADD COLUMN pdf_rendered INTEGER NOT NULL DEFAULT 0" },
+    { col: "pdf_compatibility", ddl: "ALTER TABLE documents ADD COLUMN pdf_compatibility TEXT" },
   ];
   for (const w of wanted) {
     if (!have.has(w.col)) {

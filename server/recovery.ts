@@ -403,7 +403,27 @@ export async function restoreQuarantined(folderName: string): Promise<RestoreOut
     // (d) Rebuild document_pages rows from the restored images. Dimensions
     //     are decoded once per image; the restore path is rare enough that
     //     the extra I/O is acceptable.
-    if (movedPagesInto) {
+    if (docRow.original_ext === "pdf" && !docRow.pdf_rendered) {
+      if (!restoredOriginal) throw new Error("The retained PDF is missing; recovery was not committed.");
+      let geometry: any[];
+      const savedRows = join(dir, "page-rows.json");
+      if (existsSync(savedRows)) geometry = JSON.parse(readFileSync(savedRows,"utf8"));
+      else {
+        // Older quarantine folders did not preserve native PDF geometry.
+        const {extractTextFromFile} = await import("./extract");
+        const extracted = await extractTextFromFile("restore.pdf",readFileSync(movedOriginalTo!));
+        geometry = extracted.pages ?? [];
+      }
+      if (!Array.isArray(geometry) || !geometry.length ||
+          geometry.some((p,i)=>p.page_number!==i+1 || !Number.isFinite(p.width) ||
+            !Number.isFinite(p.height) || p.width<=0 || p.height<=0))
+        throw new Error("The native PDF page geometry is incomplete.");
+      for(const p of geometry)storage.upsertPage({document_id:docId,page_number:p.page_number,
+        width:p.width,height:p.height,image_path:"",generated_at:new Date().toISOString()});
+      storage.upsertRenderStatus({document_id:docId,status:"ready",rendered:geometry.length,
+        total:geometry.length,error:null,updated_at:new Date().toISOString()});
+      restoredPageRows=geometry.length;
+    } else if (movedPagesInto) {
       restoredPageRows = await rebuildPageRowsForRestore(docId, movedPagesInto);
     }
 

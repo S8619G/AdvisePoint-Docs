@@ -520,6 +520,7 @@ test("v1.2.5 Settings has four ordered tabs and keeps Welcome/values paired", as
       ["System", "Formats", "Backup / Restore", "Developer"]);
     assert.equal(await page.getByTestId("tab-system").getAttribute("data-state"), "active");
     assert.ok(bannerReads > 0, "banner still fetches on System mount");
+    await page.getByTestId("button-restore-banner-dismiss").waitFor();
     assert.match(await page.locator('[role="tabpanel"][data-state="active"] > :first-child').innerText(),
       /Restore completed/);
     const active = page.locator('[role="tabpanel"][data-state="active"]');

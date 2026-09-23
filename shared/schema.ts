@@ -132,6 +132,10 @@ export const documents = sqliteTable("documents", {
   // viewer's PdfPageViewerDialog/DocxViewerDialog routing, and the
   // "Re-upload for viewing" banner on legacy docs.
   original_ext: text("original_ext"),
+  // Retaining a fallback PDF must not switch its viewer away from saved images.
+  pdf_rendered: integer("pdf_rendered").notNull().default(0),
+  // JSON provenance only, not a second PDF. file_hash_sha256 hashes retained bytes.
+  pdf_compatibility: text("pdf_compatibility"),
 
   // stats
   total_chunks: integer("total_chunks").notNull().default(0),

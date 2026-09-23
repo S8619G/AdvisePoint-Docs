@@ -211,3 +211,11 @@ export const queryClient = new QueryClient({
     },
   },
 });
+// Type usage is library data, not a permanent settings snapshot. Any library
+// invalidation (import, edit, delete, restore, merge) invalidates its counters too.
+queryClient.getQueryCache().subscribe(event => {
+  if(event.type==="updated" && event.action.type==="invalidate" &&
+    ["/api/documents","/api/stats"].includes(String(event.query.queryKey[0]))) {
+    void queryClient.invalidateQueries({queryKey:["/api/document-types"]});
+  }
+});

@@ -1,4 +1,6 @@
 import type { Express, Request } from "express";
+import { pdfRoutes } from "./pdf-routes";
+import { originalPdfAvailable } from "./originals";
 import { createServer } from "node:http";
 import type { Server } from "node:http";
 import { createHash } from "node:crypto";
@@ -49,6 +51,7 @@ import {
   type QueryHistoryEntry,
 } from "./query-history";
 import { extractTextFromFile } from "./extract";
+import {prepareCompatiblePdf} from "./pdf-compat";
 import { deriveLocation } from "./locate";
 import { scheduleRender, purgePagesForDoc, pageFilePath, getRenderQueueSnapshot, isSafeDocIdForPathUse, hasRenderedPageFiles, resolvePageImageOnDisk } from "./pages";
 import { quarantineDocument } from "./quarantine";
@@ -125,6 +128,7 @@ import {
   clearRestoreSidefile,
 } from "./restore-sidefile";
 import { appendBackupLog, appendBackupLogSessionStart, backupLogPath, BACKUP_LOG_NAME, BACKUP_LOG_ROTATED_NAME } from "./backup-log";
+import {startUploadLog, trackUpload, uploadStage, UPLOAD_LOG_NAMES} from "./upload-log";
 import { unlinkSync } from "node:fs";
 import {
   ingestRequestSchema,
@@ -169,6 +173,7 @@ function documentTypeError(res: any, error: unknown) {
 }
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
+  startUploadLog(APP_VERSION);
   // -------- v0.9.26: Health check --------
   // Lightweight endpoint the client polls to detect a dead backend so it can
   // show a "please restart the app" overlay instead of a generic error.
@@ -443,6 +448,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       // down running server" and "launch after update" prompts, and
       // APD_UPDATE_NO_PROMPT skips the two "press Enter to close" waits.
       // The user just sees the app disconnect and reconnect on the new build.
+      clearUpdaterStatus();
       const child = spawn(`"${launcherPath}"`, [], {
         detached: true,
         stdio: "ignore",
@@ -489,6 +495,30 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     : null;
   const SENTINEL_FLOOR_MS = 5 * 60 * 1000; // 5 min
   const SENTINEL_CEILING_MS = 24 * 60 * 60 * 1000; // 24 h
+
+  const updaterStatusPath = process.env.LOCALAPPDATA
+    ? join(process.env.LOCALAPPDATA, "AdvisePoint Docs", "update-status.json")
+    : null;
+  function clearUpdaterStatus() {
+    if (updaterStatusPath && existsSync(updaterStatusPath)) unlinkSync(updaterStatusPath);
+  }
+  app.get("/api/updater/status", (req, res) => {
+    const remote = req.socket.remoteAddress ?? "";
+    if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote)) return res.sendStatus(403);
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      if (!updaterStatusPath || !existsSync(updaterStatusPath)) return res.json({ phase: "idle" });
+      const data = JSON.parse(readFileSync(updaterStatusPath, "utf8"));
+      return res.json({
+        phase: ["preparing", "installing", "complete", "failed"].includes(data.phase) ? data.phase : "idle",
+        message: typeof data.message === "string" ? data.message.slice(0, 1500) : "",
+        startedAt: Number(data.startedAt) || 0,
+        updatedAt: Number(data.updatedAt) || 0,
+      });
+    } catch {
+      return res.json({ phase: "idle" });
+    }
+  });
 
   function readSentinelStatus(): {
     present: boolean;
@@ -805,6 +835,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       });
     }
     try {
+      clearUpdaterStatus();
       const child = spawn(`"${launcherPath}"`, [], {
         detached: true,
         stdio: "ignore",
@@ -1706,6 +1737,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const missing_pages: { id: string; title: string; total_pages: number; missing: number[] }[] = [];
     for (const d of docs) {
       const totalPages = (d as any).total_pages as number | null | undefined;
+      if ((d as any).original_ext === "pdf" && !d.pdf_rendered && originalExists(d.id, "pdf")) continue;
       if (!totalPages || totalPages <= 0) continue;
       const status = storage.getRenderStatus(d.id);
       // Skip docs that never had a PDF or are still rendering — nothing to check.
@@ -1762,7 +1794,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       height: p.height,
       url: `/api/documents/${req.params.id}/pages/${p.page_number}.jpg`,
     }));
-    res.json({ document_id: req.params.id, pages });
+    res.json({ document_id: req.params.id, pages,pdf_prepared:!!doc.pdf_compatibility,
+      viewer: (doc as any).original_ext === "pdf" && !doc.pdf_rendered ? "pdf-native" : "page-images" });
   });
 
   // Stream one page image. Path is validated against the DB row so we never
@@ -1929,8 +1962,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       // Prefer download-name that matches the original file so "Save As"
       // in the browser doesn't produce "<uuid>.docx".
       const safeName = (doc.file_name ?? `document.${ext}`).replace(/["\\]/g, "_");
-      res.setHeader("Content-Disposition", `inline; filename="${safeName}"`);
-      createReadStream(filePath).pipe(res);
+      if (req.query.download !== "1") res.setHeader("Content-Disposition", `inline; filename="${safeName}"`);
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      if (req.query.download === "1") {
+        if (ext === "pdf" && !originalPdfAvailable(doc.id, ext))
+          return res.status(404).json({message:"retained original unavailable",reason:"original_missing"});
+        const downloadName = (doc.file_name || `document.${ext}`).replace(/[/\\\x00-\x1f\x7f]/g, "_");
+        return res.download(filePath, downloadName);
+      }
+      res.sendFile(filePath);
     } catch (err) {
       console.error(`[originals] stream failed for ${req.params.id}:`, err);
       if (!res.headersSent) res.status(500).json({ message: "read failed" });
@@ -2007,9 +2048,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     },
   });
 
-  app.post("/api/upload", upload.single("file"), async (req: Request, res) => {
+  app.post("/api/upload", trackUpload, (req, res, next) => {
+    upload.single("file")(req,res,(err: any)=>{
+      if (!err) return next();
+      uploadStage(res,"receive_failed",{code:err.code === "LIMIT_FILE_SIZE" ? "FILE_TOO_LARGE" : "MULTIPART_FAILED"});
+      return res.status(err.code === "LIMIT_FILE_SIZE" ? 413 : 400).json({
+        message:err.code === "LIMIT_FILE_SIZE" ? "This file exceeds the 150 MB upload limit." : "The upload could not be received. Please select the file again.",
+        upload_id:res.locals.upload.upload_id,
+      });
+    });
+  }, async (req: Request, res) => {
     try {
       if (!req.file) {
+        uploadStage(res,"rejected",{code:"UNSUPPORTED_OR_MISSING_FILE"});
         // Two reasons this fires: no `file` field, or multer's fileFilter
         // rejected the type. The client sends a file field ~always, so a
         // missing file at this point almost certainly means bad MIME/extension.
@@ -2023,18 +2074,56 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         });
       }
 
+      const mode = req.body?.pdf_import_mode ?? "native";
+      uploadStage(res,"received",{filename:req.file.originalname,bytes:req.file.size,mode});
+      if (!["native","rendered"].includes(mode) || (mode === "rendered" && !req.file.originalname.toLowerCase().endsWith(".pdf"))) {
+        uploadStage(res,"rejected",{code:"INVALID_IMPORT_MODE"});
+        return res.status(400).json({message:"Invalid PDF import mode."});
+      }
       // Parse the metadata JSON blob that the client posts alongside the file
       const metaRaw = typeof req.body?.metadata === "string" ? req.body.metadata : "{}";
       let metaObj: Record<string, unknown>;
       try {
         metaObj = JSON.parse(metaRaw);
       } catch {
+        uploadStage(res,"rejected",{code:"INVALID_METADATA_JSON"});
         return res.status(400).json({ message: "metadata field is not valid JSON" });
       }
 
       // Extract text
-      const extracted = await extractTextFromFile(req.file.originalname, req.file.buffer);
+      uploadStage(res,"extracting");
+      let retainedBytes = req.file.buffer;
+      let compatibility: string | null = null;
+      let extracted;
+      const controller = new AbortController();
+      const disconnected = () => { if (!res.writableFinished) controller.abort(); };
+      res.once("close", disconnected);
+      try {
+        try {
+          extracted = await extractTextFromFile(req.file.originalname, retainedBytes, mode === "rendered");
+        } catch (err: any) {
+          if (mode !== "native" || err?.code !== "PDF_COPY_RESTRICTED") throw err;
+          try {
+            retainedBytes = await prepareCompatiblePdf(retainedBytes, controller.signal,
+              stage => uploadStage(res, stage));
+            extracted = await extractTextFromFile(req.file.originalname, retainedBytes);
+            compatibility = JSON.stringify({engine:"QPDF 12.4.1",
+              source_sha256:createHash("sha256").update(req.file.buffer).digest("hex"),
+              source_bytes:req.file.buffer.length,retained_bytes:retainedBytes.length,
+              prepared_at:new Date().toISOString()});
+          } catch (cause: any) {
+            console.error("[pdf-compat] preparation refused:", cause?.message);
+            throw Object.assign(new Error("A compatible PDF could not be prepared safely. Retry, choose rendered-page import if authorized, or use an authorized unrestricted copy. No document was imported."),
+              {code:"PDF_COPY_RESTRICTED"});
+          }
+        }
+        if(controller.signal.aborted)throw Error("Import cancelled before library commit.");
+      } finally {
+        res.removeListener("close", disconnected);
+      }
+      uploadStage(res,"extracted",{pages:extracted.page_count ?? 0});
       if (!extracted.text || extracted.text.trim().length < 20) {
+        uploadStage(res,"rejected",{code:"INSUFFICIENT_TEXT"});
         return res.status(422).json({
           message: `Extracted less than 20 characters of text from ${req.file.originalname}. If this is a scanned PDF, it needs OCR first.`,
         });
@@ -2056,25 +2145,62 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
       const parsed = ingestRequestSchema.safeParse(merged);
       if (!parsed.success) {
+        uploadStage(res,"rejected",{code:"INVALID_METADATA"});
         return res.status(400).json({
           message: "invalid metadata",
           issues: parsed.error.flatten(),
         });
       }
       if (!storage.documentTypeExists(parsed.data.document_type)) {
+        uploadStage(res,"rejected",{code:"UNKNOWN_DOCUMENT_TYPE"});
         return res.status(400).json({ message: "That document type no longer exists." });
       }
 
+      uploadStage(res,"indexing");
       const result = await ingestParsed(parsed.data);
+      uploadStage(res,"indexed",{document_id:result.document.id});
 
       // v0.9.7 — fire off page rendering for PDFs. Runs in the background so
       // the client sees the doc immediately; viewer polls /pages/status while
       // it works. Non-PDFs skip this entirely.
       if (extracted.format === "pdf" && result?.document?.id) {
         try {
-          scheduleRender(result.document.id, req.file.buffer);
+          const id = result.document.id;
+          if (mode === "rendered") {
+            if (saveOriginalIfRetainable(id, req.file.originalname, req.file.buffer) !== "pdf")
+              throw Error("PDF original could not be retained.");
+            storage.updateDocumentMeta(id, {original_ext:"pdf",pdf_rendered:1,
+              file_hash_sha256:createHash("sha256").update(req.file.buffer).digest("hex")});
+            scheduleRender(id,req.file.buffer);
+            uploadStage(res,"render_queued");
+            return res.json({...result,document:hydrateDocument(storage.getDocument(id)!),
+              extraction:{format:"pdf",page_count:extracted.page_count,char_count:extracted.text.length},
+              viewer:"page-images",rendering:true,upload_id:res.locals.upload.upload_id});
+          }
+          if (!extracted.pages?.length) throw new Error("PDF has no page geometry.");
+          const saved = saveOriginalIfRetainable(id, req.file.originalname, retainedBytes);
+          if (saved !== "pdf") throw new Error("PDF original could not be retained.");
+          rawDb.transaction(() => {
+            storage.updateDocumentMeta(id, {original_ext:"pdf",pdf_compatibility:compatibility,
+              file_hash_sha256:createHash("sha256").update(retainedBytes).digest("hex")});
+            for (const p of extracted.pages!) storage.upsertPage({
+              document_id:id, ...p, image_path:"", generated_at:new Date().toISOString(),
+            });
+            storage.upsertRenderStatus({
+              document_id:id, status:"ready", rendered:extracted.pages!.length,
+              total:extracted.pages!.length, error:null, updated_at:new Date().toISOString(),
+            });
+          })();
+          uploadStage(res,"complete");
+          return res.json({...result, document:hydrateDocument(storage.getDocument(id)!),upload_id:res.locals.upload.upload_id,
+            extraction:{format:"pdf",page_count:extracted.pages.length,char_count:extracted.text.length},
+            viewer:"pdf-native",pdf_prepared:!!compatibility});
         } catch (err) {
-          console.error("[upload] scheduleRender failed:", err);
+          // ingestParsed always allocates a new id, never an existing library row.
+          removeOriginal(result.document.id, "pdf");
+          purgePagesForDoc(result.document.id);
+          storage.deleteDocument(result.document.id);
+          throw err;
         }
       }
 
@@ -2103,8 +2229,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         }
       }
 
+      uploadStage(res,"complete");
       return res.json({
         ...result,
+        upload_id:res.locals.upload.upload_id,
         extraction: {
           format: extracted.format,
           page_count: extracted.page_count,
@@ -2112,8 +2240,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         },
       });
     } catch (err: any) {
+      const known = ["PDF_PASSWORD_REQUIRED","PDF_COPY_RESTRICTED","PDF_RENDER_RESTRICTED"].includes(err?.code);
+      uploadStage(res,"failed",{code:known ? err.code : "IMPORT_FAILED"});
+      if (known) {
+        return res.status(422).json({code:err.code,message:err.message,
+          fallback_available:err.code === "PDF_COPY_RESTRICTED",upload_id:res.locals.upload.upload_id});
+      }
       console.error("[upload] failed:", err);
-      return res.status(500).json({ message: err?.message ?? "upload failed" });
+      return res.status(500).json({ message:"The import failed. Export diagnostics for details and check the library before retrying.",upload_id:res.locals.upload.upload_id });
     }
   });
 
@@ -2169,6 +2303,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       file_hash_sha256: createHash("sha256").update(r.body).digest("hex"),
       ingested_at: now,
       pipeline_version: "advisepoint-docs-1.0.0",
+      original_ext: null,
+      pdf_rendered: 0,
+      pdf_compatibility: null,
       tags_json: JSON.stringify(r.tags),
       keywords_json: JSON.stringify(r.keywords),
       // v0.9.30: title accent color — not settable at ingest time; users
@@ -2391,10 +2528,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const doc = storage.getDocument(documentId);
     if (!doc) return res.status(404).json({ error: "document not found" });
     const ext = (doc as any).original_ext as string | null;
-    if (!ext) {
+    if (!ext || !["docx","rtf"].includes(ext.toLowerCase())) {
       return res.status(400).json({
         error:
-          "this document has no retained original; only DOCX uploads from v1.0.6+ can be edited in place",
+          "Only retained DOCX and RTF documents can be edited in place. PDFs open as temporary copies.",
       });
     }
     try {
@@ -2479,7 +2616,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const doc = storage.getDocument(docId);
         if (!doc) return res.status(404).json({ message: "document not found" });
         const currentExt = ((doc as any).original_ext ?? null) as string | null;
-        if (!currentExt || !isRetainableExtension(currentExt)) {
+        if (!currentExt || !["docx","rtf"].includes(currentExt.toLowerCase())) {
           return res.status(400).json({
             message: "this document does not have a retained original -- upload a new file instead",
           });
@@ -2531,7 +2668,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const doc = storage.getDocument(docId);
         if (!doc) return res.status(404).json({ message: "document not found" });
         const currentExt = ((doc as any).original_ext ?? null) as string | null;
-        if (!currentExt || !isRetainableExtension(currentExt)) {
+        if (!currentExt || !["docx","rtf"].includes(currentExt.toLowerCase())) {
           return res.status(400).json({
             message: "this document does not have a retained original -- upload a new file instead",
           });
@@ -2643,7 +2780,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const doc = storage.getDocument(docId);
       if (!doc) return res.status(404).json({ message: "document not found" });
       const currentExt = ((doc as any).original_ext ?? null) as string | null;
-      if (!currentExt || !isRetainableExtension(currentExt)) {
+      if (!currentExt || !["docx","rtf"].includes(currentExt.toLowerCase())) {
         return res.status(400).json({ message: "nothing to undo -- no retained original" });
       }
       const token = String(req.body?.token || "");
@@ -2945,6 +3082,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       for (const name of [
         "server.log",
         "server.log.1",
+        ...UPLOAD_LOG_NAMES,
         BACKUP_LOG_NAME,
         BACKUP_LOG_ROTATED_NAME,
         "update.log",
@@ -3062,6 +3200,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         `[app]`,
         `version: ${APP_VERSION}`,
         `cwd: ${process.cwd()}`,
+        `upload_logging: ${existsSync(join(logDir,"uploads.log")) ? "journal present" : "UNAVAILABLE - inspect disk space and log permissions"}`,
+        `upload_log_privacy: includes filenames and document IDs; no document text or metadata`,
         `log_dir: ${logDir}`,
         `backup_log: ${backupLogPath() ?? "(unresolved)"}${
           backupLogPath() && existsSync(backupLogPath() as string) ? "" : " (not yet created)"
@@ -3324,7 +3464,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/backup/size", (_req, res) => {
     try {
       const raw = currentBackupRawSize();
-      const total = raw.db_bytes + raw.pages_bytes;
+      const total = raw.db_bytes + raw.pages_bytes + raw.original_bytes + raw.wal_bytes + raw.shm_bytes;
       res.json({
         ok: true,
         current_backup_size_bytes: total,
@@ -3333,6 +3473,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         current_backup_size_estimate_bytes: Math.ceil(total * 1.02),
         db_bytes: raw.db_bytes,
         pages_bytes: raw.pages_bytes,
+        original_bytes: raw.original_bytes,
+        wal_bytes: raw.wal_bytes,
+        shm_bytes: raw.shm_bytes,
       });
     } catch (err) {
       const raw = (err as Error).message || String(err);
@@ -3560,7 +3703,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } else {
       try {
         const raw = currentBackupRawSize();
-        neededBytes = Math.ceil((raw.db_bytes + raw.pages_bytes) * 1.02);
+        neededBytes = Math.ceil((raw.db_bytes + raw.pages_bytes + raw.original_bytes + raw.wal_bytes + raw.shm_bytes) * 1.02);
       } catch { neededBytes = null; }
     }
 
@@ -3848,13 +3991,22 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
       const result = await ingestParsed(parsed.data, { overrideId: SEED_WELCOME_GUIDE_DOC_ID });
 
-      // Kick page rendering so the viewer works immediately.
+      // The bundled guide is a new PDF import too. Existing successfully seeded
+      // guides are not touched; newly seeded/reinstalled guides retain bytes.
       if (extracted.format === "pdf" && result?.document?.id) {
-        try {
-          scheduleRender(result.document.id, found.bytes);
-        } catch (err) {
-          console.error(`${SEED_LOG_PREFIX} scheduleRender failed:`, err);
-        }
+        const id=result.document.id;
+        if (!extracted.pages?.length) throw Error("Welcome Guide page geometry missing.");
+        if (saveOriginalIfRetainable(id,WELCOME_GUIDE_METADATA.file_name,found.bytes)!=="pdf")
+          throw Error("Welcome Guide original could not be saved.");
+        rawDb.transaction(()=>{
+          storage.updateDocumentMeta(id,{original_ext:"pdf",
+            file_hash_sha256:createHash("sha256").update(found.bytes).digest("hex")});
+          for (const p of extracted.pages!) storage.upsertPage({
+            document_id:id,...p,image_path:"",generated_at:new Date().toISOString(),
+          });
+          storage.upsertRenderStatus({document_id:id,status:"ready",rendered:extracted.pages!.length,
+            total:extracted.pages!.length,error:null,updated_at:new Date().toISOString()});
+        })();
       }
 
       return {
@@ -3995,7 +4147,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   // Fire-and-forget: don't await, so the server binds its port without
   // waiting for PDF extraction. Errors are self-logged.
-  seedWelcomeGuideIfNeeded();
+  pdfRoutes(app);
+    if (process.env.RAG_NO_SEED !== "1") seedWelcomeGuideIfNeeded();
 
   // Kick the scheduler once routes are wired. Idempotent.
   startBackupScheduler();
@@ -4026,6 +4179,8 @@ function guessSourceSystem(uri: string): string {
 function hydrateDocument(d: Document) {
   return {
     ...d,
+    has_original_pdf: originalPdfAvailable(d.id, d.original_ext),
+    pdf_prepared: !!d.pdf_compatibility,
     audience: safeJson<string[]>(d.audience_json, []),
     platform: safeJson<string[]>(d.platform_json, []),
     region: safeJson<string[]>(d.region_json, []),

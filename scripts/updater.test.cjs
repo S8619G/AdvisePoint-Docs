@@ -30,6 +30,8 @@ function createInstall(name, version = "0.9.32") {
   const root = path.join(scratch, name);
   write(path.join(root, "VERSION"), `${version}\n`);
   write(path.join(root, "NODE_VERSION"), "20.18.1\n");
+  write(path.join(root, "node", "node.exe"), "old-node-runtime");
+  write(path.join(root, "node_modules", "test-module", "index.js"), "old-module");
   write(path.join(root, "dist", "index.cjs"), `old-${name}`);
   write(path.join(root, "Start AdvisePoint Docs.bat"), "baseline-launcher");
   write(path.join(root, "packaging", "updater", "updater.cjs"), fs.readFileSync(sourceUpdater));
@@ -51,11 +53,13 @@ function createInstall(name, version = "0.9.32") {
 // exist in createInstall(): README.txt (new file at the app root),
 // welcome-guide/ and launcher/ (new folders, the latter nested), and a
 // deliberately hostile advisepoint.db + pages/ to prove the preserve set holds.
-function createReleaseZip(name, version = "0.9.33") {
+function createReleaseZip(name, version = "0.9.33", options = {}) {
   const work = path.join(scratch, `${name}-release`);
   const app = path.join(work, "AdvisePoint Docs");
   write(path.join(app, "VERSION"), `${version}\n`);
-  write(path.join(app, "NODE_VERSION"), "20.18.1\n");
+  write(path.join(app, "NODE_VERSION"), options.nodeVersion || "20.18.1\n");
+  write(path.join(app, "node", "node.exe"), "new-node-runtime");
+  write(path.join(app, "node_modules", "test-module", "index.js"), "new-module");
   // v1.2.0: shipped zips always carry an ARCH sentinel so the updater can
   // refuse a cross-architecture upgrade. Tests build x64 releases; the
   // installed side has no ARCH, which the updater treats as "x64" for
@@ -66,6 +70,8 @@ function createReleaseZip(name, version = "0.9.33") {
   write(path.join(app, "packaging", "updater", "updater.cjs"), fs.readFileSync(sourceUpdater));
   // --- new-in-incoming-version content (the v1.0.15 regression) ---
   write(path.join(app, "README.txt"), `readme-${name}`);
+  write(path.join(app, "pdf-engine", "qpdf.exe"), `engine-${name}`);
+  write(path.join(app, "pdf-engine", "licenses", "LICENSE.txt"), "engine-license");
   write(
     path.join(app, "welcome-guide", "AdvisePoint-Docs-Welcome-Guide.pdf"),
     `%PDF-1.4 welcome-guide-${name}`,
@@ -92,13 +98,17 @@ function setRelease(version, archive, options = {}) {
     archive,
     size: options.size ?? archive.length,
     body: options.body === undefined ? `sha256: ${hash}` : options.body,
+    assets: options.assets,
+    digest: options.digest,
+    assetName: options.assetName,
+    checksum: options.checksum,
   };
 }
 
-function runUpdater(install, extraEnv = {}) {
+function runUpdater(install, extraEnv = {}, args = []) {
   const script = path.join(install.root, "packaging", "updater", "updater.cjs");
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [script], {
+    const child = spawn(process.execPath, [script, ...args], {
       cwd: install.root,
       env: {
         ...process.env,
@@ -126,10 +136,11 @@ before(async () => {
       const payload = JSON.stringify({
         tag_name: `v${release.version}`,
         body: release.body,
-        assets: [{
-          name: `AdvisePoint-Docs-v${release.version}.zip`,
+        assets: release.assets || [{
+          name: release.assetName || `AdvisePoint-Docs-v${release.version}.zip`,
           size: release.size,
           browser_download_url: `${baseUrl}/asset.zip`,
+          digest: release.digest,
         }],
       });
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -139,6 +150,10 @@ before(async () => {
     if (req.url === "/asset.zip") {
       res.writeHead(200, { "Content-Type": "application/zip" });
       res.end(release.archive);
+      return;
+    }
+    if (req.url === "/checksum") {
+      res.end(release.checksum || "");
       return;
     }
     res.writeHead(404);
@@ -303,6 +318,8 @@ test("upgrade creates folders that are new in the incoming version", async () =>
     "welcome-guide/ is new in the incoming version and must be created on upgrade",
   );
   assert.equal(fs.readFileSync(guide, "utf8"), "%PDF-1.4 welcome-guide-new-folder");
+  assert.equal(fs.readFileSync(path.join(install.root,"pdf-engine","qpdf.exe"),"utf8"),"engine-new-folder");
+  assert.equal(fs.readFileSync(path.join(install.root,"pdf-engine","licenses","LICENSE.txt"),"utf8"),"engine-license");
 
   // Nested new folders must be created too, not just the first level.
   assert.equal(
@@ -385,7 +402,7 @@ test("isPreservedName classifies user data, logs, and transient artifacts", () =
   }
   // Shipped content: synced.
   for (const name of [
-    "README.txt", "welcome-guide", "launcher", "packaging", "node_modules",
+    "README.txt", "welcome-guide", "launcher", "packaging", "node_modules", "pdf-engine",
     "Start AdvisePoint Docs.bat", "Setup Icon (run once).bat", "seed.db",
   ]) {
     assert.equal(updaterLib.isPreservedName(name), false, `${name} should be synced`);
@@ -474,7 +491,10 @@ test("upgrade refuses when incoming ARCH does not match installed ARCH", async (
   // The installed side is explicitly arm64; the incoming release is x64.
   write(path.join(install.root, "ARCH"), "arm64\n");
   const archive = createReleaseZipWithArch("arch-mismatch", "x64\n");
-  setRelease("0.9.33", archive);
+  setRelease("0.9.33", archive, {
+    assetName: "AdvisePoint-Docs-v0.9.33-arm64.zip",
+    digest: `sha256:${crypto.createHash("sha256").update(archive).digest("hex")}`,
+  });
   const result = await runUpdater(install);
   assert.equal(result.code, 4, result.stderr);
   assert.match(result.stdout, /Refusing cross-architecture upgrade/i);
@@ -483,6 +503,222 @@ test("upgrade refuses when incoming ARCH does not match installed ARCH", async (
   assert.equal(fs.existsSync(path.join(install.root, "dist.bak")), false);
   // ARCH sentinel is not touched by the failed upgrade.
   assert.equal(fs.readFileSync(path.join(install.root, "ARCH"), "utf8").trim(), "arm64");
+});
+
+// v1.2.8: architecture, integrity, sequencing and complete failed-update recovery.
+function githubAsset(name) {
+  return { name, size: 100, browser_download_url: `https://github.com/S8619G/AdvisePoint-Docs/releases/download/v1.2.8/${name}` };
+}
+function permutations(items) {
+  return items.length ? items.flatMap((x, i) => permutations(items.filter((_, j) => i !== j)).map(rest => [x, ...rest])) : [[]];
+}
+test("both architectures select the explicit binary in all 24 asset orderings", () => {
+  const names = ["source", "x64", "arm64"].map(s => `AdvisePoint-Docs-v1.2.8-${s}.zip`).concat("AdvisePoint-Docs-v1.2.8.zip");
+  for (const assets of permutations(names.map(githubAsset))) {
+    for (const arch of ["x64", "arm64"]) assert.equal(
+      updaterLib.selectReleaseAsset({ tag_name: "v1.2.8", assets }, arch).name,
+      `AdvisePoint-Docs-v1.2.8-${arch}.zip`,
+    );
+  }
+});
+test("ARM64 refuses x64 aliases, source-only and unrelated lone ZIPs", () => {
+  for (const name of ["AdvisePoint-Docs.zip", "AdvisePoint-Docs-v1.2.8.zip", "AdvisePoint-Docs-v1.2.8-source.zip", "release.zip"]) {
+    assert.throws(() => updaterLib.selectReleaseAsset({ tag_name: "1.2.8", assets: [githubAsset(name)] }, "arm64"), /No compatible/);
+  }
+});
+test("legacy x64 naming and zero-padded version precision remain supported", () => {
+  for (const name of ["AdvisePoint-Docs.zip", "AdvisePoint.Docs.v1.2.8.0.zip", "AdvisePoint_Docs_v1.2.8_x64.zip"]) {
+    assert.equal(updaterLib.selectReleaseAsset({ tag_name: "1.2.8", assets: [githubAsset(name)] }, "x64").name, name);
+  }
+});
+test("wrong-version, untrusted and ambiguous matching assets fail closed", () => {
+  for (const assets of [
+    [githubAsset("AdvisePoint-Docs-v1.2.9-arm64.zip")],
+    [{ ...githubAsset("AdvisePoint-Docs-v1.2.8-arm64.zip"), browser_download_url: "https://evil.example/file.zip" }],
+    [githubAsset("AdvisePoint-Docs-v1.2.8-arm64.zip"), githubAsset("AdvisePoint_Docs_v1.2.8_arm64.zip")],
+  ]) assert.throws(() => updaterLib.selectReleaseAsset({ tag_name: "1.2.8", assets }, "arm64"));
+});
+
+async function withRunningApp(action, refuseShutdown = false) {
+  let shutdowns = 0;
+  const app = http.createServer((req, res) => {
+    if (req.url === "/api/health") return res.end(JSON.stringify({ app: "advisepoint-docs" }));
+    if (req.url === "/api/updater/shutdown") {
+      shutdowns++;
+      res.writeHead(refuseShutdown ? 503 : 200);
+      res.end(JSON.stringify({ app: "advisepoint-docs" }));
+      if (!refuseShutdown) app.close();
+      return;
+    }
+    res.writeHead(404); res.end();
+  });
+  await new Promise((resolve, reject) => { app.once("error", reject); app.listen(5000, "127.0.0.1", resolve); });
+  try { await action(app, () => shutdowns); }
+  finally { if (app.listening) await new Promise(r => app.close(r)); }
+}
+
+test("missing ARM64 binary fails before stopping a live application", async () => {
+  await withRunningApp(async (app, shutdowns) => {
+    const install = createInstall("missing-arm");
+    write(path.join(install.root, "ARCH"), "arm64");
+    setRelease("0.9.33", createReleaseZip("missing-arm"));
+    const result = await runUpdater(install, { APD_UPDATE_ASSUME_YES: "1" });
+    assert.equal(result.code, 3);
+    assert.match(result.stdout, /No compatible arm64/);
+    assert.equal(shutdowns(), 0); assert.equal(app.listening, true);
+  });
+});
+test("bad asset-specific checksum leaves the live application untouched", async () => {
+  await withRunningApp(async (app, shutdowns) => {
+    const install = createInstall("bad-digest");
+    setRelease("0.9.33", createReleaseZip("bad-digest"), { assetName: "AdvisePoint-Docs-v0.9.33-x64.zip", digest: `sha256:${"0".repeat(64)}` });
+    const result = await runUpdater(install, { APD_UPDATE_ASSUME_YES: "1" });
+    assert.equal(result.code, 4); assert.match(result.stdout, /SHA-256 mismatch/);
+    assert.equal(shutdowns(), 0); assert.equal(app.listening, true);
+  });
+});
+test("selected ARM64 companion checksum overrides an unrelated release-body hash", async () => {
+  const install = createInstall("arm-companion");
+  write(path.join(install.root, "ARCH"), "arm64");
+  const archive = createReleaseZipWithArch("arm-companion", "arm64");
+  const name = "AdvisePoint-Docs-v0.9.33-arm64.zip";
+  const hash = crypto.createHash("sha256").update(archive).digest("hex");
+  setRelease("0.9.33", archive, {
+    body: `sha256: ${"0".repeat(64)}`,
+    checksum: `${hash}  ${name}\n`,
+    assets: [
+      { name, size: archive.length, browser_download_url: `${baseUrl}/asset.zip` },
+      { name: `${name}.sha256`, size: 100, browser_download_url: `${baseUrl}/checksum` },
+    ],
+  });
+  const result = await runUpdater(install);
+  assert.equal(result.code, 0, result.stdout);
+  assert.equal(fs.readFileSync(path.join(install.root, "VERSION"), "utf8").trim(), "0.9.33");
+});
+test("mislabeled and corrupt local ZIPs fail before shutdown and original ZIP is retained", async () => {
+  await withRunningApp(async (app, shutdowns) => {
+    const install = createInstall("local-arm");
+    write(path.join(install.root, "ARCH"), "arm64");
+    const file = path.join(scratch, "user-download.zip");
+    for (const content of [createReleaseZip("local-arm"), Buffer.from("broken ZIP")]) {
+      write(file, content);
+      const result = await runUpdater(install, { APD_UPDATE_ASSUME_YES: "1" }, ["--local-zip", file]);
+      assert.equal(result.code, 4, result.stdout);
+      assert.equal(fs.existsSync(file), true);
+      assert.equal(shutdowns(), 0); assert.equal(app.listening, true);
+    }
+  });
+});
+test("up-to-date check never shuts down the live application", async () => {
+  await withRunningApp(async (app, shutdowns) => {
+    const install = createInstall("live-current");
+    setRelease("0.9.32", createReleaseZip("live-current", "0.9.32"));
+    assert.equal((await runUpdater(install, { APD_UPDATE_ASSUME_YES: "1" })).code, 0);
+    assert.equal(shutdowns(), 0); assert.equal(app.listening, true);
+  });
+});
+test("shutdown refusal leaves files unchanged and does not duplicate the live server", async () => {
+  await withRunningApp(async (app, shutdowns) => {
+    const install = createInstall("refused");
+    setRelease("0.9.33", createReleaseZip("refused"));
+    const result = await runUpdater(install, { APD_UPDATE_ASSUME_YES: "1" });
+    assert.equal(result.code, 4); assert.equal(shutdowns(), 1); assert.equal(app.listening, true);
+    assert.match(result.stdout, /no duplicate recovery launch/);
+    assert.equal(fs.readFileSync(path.join(install.root, "VERSION"), "utf8").trim(), "0.9.32");
+  }, true);
+});
+test("failure after app-root sync restores launchers, modules and markers, preserving data", async () => {
+  const install = createInstall("full-rollback");
+  write(path.join(install.root, "README.txt"), "OLD README");
+  setRelease("0.9.33", createReleaseZip("full-rollback"));
+  const result = await runUpdater(install, { APD_UPDATE_TEST_FAIL_AFTER_SYNC: "1" });
+  assert.equal(result.code, 4, result.stdout);
+  for (const [file, expected] of [
+    ["dist/index.cjs", "old-full-rollback"], ["VERSION", "0.9.32\n"],
+    ["README.txt", "OLD README"], ["Start AdvisePoint Docs.bat", "baseline-launcher"],
+    ["node_modules/test-module/index.js", "old-module"],
+    ["advisepoint.db", "USER-DATABASE-DO-NOT-CLOBBER"], ["pages/doc-1/page-1.webp", "USER-PAGE-IMAGE"],
+  ]) assert.equal(fs.readFileSync(path.join(install.root, file), "utf8"), expected, file);
+  assert.equal(fs.existsSync(path.join(install.root, "welcome-guide")), false);
+  assert.equal(fs.existsSync(path.join(install.root, "launcher")), false);
+  assert.match(result.stdout, /Full application recovery verified/);
+  assert.equal(fs.existsSync(path.join(install.root,"pdf-engine")),false);
+});
+test("recovery launches only when the port is free and verifies application health", async () => {
+  let launched = 0;
+  const deps = { portBusy: async () => false, launch: async () => { launched++; }, waitHealthy: async () => true };
+  assert.equal(await updaterLib.recoverStoppedApp(deps), true);
+  assert.equal(launched, 1);
+  for (const ours of [true, false]) {
+    assert.equal(await updaterLib.recoverStoppedApp({ ...deps, portBusy: async () => true, identify: async () => ours }), false);
+  }
+  assert.equal(launched, 1);
+  assert.equal(await updaterLib.recoverStoppedApp({ ...deps, waitHealthy: async () => false }), false);
+});
+
+test("failure after runtime replacement restores old runtime and NODE_VERSION", async () => {
+  const install = createInstall("node-rollback");
+  setRelease("0.9.33", createReleaseZip("node-rollback", "0.9.33", { nodeVersion: "99.0.0\n" }));
+  const result = await runUpdater(install, { APD_UPDATE_TEST_FAIL_AFTER_NODE: "1" });
+  assert.equal(result.code, 4, result.stdout);
+  for (const [file, expected] of [["node/node.exe", "old-node-runtime"], ["NODE_VERSION", "20.18.1\n"], ["VERSION", "0.9.32\n"]]) {
+    assert.equal(fs.readFileSync(path.join(install.root, file), "utf8"), expected, file);
+  }
+});
+test("post-shutdown failure attempts recovery and persists failure status", async () => {
+  await withRunningApp(async (_app, shutdowns) => {
+    const install = createInstall("stopped-recovery");
+    setRelease("0.9.33", createReleaseZip("stopped-recovery"));
+    const result = await runUpdater(install, { APD_UPDATE_ASSUME_YES: "1", APD_UPDATE_TEST_FAIL_AFTER_SYNC: "1" });
+    assert.equal(result.code, 4);
+    assert.equal(shutdowns(), 1);
+    assert.ok(result.stdout.indexOf("Package validation complete") < result.stdout.indexOf("Requesting a clean shutdown"));
+    assert.match(result.stdout, /Restarting the preserved application/);
+    const status = JSON.parse(fs.readFileSync(path.join(install.localAppData, "AdvisePoint Docs", "update-status.json")));
+    assert.equal(status.phase, "failed");
+    assert.match(status.message, /Simulated failure after root sync/);
+    assert.equal(fs.readFileSync(path.join(install.root, "VERSION"), "utf8").trim(), "0.9.32");
+  });
+});
+test("incomplete recovery keeps snapshot and refuses to relaunch mixed files", async () => {
+  await withRunningApp(async () => {
+    const install = createInstall("unsafe-recovery");
+    setRelease("0.9.33", createReleaseZip("unsafe-recovery"));
+    const result = await runUpdater(install, {
+      APD_UPDATE_ASSUME_YES: "1", APD_UPDATE_TEST_FAIL_AFTER_SYNC: "1", APD_UPDATE_TEST_FAIL_RECOVERY: "1",
+    });
+    assert.equal(result.code, 4);
+    assert.match(result.stdout, /automatic recovery was incomplete/);
+    assert.doesNotMatch(result.stdout, /Restarting the preserved application/);
+    const folder = fs.readdirSync(install.root).find(n => n.startsWith(".update-recovery-"));
+    assert.ok(folder);
+    assert.equal(fs.readFileSync(path.join(install.root, folder, "VERSION"), "utf8").trim(), "0.9.32");
+  });
+});
+test("a second updater cannot overwrite an active update or clear its sentinel", async () => {
+  const install = createInstall("locked");
+  write(path.join(install.root, ".update-lock"), String(process.pid));
+  const sentinel = path.join(install.localAppData, "AdvisePoint Docs", ".updating");
+  write(sentinel, "active-owner");
+  const result = await runUpdater(install);
+  assert.equal(result.code, 5);
+  assert.equal(fs.readFileSync(sentinel, "utf8"), "active-owner");
+  assert.equal(fs.readFileSync(path.join(install.root, ".update-lock"), "utf8"), String(process.pid));
+});
+test("malformed or incorrectly named checksum companion fails before shutdown", async () => {
+  await withRunningApp(async (_app, shutdowns) => {
+    for (const checksum of ["not-a-checksum", `${"0".repeat(64)}  another-file.zip`]) {
+      const install = createInstall(`checksum-${checksum.length}`);
+      const archive = createReleaseZip(`checksum-${checksum.length}`);
+      const name = "AdvisePoint-Docs-v0.9.33-x64.zip";
+      setRelease("0.9.33", archive, { checksum, assets: [
+        { name, size: archive.length, browser_download_url: `${baseUrl}/asset.zip` },
+        { name: `${name}.sha256`, browser_download_url: `${baseUrl}/checksum` },
+      ] });
+      assert.equal((await runUpdater(install, { APD_UPDATE_ASSUME_YES: "1" })).code, 3);
+      assert.equal(shutdowns(), 0);
+    }
+  });
 });
 
 test("upgrade refuses when incoming zip is missing the ARCH sentinel", async () => {
