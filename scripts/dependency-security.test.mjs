@@ -7,6 +7,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import express from "express";
 import multer from "multer";
+import http from "node:http";
 const require = createRequire(import.meta.url);
 const qs = require("qs");
 let server, base, folder;
@@ -30,6 +31,11 @@ before(async () => {
     });
   }
   app.get("/health", (_req, res) => res.json({ ok: true }));
+  const abortUpload = multer({ storage: multer.diskStorage({
+    destination: folder,
+    filename: (_req, _file, cb) => setTimeout(() => cb(null, "aborted.bin"), 100),
+  }) });
+  app.post("/abort", abortUpload.single("file"), (_req, res) => res.json({ok:true}));
   app.use((err, _req, res, _next) => res.status(err.code === "LIMIT_FILE_SIZE" ? 413 : 400)
     .json({ code: err.code }));
   await new Promise((resolve) => { server = app.listen(0, "127.0.0.1", resolve); });
@@ -45,7 +51,7 @@ after(async () => {
 });
 
 test("security dependency versions are pinned at the patched releases", () => {
-  assert.equal(require("multer/package.json").version, "2.3.0");
+  assert.equal(require("multer/package.json").version, "2.4.0");
   assert.equal(require("qs/package.json").version, "6.16.0");
   const lock = require("../package-lock.json");
   const matches = Object.entries(lock.packages).filter(([name]) => /(?:^|\/)node_modules\/qs$/.test(name));
@@ -96,4 +102,19 @@ test("oversized uploads are refused and disk partial files are removed", async (
     assert.equal((await fetch(`${base}/health`)).status, 200);
     assert.deepEqual(fs.readdirSync(folder), []);
   }
+});
+
+test("aborting while disk destination opens leaves no orphan file", async () => {
+  await new Promise(resolve => {
+    const req = http.request(`${base}/abort`, {
+      method:"POST", headers:{"Content-Type":"multipart/form-data; boundary=abort-test","Content-Length":"1000000"},
+    });
+    req.on("error", () => {});
+    req.write('--abort-test\r\nContent-Disposition: form-data; name="file"; filename="abort.txt"\r\nContent-Type: text/plain\r\n\r\n');
+    req.write(Buffer.alloc(1024, 65));
+    setTimeout(() => {req.destroy();resolve();}, 30);
+  });
+  await new Promise(r=>setTimeout(r,350));
+  assert.deepEqual(fs.readdirSync(folder), []);
+  assert.equal((await fetch(`${base}/health`)).status,200);
 });

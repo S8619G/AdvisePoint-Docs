@@ -81,6 +81,13 @@ type Weekday = 0 | 1 | 2 | 3 | 4 | 5 | 6;
 // -------- Types mirroring the server's wire shape --------
 
 interface BackupSettingsWire {
+  mode?: "count" | "pair";
+  pair?: {
+    latest: { file: string; createdAt: string } | null;
+    previous: { file: string; createdAt: string } | null;
+    recovery_pending: boolean;
+    error: string | null;
+  } | null;
   cadence: Cadence;
   time: string;
   time_hhmm: string;
@@ -176,6 +183,7 @@ export function BackupPanel() {
   const [scheduledCadence, setScheduledCadence] = useState<Cadence>("off");
   const [scheduledTime, setScheduledTime] = useState("02:00");
   const [scheduledRetention, setScheduledRetention] = useState(7);
+  const [scheduledMode, setScheduledMode] = useState<"count" | "pair">("count");
   const [scheduledWeekday, setScheduledWeekday] = useState<Weekday>(0);
   const [scheduledDirty, setScheduledDirty] = useState(false);
   const [scheduledSaving, setScheduledSaving] = useState(false);
@@ -301,6 +309,7 @@ export function BackupPanel() {
         setScheduledCadence(s.cadence);
         setScheduledTime(s.time_hhmm ?? s.time ?? "02:00");
         setScheduledRetention(s.retention_count ?? s.retention ?? 7);
+        setScheduledMode(s.mode === "pair" ? "pair" : "count");
         setScheduledWeekday((s.weekday ?? 0) as Weekday);
         // Seed the Quick backup folder to the scheduled folder as a
         // reasonable default; users often want the ZIP in the same
@@ -653,6 +662,7 @@ export function BackupPanel() {
           time_hhmm: scheduledTime,
           folder: scheduledFolder,
           retention_count: scheduledRetention,
+          mode: scheduledMode,
           weekday: scheduledWeekday,
         }),
       });
@@ -1070,7 +1080,7 @@ export function BackupPanel() {
               Scheduled backups
             </CardTitle>
             <CardDescription>
-              Let AdvisePoint Docs make backups on a schedule and keep the last few.
+              Make scheduled backups with a retained count or a latest-and-previous pair.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -1162,15 +1172,39 @@ export function BackupPanel() {
                 </div>
               )}
               <div className="space-y-1.5">
-                <Label>Keep last</Label>
+                <Label htmlFor="scheduled-retention">Backups to keep</Label>
                 <Input
+                  id="scheduled-retention"
+                  data-testid="input-backups-to-keep"
                   type="number"
                   min={1}
                   max={365}
-                  value={scheduledRetention}
+                  value={scheduledMode === "pair" ? 2 : scheduledRetention}
+                  disabled={scheduledMode === "pair"}
                   onChange={(e) => { setScheduledRetention(parseInt(e.target.value, 10) || 1); setScheduledDirty(true); }}
                 />
               </div>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="scheduled-backup-mode">Backup mode</Label>
+              <Select value={scheduledMode} onValueChange={(v: "count" | "pair") => {
+                setScheduledMode(v); setScheduledDirty(true);
+              }}>
+                <SelectTrigger id="scheduled-backup-mode" data-testid="select-backup-mode"
+                  className="h-auto min-h-9 text-left text-xs [&>span]:whitespace-normal">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="count">Keep a set number of backups</SelectItem>
+                  <SelectItem value="pair">Latest backup + previous backup</SelectItem>
+                </SelectContent>
+              </Select>
+              {scheduledMode === "pair" && (
+                <p className="text-xs text-muted-foreground" data-testid="text-backup-pair-help">
+                  Retains two full backups after two successful runs. Each new copy is verified before rotation.
+                  Extra temporary space is required. Existing dated and manual backups are not removed.
+                </p>
+              )}
             </div>
             <div className="grid grid-cols-2 gap-2 pt-1">
               <Button
@@ -1210,6 +1244,17 @@ export function BackupPanel() {
               </div>
               {settings?.next_run_at && scheduledCadence !== "off" && (
                 <div>Next run: {formatTimestamp(settings.next_run_at)}</div>
+              )}
+              {settings?.mode === "pair" && (
+                <div className="space-y-1 [overflow-wrap:anywhere]" data-testid="backup-pair-status">
+                  <div>Latest: {settings.pair?.latest
+                    ? `${formatTimestamp(settings.pair.latest.createdAt)} · ${settings.pair.latest.file}` : "Not created yet"}</div>
+                  <div>Previous: {settings.pair?.previous
+                    ? `${formatTimestamp(settings.pair.previous.createdAt)} · ${settings.pair.previous.file}` : "Not created yet"}</div>
+                  <div>Folder: AdvisePoint-Scheduled-Pair inside the selected backup folder.</div>
+                  {settings.pair?.recovery_pending && <div>Recovery or cleanup will be retried after a successful backup.</div>}
+                  {settings.pair?.error && <div role="alert">{settings.pair.error}</div>}
+                </div>
               )}
             </div>
           </CardContent>

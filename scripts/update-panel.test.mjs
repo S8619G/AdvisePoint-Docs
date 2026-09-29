@@ -5,11 +5,15 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { chromium } from "playwright";
 const root = resolve(import.meta.dirname, "..");
+const current = readFileSync(join(root, "client/src/version.ts"), "utf8").match(/APP_VERSION = "([^"]+)"/)[1];
+const parts = current.split(".").map(Number); parts[parts.length-1]++;
+const futureTag = `v${parts.join(".")}`;
+const futureUrl = `https://github.com/S8619G/advisepoint-docs/releases/tag/${futureTag}`;
 const base = "http://127.0.0.1:5198";
 let server, browser, temp;
 before(async () => {
@@ -39,7 +43,7 @@ async function open() {
   const page = await browser.newPage({ viewport: { width: 1366, height: 900 } });
   const state = { phase: "preparing", message: "Downloading and validating the package.", startedAt: Date.now(), offline: false };
   await page.route("https://api.github.com/**", r => r.fulfill({ json: {
-    tag_name: "v1.3.3", html_url: "https://github.com/S8619G/advisepoint-docs/releases/tag/v1.3.3",
+    tag_name: futureTag, html_url: futureUrl,
     name: "Future test release", body: "Test only", assets: [],
   } }));
   await page.route("**/api/render/busy", r => r.fulfill({ json: { busy: false } }));
@@ -74,7 +78,7 @@ test("slow validation keeps live UI busy without a false launch failure", async 
 test("manual downloads always open the release page, not an arbitrary ZIP", async () => {
   const { page } = await open();
   try {
-    assert.match(await page.getByTestId("link-panel-update-download").getAttribute("href"), /\/releases\/tag\/v1\.3\.3$/);
+    assert.equal(await page.getByTestId("link-panel-update-download").getAttribute("href"), futureUrl);
   } finally { await page.close(); }
 });
 test("local-ZIP validation and failure are visible without a fake disconnect countdown", async () => {

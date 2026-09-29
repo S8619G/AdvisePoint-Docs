@@ -1,32 +1,60 @@
-# AdvisePoint Docs v1.3.2
+# AdvisePoint Docs v1.3.3
 
-This release reorganizes Settings and removes automatic shutdown caused by missing browser heartbeats. It continues from v1.3.1 and does not migrate, reset or convert an existing library.
+This release adds focused Query and Upload controls and an optional two-copy
+scheduled backup mode. Existing library documents and saved count-based backup
+settings are preserved.
 
 ## Changes
 
-- **Long-idle reliability:** a quiet, backgrounded or suspended browser tab no longer causes the local service to exit. Closing all browser tabs also leaves the service running.
-- **Intentional shutdown:** Settings > System > Diagnostics now includes Stop application. Confirmation explains that the stop affects every tab and pauses scheduled backups. Tracked writes, rendering, print preparation, PDF compatibility preparation, backups, restore, external editing and update activity block the stop.
-- **Connection reporting:** heartbeat absence and recovery are logged without inferring that Windows slept. A connection warning describes an unavailable service rather than asserting that it crashed.
-- **Manage Product Lists:** moved from System to Formats, directly below Document types and before Filename codes. The card, button and dialog share the new name. Product family/model counts, renaming, merging and delete-with-reassignment retain their existing behavior.
-- **System layout:** Library maintenance and Diagnostics share a two-column row on wider windows and stack on narrow windows.
-- **Welcome Guide:** reinstall moved to the bottom of Backup / Restore. The bundled Guide and README have been refreshed, including current PDF storage, printing, Settings navigation and retention wording.
-- **Package hygiene:** no reset/delete-all utility, prototype launcher or isolated-test launcher is included in release ZIPs. Automated regression tests remain in shared source. Guide-generation failure now blocks packaging instead of silently shipping a stale guide.
+- **Selected family only:** an unchecked-by-default checkbox below Product
+  family limits results to documents explicitly assigned to that family.
+  Without it, documents with no family remain eligible. Family Any disables
+  the option; model and family lists remain independent.
+- **Query Reset:** beside Search, clears the query, results and filters without
+  deleting recent searches or documents. Delayed responses from an earlier
+  search cannot repopulate the reset results.
+- **Search state:** family-only selection is restored with recent searches and
+  search URLs. Filtered URLs now reopen the correct tab after reload, and a
+  pending URL update cannot navigate back to a tab that was just left.
+- **Upload Reset:** at the right of Upload result, clears completed feedback
+  without refreshing the browser. Imported documents, pending/failed staged
+  files and editable fields are preserved. Reset is unavailable during uploads.
+- **Backup wording:** Scheduled backups now labels retention as Backups to keep.
+  The existing default of 7 and saved counts are unchanged.
+- **Optional backup pair:** Latest backup + previous backup creates and verifies
+  a new full archive before committing the rotation. The prior valid latest
+  becomes previous. Existing dated/manual files are not removed by pair mode.
+  Interrupted rotations are reconciled from the saved record on a later run.
 
-## Features retained from v1.3.1
+## Backup mode details
 
-- **Browser-free PDF compatibility import:** supported printable, copy-restricted PDFs are prepared with the bundled open-source converter, not Chrome, Edge or Firefox. The retained compatible PDF replaces the input as the library copy, rather than keeping duplicate original and converted PDFs.
-- **PDF viewing and printing:** new normal PDFs retain their PDF and render on demand. Existing stored-page documents remain supported. The redundant PDF-opening choice and unwanted successful-opening popup remain removed.
-- **Links:** the compatibility path preserves links in the tested retained PDFs. Use an external reader for those links; the in-app viewer does not gain clickable links or bookmarks.
-- **Metadata and recovery:** the DE word-splitting correction, Document Type usage counts and recoverable-deletion wording remain in place.
-- **Updates:** official builds retain GitHub and local-ZIP update controls. The architecture-aware updater and its validation-before-shutdown path are unchanged.
-- **Library storage:** Settings polls approximately every 15 seconds while active. Browser background throttling can delay updates. No manual refresh or app restart is required; database and retained recovery storage do not necessarily shrink when a document is removed.
+Count-based retention remains the default. Pair mode uses an
+`AdvisePoint-Scheduled-Pair` subfolder; Settings shows the timestamp and filename
+of each recovery copy. The first successful run creates latest, and the second
+establishes previous. Switching modes preserves the saved retention count.
 
-## Scope and verification limits
+Two full archives are retained in normal operation, not incremental changes.
+Extra temporary space is required for creation and verification. Failure leaves
+existing recovery copies intact; a cleanup failure may temporarily retain more
+files. If neither existing copy verifies, automatic rotation stops rather than
+discarding both. Keep an independent backup for longer history and drive failure.
 
-The supplied x64 diagnostics show a successful v1.3.0-to-v1.3.1 GitHub upgrade and healthy restart. The earlier four-hour Edge incident is no longer present in the rotated logs, so its exact cause remains unconfirmed. This release removes a demonstrated failure path; it is not a claim that every possible disconnection is fixed.
+## Compatibility and verification limits
 
-Automated and isolated-browser verification is described separately. Native Windows long-idle Edge testing, ARM64 local-ZIP/in-place upgrade, x64 updater acceptance for this release and physical printing remain field gates. Not every PDF is supported.
+The release audit identified an aborted-upload disk-write issue in the prior
+Multer version. Multer is pinned to 2.4.0 for the fix described in
+[GHSA-3pph-fpjx-jg34](https://github.com/advisories/GHSA-3pph-fpjx-jg34).
+Other dependency upgrades are outside this release.
 
-TypeScript still has 14 pre-existing diagnostics. Two older custom filename-code tests also fail unchanged on v1.3.1 and are tracked separately; neither is represented as a new regression or a pass.
+The browser-free PDF converter, PDF viewing/printing, metadata, recovery and
+architecture-aware updater behavior from v1.3.2 remain. No real library reset,
+conversion or backup cleanup is performed by installing this release.
 
-Excel/PowerPoint import-to-PDF remains a backlog item and is not implemented. Production remains on port 5000; separate prototype/test environments are not repointed or altered by this release.
+Windows x64/ARM64 installation, file-lock and interruption behavior, long-idle
+Edge acceptance and physical printing still require field testing. Automated
+checks do not certify every PDF or storage device. Fourteen pre-existing
+TypeScript diagnostics and two pre-existing filename-code regression failures
+remain recorded separately.
+
+These packages are for local field acceptance. GitHub publication requires
+separate approval.

@@ -383,6 +383,7 @@ export default function Upload() {
 
   // Currently-uploading file key. Non-null means the sequential loop is running.
   const [uploadingKey, setUploadingKey] = useStoreField(uploadTabStore, "uploadingKey");
+  const [textUploading, setTextUploading] = useStoreField(uploadTabStore, "textUploading");
   const [batchDone, setBatchDone] = useStoreField(uploadTabStore, "batchDone");
 
   // v1.1.0: filename-code -> Document type mapping, cached by React Query.
@@ -470,8 +471,11 @@ export default function Upload() {
   // -------- Pasted-text ingest (unchanged behaviour) --------
   const textMut = useMutation({
     mutationFn: async (payload: any) => {
-      const res = await apiRequest("POST", "/api/ingest", payload);
-      return res.json();
+      setTextUploading(true);
+      try {
+        const res = await apiRequest("POST", "/api/ingest", payload);
+        return await res.json();
+      } finally { setTextUploading(false); }
     },
     onSuccess: (data) => {
       setPastedResult(data);
@@ -835,6 +839,7 @@ export default function Upload() {
 
   // -------- Pasted-text submit (only when no files staged) --------
   const submitPasted = () => {
+    if (uploadTabStore.getState().textUploading || uploadTabStore.getState().uploadingKey !== null) return;
     // Product model intentionally not checked here -- see runBatch().
     if (!pastedBody.trim()) {
       toast({ title: "Nothing to upload", description: "Paste text or attach files.", variant: "destructive" });
@@ -851,7 +856,17 @@ export default function Upload() {
   // -------- Derived helpers --------
   const anyFiles = files.length > 0;
   const isBatch = files.length > 1;
-  const pending = uploadingKey !== null || textMut.isPending;
+  const pending = uploadingKey !== null || textUploading || textMut.isPending;
+
+  const resetUploadResults = () => {
+    const state = uploadTabStore.getState();
+    if (state.uploadingKey !== null || state.textUploading || textMut.isPending) return;
+    uploadTabStore.setState({
+      completedUploads: [], pastedResult: null, batchDone: false,
+      files: state.files.filter(f => f.status !== "done"),
+    });
+    textMut.reset();
+  };
 
   // v0.9.30: successful results now live in two places while a batch is
   // in progress: still-staged rows (`files` with status="done", cleared on
@@ -1049,7 +1064,7 @@ export default function Upload() {
                 )}
               </Button>
             ) : (
-              <Button onClick={submitPasted} disabled={textMut.isPending} data-testid="button-ingest">
+              <Button onClick={submitPasted} disabled={pending} data-testid="button-ingest">
                 {textMut.isPending ? (
                   <>
                     <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -1071,9 +1086,11 @@ export default function Upload() {
       <div className="space-y-6">
         <Card className="hover-elevate" data-testid="card-preview">
           <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-xl">
-              <FileText className="h-4 w-4 text-primary" />
-              Upload result
+            <CardTitle className="flex items-center justify-between gap-2 text-xl">
+              <span className="flex items-center gap-2"><FileText className="h-4 w-4 text-primary" />
+              Upload result</span>
+              <Button type="button" variant="outline" size="sm" disabled={pending}
+                onClick={resetUploadResults} data-testid="button-reset-upload-results">Reset</Button>
             </CardTitle>
             <CardDescription>
               {successResults.length > 0

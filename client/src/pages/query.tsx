@@ -341,6 +341,7 @@ export default function Query() {
   // dropdowns list the full set regardless of the other's value). When set,
   // documents whose family is empty are still included, per product decision.
   const [productFamily, setProductFamily] = useStoreField(queryTabStore, "productFamily");
+  const [selectedFamilyOnly, setSelectedFamilyOnly] = useStoreField(queryTabStore, "selectedFamilyOnly");
   const [docType, setDocType] = useStoreField(queryTabStore, "docType");
   const [firmware, setFirmware] = useStoreField(queryTabStore, "firmware");
   const [errorCode, setErrorCode] = useStoreField(queryTabStore, "errorCode");
@@ -382,11 +383,14 @@ export default function Query() {
   const [lastResponse, setLastResponse] = useStoreField(queryTabStore, "lastResponse");
 
   const mut = useMutation({
-    mutationFn: async () => {
+    mutationFn: async ({ state, generation }: { state: QueryTabState; generation: number }) => {
+      const { q, maxResults, matchMode, productModel, productFamily, selectedFamilyOnly,
+        docType, firmware, errorCode, confidentialityMax, selectedTags } = state;
       const filters: any = {};
       if (productModel) filters.product_model = [productModel];
       // v1.0.14: send as a scalar to match searchRequestSchema.filters.product_family.
       if (productFamily) filters.product_family = productFamily;
+      if (productFamily && selectedFamilyOnly) filters.selected_family_only = true;
       if (docType) filters.document_type = [docType];
       if (firmware) filters.firmware_version = [firmware];
       if (errorCode) filters.error_code = errorCode;
@@ -415,9 +419,12 @@ export default function Query() {
         hybrid,
         filters,
       });
-      return res.json() as Promise<SearchResponse>;
+      return { data: await res.json() as SearchResponse, generation };
     },
-    onSuccess: (data) => {
+    onSuccess: ({ data, generation }, { state }) => {
+      if (generation !== queryTabStore.getState().searchGeneration) return;
+      const { q, matchMode, maxResults, productModel, productFamily, selectedFamilyOnly,
+        docType, firmware, errorCode, confidentialityMax, selectedTags } = state;
       // Reset selection state when a new query lands.
       setSelectedResultId(null);
       setExpandedKeys(new Set());
@@ -440,6 +447,7 @@ export default function Query() {
           filters: {
             productModel,
             productFamily,
+            selectedFamilyOnly: !!productFamily && selectedFamilyOnly,
             docType,
             firmware,
             errorCode,
@@ -461,10 +469,24 @@ export default function Query() {
   // v0.9.31: mut.data is the fresh result of the current mutation; it's
   // undefined after unmount/remount. Fall back to the store-cached
   // response so a user tabbing away and back sees their previous hits.
-  const activeResponse = mut.data ?? (lastResponse as SearchResponse | null | undefined);
+  const activeResponse = lastResponse as SearchResponse | null | undefined;
 
   const clearFilters = () => {
     setProductModel(""); setProductFamily(""); setDocType(""); setFirmware(""); setErrorCode(""); setConfidentialityMax(""); setTenant(""); setSelectedTags([]);
+    setSelectedFamilyOnly(false);
+  };
+
+  const resetQuery = () => {
+    const s = queryTabStore.getState();
+    queryTabStore.setState({
+      q: "", productModel: "", productFamily: "", selectedFamilyOnly: false,
+      docType: "", firmware: "", errorCode: "", confidentialityMax: "", selectedTags: [],
+      lastResponse: null, lastQuery: "", selectedResultId: null, expandedKeys: [],
+      kbdIdx: null, pageViewer: null, scrollY: 0, searchGeneration: s.searchGeneration + 1,
+    });
+    mut.reset();
+    writeHashQuery(serializeQueryStateToUrl(queryTabStore.getState()));
+    inputRef.current?.focus();
   };
 
   // v0.9.31: Mirror the URL-synced subset of state to the hash on every
@@ -476,13 +498,15 @@ export default function Query() {
     if (!window.location.hash.startsWith("#/query")) return;
     const s = queryTabStore.getState();
     writeHashQuery(serializeQueryStateToUrl(s));
-  }, [q, matchMode, maxResults, productModel, productFamily, docType, firmware, errorCode, confidentialityMax, selectedTags, selectedResultId]);
+  }, [q, matchMode, maxResults, productModel, productFamily, selectedFamilyOnly, docType, firmware, errorCode, confidentialityMax, selectedTags, selectedResultId]);
   const hasFilters = productModel || productFamily || docType || firmware || errorCode || confidentialityMax || tenant || selectedTags.length > 0;
 
   const submit = useCallback(() => {
-    if (q.trim()) {
-      setLastQuery(q.trim());
-      mut.mutate();
+    const state = queryTabStore.getState();
+    if (state.q.trim()) {
+      const generation = state.searchGeneration + 1;
+      queryTabStore.setState({ lastQuery: state.q.trim(), searchGeneration: generation });
+      mut.mutate({ state, generation });
     }
   }, [q, mut]);
 
@@ -707,6 +731,14 @@ export default function Query() {
                     {familyOptions.map((f) => <SelectItem key={f} value={f}>{f}</SelectItem>)}
                   </SelectContent>
                 </Select>
+                <label className="mt-2 flex items-center gap-2 text-xs text-muted-foreground"
+                  title="Exclude documents with no product family assigned.">
+                  <input type="checkbox" checked={selectedFamilyOnly}
+                    disabled={!productFamily || !familiesExist}
+                    onChange={e => setSelectedFamilyOnly(e.target.checked)}
+                    data-testid="checkbox-selected-family-only" />
+                  Selected family only
+                </label>
               </FilterField>
             );
           })()}
@@ -811,6 +843,7 @@ export default function Query() {
           setMaxResults(entry.maxResults);
           setProductModel(entry.filters.productModel ?? "");
           setProductFamily(entry.filters.productFamily ?? "");
+          setSelectedFamilyOnly(entry.filters.selectedFamilyOnly === true);
           setDocType(entry.filters.docType ?? "");
           setFirmware(entry.filters.firmware ?? "");
           setErrorCode(entry.filters.errorCode ?? "");
@@ -818,7 +851,7 @@ export default function Query() {
           setSelectedTags(entry.filters.selectedTags ?? []);
           // Fire the same mutation the Search button uses. onSuccess
           // will re-record the entry (bumping ranAt to now).
-          mut.mutate();
+          submit();
         }}
         onClear={async () => {
           if (!window.confirm("Clear the recent searches list? This does not touch any documents or filters.")) {
@@ -842,7 +875,7 @@ export default function Query() {
       <div className="space-y-4">
         <Card>
           <CardContent className="p-3">
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
               <Search className="ml-2 h-4 w-4 text-muted-foreground" />
               <Input
                 ref={inputRef}
@@ -855,7 +888,7 @@ export default function Query() {
                 // "/" keyboard shortcut (focus + select).
                 onFocus={(e) => e.currentTarget.select()}
                 placeholder='Ask something… wrap terms in "quotes" to require an exact match ( / to focus )'
-                className="flex-1 border-0 shadow-none focus-visible:ring-0"
+                className="min-w-0 flex-1 basis-[80%] border-0 shadow-none focus-visible:ring-0 sm:basis-auto"
                 data-testid="input-query"
               />
               <Tooltip>
@@ -879,6 +912,9 @@ export default function Query() {
               </Tooltip>
               <Button onClick={submit} disabled={mut.isPending || !q.trim()} data-testid="button-search">
                 {mut.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : "Search"}
+              </Button>
+              <Button type="button" variant="outline" onClick={resetQuery} data-testid="button-reset-query">
+                Reset
               </Button>
             </div>
             <div className="mt-2 flex flex-wrap gap-1.5">
@@ -1128,6 +1164,7 @@ function summarizeHistoryFilters(f: QueryHistoryFilters | undefined): string {
   const parts: string[] = [];
   if (f.productModel) parts.push(`Model: ${f.productModel}`);
   if (f.productFamily) parts.push(`Family: ${f.productFamily}`);
+  if (f.productFamily && f.selectedFamilyOnly) parts.push("Selected family only");
   if (f.docType) parts.push(`Type: ${f.docType}`);
   if (f.firmware) parts.push(`Firmware: ${f.firmware}`);
   if (f.errorCode) parts.push(`Error: ${f.errorCode}`);

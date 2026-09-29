@@ -34,12 +34,18 @@ export function writeHashQuery(queryString: string): void {
   const nextHash = `#${basePath}${queryString}`;
 
   // No-op if nothing changed - avoids a redundant replaceState.
-  if (nextHash === currentHash) return;
+  if (nextHash === currentHash) {
+    if (pendingTimer) clearTimeout(pendingTimer);
+    pendingHash = null; pendingTimer = null;
+    return;
+  }
 
   pendingHash = nextHash;
   if (pendingTimer) return;
   pendingTimer = setTimeout(() => {
-    if (pendingHash) {
+    // A late edit from Query must never navigate back from Upload/Library.
+    const livePath = (window.location.hash || "#/").slice(1).split("?")[0];
+    if (pendingHash && livePath === pendingHash.slice(1).split("?")[0]) {
       try {
         history.replaceState(null, "", pendingHash);
       } catch {

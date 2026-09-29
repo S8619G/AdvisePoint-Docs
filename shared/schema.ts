@@ -276,6 +276,7 @@ export const searchRequestSchema = z.object({
       // selected, documents that have NO recorded family are included as
       // well -- forgiving for older uploads that pre-date the family field.
       product_family: z.string().optional(),
+      selected_family_only: z.boolean().optional(),
       product_version: z.array(z.string()).optional(),
       firmware_version: z.array(z.string()).optional(),
       document_type: z.array(z.string().trim().min(1).max(80)).optional(),

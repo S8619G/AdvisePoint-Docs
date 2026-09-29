@@ -155,12 +155,19 @@ function AppRouter() {
   );
 }
 
+// Route on the hash pathname; tab stores own the query-string state.
+// Otherwise a bookmarked /query?family=... fails exact route matching.
+function useHashPath(): ReturnType<typeof useHashLocation> {
+  const [location, navigate] = useHashLocation();
+  return [location.split("?")[0], navigate];
+}
+
 function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <Toaster />
-        <Router hook={useHashLocation}>
+        <Router hook={useHashPath}>
           <div className="min-h-screen bg-background text-foreground">
             <TopNav />
             {/* v1.0.5: cloud-sync / UNC folder warning. Sits above the update

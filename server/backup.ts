@@ -710,11 +710,36 @@ export function verifyDatabaseFile(dbPath: string, manifest: BackupManifest | nu
  * verification a restore would demand, so an unverifiable backup can only
  * ever accumulate, never displace a known-good one.
  */
-export async function verifyBackupArchiveFile(zipPath: string): Promise<VerifyResult> {
+export async function verifyBackupArchiveFile(zipPath: string, complete = false): Promise<VerifyResult> {
   let staged: StagedImport | null = null;
   try {
     staged = await stageImport(zipPath);
     verifyRetainedPdfs(staged.dbPath, staged.originalsDir);
+    if (complete) {
+      if (!staged.manifest) throw Error("Backup manifest is missing.");
+      if (directorySize(staged.pagesDir).files !== staged.manifest.pages_file_count) {
+        throw Error("Backup page-image count does not match its manifest.");
+      }
+      const db = new Database(staged.dbPath, { readonly: true, fileMustExist: true });
+      try {
+        const originals = db.prepare("SELECT id, original_ext FROM documents WHERE original_ext IS NOT NULL AND original_ext != ''")
+          .all() as {id: string; original_ext: string}[];
+        for (const doc of originals) {
+          if (!/^[A-Za-z0-9_-]+$/.test(doc.id) || !/^(pdf|docx|rtf)$/.test(doc.original_ext))
+            throw Error("Backup contains an invalid retained-original reference.");
+          const s = lstatSync(join(staged.originalsDir, `${doc.id}.${doc.original_ext}`));
+          if (!s.isFile() || s.isSymbolicLink() || !s.size) throw Error("Backup is missing a retained original.");
+        }
+        const pages = db.prepare("SELECT document_id, image_path FROM document_pages WHERE image_path != ''")
+          .all() as {document_id: string; image_path: string}[];
+        for (const page of pages) {
+          if (!/^[A-Za-z0-9_-]+$/.test(page.document_id)) throw Error("Invalid page document id.");
+          const name = page.image_path.replace(/\\/g, "/").split("/").pop()!;
+          const s = lstatSync(join(staged.pagesDir, page.document_id, name));
+          if (!s.isFile() || s.isSymbolicLink() || !s.size) throw Error("Backup is missing a stored page.");
+        }
+      } finally { db.close(); }
+    }
     return verifyDatabaseFile(staged.dbPath, staged.manifest);
   } catch (err) {
     return {

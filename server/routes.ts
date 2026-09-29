@@ -2900,7 +2900,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         storage.listDocuments()
           .filter((d) => {
             const fam = (d.product_family ?? "").trim();
-            if (fam === "") return true; // untagged docs pass
+            if (fam === "") return filters.selected_family_only !== true;
             return fam.toLowerCase() === wanted;
           })
           .map((d) => d.id),

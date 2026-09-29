@@ -13,7 +13,7 @@ const require=createRequire(import.meta.url),compat=require("../server/workers/p
 const root=resolve(import.meta.dirname,".."),base="http://127.0.0.1:5221";
 const digest=b=>createHash("sha256").update(b).digest("hex");
 const engine=process.env.APD_ENGINE_TEST_EXE;
-let temp,server,log="",kind,plain,restricted,convertedId,backup;
+let temp,server,log="",kind,plain,restricted,convertedId,backup,samplePath;
 const json=async p=>(await fetch(base+p)).json();
 async function start(){
   server=spawn(process.execPath,["dist/index.cjs"],{cwd:root,env:{...process.env,
@@ -42,6 +42,16 @@ before(async()=>{
   plain=Buffer.from(await pdf.save());writeFileSync(join(temp,"plain.pdf"),plain);
   execFileSync(engine,["--encrypt","","owner","256","--extract=n","--",join(temp,"plain.pdf"),join(temp,"restricted.pdf")]);
   restricted=readFileSync(join(temp,"restricted.pdf"));await start();
+  // Self-contained sample when the private field fixture is not supplied.
+  // Never report a synthetic test as a retest of that original manual.
+  samplePath=process.env.APD_SAMPLE_PDF;
+  if(!samplePath){
+    const sample=await PDFDocument.create(),font=await sample.embedFont(StandardFonts.Helvetica);
+    for(let n=1;n<=76;n++)sample.addPage([300,400]).drawText(`Synthetic compatibility sample page ${n}`,{x:15,y:200,size:9,font});
+    const path=join(temp,"sample-plain.pdf");writeFileSync(path,await sample.save());
+    samplePath=join(temp,"sample-restricted.pdf");
+    execFileSync(engine,["--encrypt","","owner","256","--extract=n","--",path,samplePath]);
+  }
   kind=(await json("/api/document-types")).types[0].key;
 });
 after(async()=>{await stop();writeFileSync(join(root,"verification/v131-server.log"),log);
@@ -61,17 +71,16 @@ test("normal PDF stays byte-identical; restricted PDF imports automatically as o
   assert.equal((await json(`/api/documents/${convertedId}/pages`)).pages.length,54);
   assert.equal(await count(),2);
 });
-test("supplied 76-page manual: complete import, source unchanged, one smaller PDF",async()=>{
-  if(!process.env.APD_SAMPLE_PDF)throw Error("Provide the supplied manual using APD_SAMPLE_PDF");
-  const source=readFileSync(process.env.APD_SAMPLE_PDF);
-  const u=await upload("CloudCaptureENOGR2025_12_17-CustomerAdminGuide.pdf",source);
+test("76-page compatibility sample: complete import, source unchanged, one smaller PDF",async()=>{
+  const source=readFileSync(samplePath);
+  const u=await upload("Compatibility-76-pages.pdf",source);
   assert.equal(u.status,200,JSON.stringify(u));assert.equal(u.data.extraction.page_count,76);
   const stored=readFileSync(join(temp,"originals",u.data.document.id+".pdf"));
-  assert.equal(digest(readFileSync(process.env.APD_SAMPLE_PDF)),digest(source));
+  assert.equal(digest(readFileSync(samplePath)),digest(source));
   assert.ok(stored.length<source.length);assert.equal(u.data.pdf_prepared,true);
   writeFileSync(join(root,"verification/converted-sample.pdf"),stored);
   writeFileSync(join(root,"verification/sample-result.json"),JSON.stringify({
-    id:u.data.document.id,pages:76,inputBytes:source.length,outputBytes:stored.length,
+    fixture:process.env.APD_SAMPLE_PDF?"supplied":"synthetic",id:u.data.document.id,pages:76,inputBytes:source.length,outputBytes:stored.length,
     sourceSHA256:digest(source),retainedSHA256:digest(stored)},null,2));
 });
 test("password, no-print, low-quality-only and malformed PDFs leave no imported row",async()=>{

@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { rawDb, isDbClosedForRestore } from "./storage";
 import { scheduledBackupFilename, isBackupFilename, writeBackupToFile, translateBackupError, verifyBackupArchiveFile } from "./backup";
 import { appendBackupLog } from "./backup-log";
+import { runBackupPair, readBackupPairSummary } from "./backup-pair";
 
 // -------- Settings persistence (app_settings key/value) --------
 
@@ -23,6 +24,7 @@ const KEYS = {
   time: "backup_time",               // "HH:MM" 24h local
   folder: "backup_folder",           // absolute path
   retention: "backup_retention",     // integer, kept as string
+  mode: "backup_mode",
   lastRunAt: "backup_last_run_at",   // ISO timestamp
   lastStatus: "backup_last_status",  // "success" | "failed" | ""
   lastError: "backup_last_error",    // string
@@ -40,6 +42,7 @@ export interface BackupSettings {
   time: string;                 // "HH:MM"
   folder: string;
   retention: number;
+  mode: "count" | "pair";
   lastRunAt: string | null;
   lastStatus: "success" | "failed" | null;
   lastError: string | null;
@@ -98,6 +101,7 @@ export interface BackupSettingsWire extends BackupSettings {
   } | null;
   last_backup_filename: string | null;
   next_run_at: string | null;
+  pair: ReturnType<typeof readBackupPairSummary> | null;
 }
 
 export function readSettings(): BackupSettingsWire {
@@ -106,6 +110,7 @@ export function readSettings(): BackupSettingsWire {
   const folderRaw = get(KEYS.folder);
   const folder = folderRaw && folderRaw.trim().length > 0 ? folderRaw.trim() : "";
   const retention = parseInt(get(KEYS.retention) ?? String(DEFAULTS.retention), 10) || DEFAULTS.retention;
+  const mode = get(KEYS.mode) === "pair" ? "pair" : "count";
   const lastRunAt = get(KEYS.lastRunAt);
   const lastStatusRaw = get(KEYS.lastStatus);
   const lastStatus = lastStatusRaw === "success" || lastStatusRaw === "failed" ? lastStatusRaw : null;
@@ -169,6 +174,8 @@ export function readSettings(): BackupSettingsWire {
     time,
     folder,
     retention,
+    mode,
+    pair: mode === "pair" && folder ? readBackupPairSummary(folder) : null,
     lastRunAt,
     lastStatus,
     lastError,
@@ -188,6 +195,7 @@ export function readSettings(): BackupSettingsWire {
 }
 
 export interface WritableSettings {
+  mode?: "count" | "pair";
   cadence?: "off" | "daily" | "weekly";
   // Accept both internal name (`time`) and UI-friendly alias (`time_hhmm`).
   time?: string;
@@ -204,6 +212,9 @@ export interface WritableSettings {
 }
 
 export function writeSettings(patch: WritableSettings): BackupSettingsWire {
+  if (patch.mode !== undefined && patch.mode !== "count" && patch.mode !== "pair")
+    throw Error("Invalid scheduled backup mode.");
+  if (patch.mode) set(KEYS.mode, patch.mode);
   if (patch.cadence && ["off", "daily", "weekly"].includes(patch.cadence)) {
     set(KEYS.cadence, patch.cadence);
   }
@@ -352,14 +363,24 @@ async function runBackupNow(reason: "scheduled" | "catchup"): Promise<void> {
   const outPath = join(settings.folder, filename);
   logBackup(`[BACKUP] ${reason} run starting -> ${outPath}`);
   try {
-    const result = await withBackupLock(() => writeBackupToFile(outPath));
-    logBackup(`[BACKUP] wrote ${outPath} (${result.bytes} bytes)`);
+    const result = await withBackupLock(async () => {
+      if (settings.mode === "pair") {
+        return runBackupPair(settings.folder, {
+          write: path => writeBackupToFile(path),
+          verify: path => verifyBackupArchiveFile(path, true),
+        });
+      }
+      const written = await writeBackupToFile(outPath);
+      await pruneOldBackups(settings.folder, settings.retention);
+      return { ...written, filename, cleanupPending: false };
+    });
+    logBackup(`[BACKUP] wrote ${result.path} (${result.bytes} bytes)`);
+    if (result.cleanupPending) logBackup("[BACKUP] verified pair committed; old-file cleanup pending.");
     set(KEYS.lastRunAt, new Date().toISOString());
     set(KEYS.lastStatus, "success");
     set(KEYS.lastError, "");
     set(KEYS.lastBytes, String(result.bytes));
-    set("backup_last_filename", filename);
-    await pruneOldBackups(settings.folder, settings.retention);
+    set("backup_last_filename", result.filename);
   } catch (err) {
     // Raw exception message goes to server.log so support and the
     // diagnostics bundle both see it. The stored `lastError` is the
@@ -381,7 +402,7 @@ async function runBackupNow(reason: "scheduled" | "catchup"): Promise<void> {
       raw,
     }));
     // Best-effort delete partial file.
-    try { if (existsSync(outPath)) rmSync(outPath); } catch { /* ignore */ }
+    try { if (settings.mode !== "pair" && existsSync(outPath)) rmSync(outPath); } catch { /* ignore */ }
   }
 }
 

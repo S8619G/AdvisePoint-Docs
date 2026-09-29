@@ -1,55 +1,100 @@
-# AdvisePoint Docs v1.3.2 testing guide
+# AdvisePoint Docs v1.3.3 testing guide
 
-Use the matching x64 or ARM64 binary package. Keep a verified independent backup before testing an upgrade; the shared-source ZIP is not an updater package.
+Use the matching x64 or ARM64 binary ZIP and verify its SHA-256. Keep an
+independent verified library backup before upgrading; shared source is not an
+updater package. These packages are not yet published to GitHub.
 
-## Package and upgrade checks
+## Upgrade and isolation
 
-- **Identity:** verify the ZIP against the supplied SHA-256 manifest. Confirm the architecture before extracting or choosing a ZIP update.
-- **ARM64:** test the local ZIP drag-and-drop/in-place upgrade from the existing installation. Confirm the version is 1.3.2, the same library is present and an existing document remains searchable and viewable.
-- **x64:** the supplied diagnostics already establish one successful GitHub upgrade from 1.3.0 to 1.3.1. GitHub upgrading to 1.3.2 can only be tested after its publication; until then use the matching local ZIP if desired.
-- **Updater behavior:** package validation should complete before the service stops. Expect a brief reconnect during installation, followed by the new version. On failure, preserve diagnostics and do not clear library data.
-- **Isolation:** release ZIPs contain only the production launcher, which uses the normal library and port 5000. Do not run it expecting a disposable library. Existing prototype port 5100 and separate test-launcher port 5101 remain unchanged. The former optional v1.3.1 test launcher used 5102 and is not bundled here. Request a separate isolated test setup if one is needed.
+- **Local upgrade:** use the existing local-ZIP update control with the matching
+  architecture package. Confirm v1.3.3, reconnect and an unchanged searchable
+  library. Validate before shutdown; preserve diagnostics if updating fails.
+- **Production:** the normal launcher uses the real library and port 5000.
+  Prototype 5100 and separate test launcher 5101 remain distinct. No isolated
+  launcher or reset/delete utility is bundled. Do not assume extracting a second
+  application creates a separate library.
+- **Test data:** use an explicitly isolated test setup or an approved disposable
+  library copy for mutation, restore and backup-failure tests. Do not interrupt
+  real production backups or delete genuine recovery copies for testing.
 
-## Edge long-idle field test
+## Query controls
 
-Run this on Windows x64 first, then ARM64. Keep Windows awake; record whether Edge is foreground, background, minimized or has put the tab to sleep.
+- **Default:** Selected family only starts unchecked. Selecting a family includes
+  matching and unassigned documents, but not other assigned families.
+- **Strict:** check the option and search again. Only explicitly matching
+  families remain; blank/whitespace values are excluded. Case and surrounding
+  whitespace do not affect matching. Any disables the option.
+- **Combined filters:** check model, type and tags with strict mode. A zero-hit
+  strict search must not silently broaden. Confirm the selected result limit
+  applies after filtering.
+- **Reset:** use Reset beside Search. Text, results, selection/preview and all
+  filters should clear; the family-only checkbox becomes unchecked. Recent
+  searches, documents, search mode and result limit remain.
+- **State:** switch tabs and return; old cleared results must not return. Reload
+  a bookmarked filtered URL and rerun a recent strict search. Reset during a
+  slow search must prevent its late response from restoring old results.
 
-- **Starting state:** open a document and confirm that Query and Library respond. Note the start time.
-- **Idle:** leave the app unused for at least four hours without putting Windows to sleep. Browser tab suspension is a separate condition worth recording, not evidence of computer sleep.
-- **Return:** use Library and Query, then Check now in Settings > System. A failed GitHub request must not stop the local service.
-- **Closed tabs:** close every app tab, wait more than ten minutes, then run the normal launcher. It should reconnect to the existing service and library.
-- **Evidence:** if a failure occurs, export diagnostics immediately after recovery, before repeated restarts rotate the logs. Record the approximate failure time, Windows architecture, Edge version and which control failed.
+## Upload result Reset
 
-The automated eight-hour injected-time test and accelerated real-server check do not replace this native Windows field test.
+- **Completed results:** upload a disposable file or batch, then use Reset at
+  the right of Upload result. The panel returns to its empty state without a
+  browser refresh; imported documents remain in Library.
+- **Partial failures:** reset after a mixed success/failure batch. Failed and
+  pending staged rows and editable metadata remain available; completed results
+  disappear. Already-imported files are not requeued by Reset.
+- **Pasted text:** repeat with a pasted-text import.
+- **Active work:** Reset is disabled while an upload is running, including after
+  switching away and back. A subsequent completed upload should show only its
+  new results.
 
-## Settings acceptance
+## Scheduled backups
 
-- **Formats:** Document types comes first, followed immediately by Manage Product Lists, then Filename codes and Filename phrases. Confirm that Product family and Product model entries show usage counts.
-- **Product edits:** in disposable documents only, rename a value, merge it into another value and delete it using reassignment or field clearing. Confirm the affected count and that the documents remain. Back up before bulk edits; no one-click undo is provided.
-- **System:** Library maintenance is on the left and Diagnostics on the right at a wide width. They stack at narrow widths. Run a read-only scan and export diagnostics.
-- **Backup / Restore:** Welcome Guide reinstall is the last panel. Reinstall it and confirm the guide identifies v1.3.2 and the new Settings locations.
-- **Storage:** add a disposable document and return to System. Allow at least 15 seconds with the panel active, then verify the storage figures refresh. Repeat after removing the disposable document. Do not expect SQLite allocation or retained recovery bytes to disappear immediately.
+- **Compatibility:** the label is Backups to keep. Existing count-based mode,
+  saved count, folder and cadence should remain unchanged. A fresh configuration
+  still defaults to 7. Changing the label alone does not run or delete backups.
+- **Opt in:** select Latest backup + previous backup and save. The count field
+  shows 2 and is disabled in this mode; switching back restores the saved count.
+- **First runs:** use Backup Now with an empty disposable destination. The first
+  successful run creates latest; the second establishes previous. Settings lists
+  both timestamps and filenames inside AdvisePoint-Scheduled-Pair.
+- **Rotation:** after a third successful run, restore/test each retained ZIP in
+  an isolated library. Verify metadata, search, retained PDFs/DOCX/RTF and stored
+  page images. Check only the oldest pair-owned generation was retired.
+- **Failures:** with disposable copies, test insufficient space, a disconnected
+  destination, locked files, a corrupt new candidate and interruption/restart.
+  Existing recovery copies must remain available; no old copy may be deleted
+  simply to make room. Do not perform these tests on genuine backups.
+- **Fallback:** a damaged latest must not replace a valid previous. If neither
+  existing copy verifies, expect a refusal and preserved files for investigation.
+- **Mode changes:** manual/historical files are not removed by pair mode.
+  Switching settings alone does not delete them. A later count-mode backup
+  still applies the configured count to matching dated archives in the parent
+  folder; keep independent manual master copies in a separate folder.
+- **Recovery record:** do not edit pair-state.json. Pending cleanup may leave
+  extra files temporarily; verify a later successful run reconciles its owned
+  interrupted generations. Report actual Windows file-lock/rename behavior on
+  both architectures.
 
-## Stop application
+The pair is two full backups, not incremental storage or a permanent master.
+Allow extra space for a new archive and extracted verification data. Keep an
+independent copy on another drive.
 
-- **Cancel:** open Stop application, then Cancel. The app should remain available.
-- **Busy refusal:** while a supported tracked operation is active, stopping should be refused with an explanation. Do not deliberately interrupt real production writes to test this.
-- **Confirmed stop:** finish work, then confirm Stop application. The initiating tab should show that the application was intentionally stopped. Other tabs lose their connection because the shared service has stopped.
-- **Restart:** use Start AdvisePoint Docs. Confirm the library is unchanged and scheduled backups are available again.
-- **External printing:** finish the external reader/printer job before stopping. The app can track preparation, not every printer queue or external reader process.
+## Regression and continuing field gates
 
-## PDF and metadata regression checks
+- **PDF:** check normal, compatible restricted and older stored-page documents,
+  including navigation, external-reader links, print preparation and a physical
+  printer. No automatic library conversion is expected.
+- **Metadata and Settings:** check DE title handling, type counts, Manage Product
+  Lists and storage polling.
+- **Lifecycle:** leave x64 Edge awake and idle at least four hours, then use
+  Query, Library and update checking. Browser suspension differs from Windows
+  sleep. Test final-tab closure, explicit Stop/cancel/busy refusal and relaunch.
+- **Architecture:** exercise local in-place upgrading and backup behavior on
+  both x64 and ARM64. Live GitHub OTA acceptance follows only after publication
+  is separately authorized.
 
-- **Normal PDF:** upload a disposable unrestricted PDF; view multiple pages, search, prepare a print range and open the result.
-- **Restricted PDF:** repeat the previously successful printable, copy-restricted example. Confirm a compatible retained PDF, no conversion-browser launch and working links in an external PDF reader.
-- **Existing documents:** check a previously retained PDF and an older stored-page document. No automatic library conversion should occur.
-- **Metadata:** check a filename affected by the DE splitting correction and confirm Document Type counts update after import, reassignment and recoverable removal.
-- **Printing:** confirm page range, count, orientation and scaling in preview and on a physical printer. Report the reader and driver used. Broad physical-printing acceptance remains pending.
-
-## Known limits and remaining backlog
-
-The earlier Edge failure is not fully captured in the uploaded logs. Its cause cannot be certified from the available evidence, and broader Windows reliability remains a field test.
-
-There are 14 pre-existing TypeScript diagnostics and two baseline custom filename-code test failures involving joined EN/custom-code names. The new Settings and lifecycle checks do not resolve those unrelated cases.
-
-Excel/PowerPoint-to-PDF import is deferred. No reset/delete-all tool is included, and no production library should be reset, deleted or converted as part of these tests.
+Known baseline: 14 TypeScript diagnostics and the `GENENZZ42` model /
+`HyPASENCG` custom-code test failures. These are not newly claimed passes.
+Export diagnostics promptly after a failure, recording the time, architecture,
+browser, backup destination type and failed action. Logs can include paths and
+filenames; review before sharing.

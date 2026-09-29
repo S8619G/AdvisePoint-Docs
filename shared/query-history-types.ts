@@ -12,6 +12,7 @@
 export interface QueryHistoryFilters {
   productModel?: string;
   productFamily?: string;
+  selectedFamilyOnly?: boolean;
   docType?: string;
   firmware?: string;
   errorCode?: string;

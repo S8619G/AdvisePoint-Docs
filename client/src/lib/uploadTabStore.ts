@@ -98,6 +98,7 @@ export interface UploadTabState {
   pastedBody: string;
   pastedResult: any | null;
   uploadingKey: string | null;
+  textUploading: boolean;
   batchDone: boolean;
   completedUploads: any[];
 }
@@ -133,7 +134,8 @@ const initialUploadTabState: UploadTabState = {
   autoFixTitles: false,
   pastedBody: "",
   pastedResult: null,
-  uploadingKey: null,
+    uploadingKey: null,
+    textUploading: false,
   batchDone: false,
   completedUploads: [],
 };

@@ -46,6 +46,7 @@ export interface QueryTabState {
   productModel: string;
   // v1.0.14: Product family filter (defaults to "" = Any).
   productFamily: string;
+  selectedFamilyOnly: boolean;
   docType: string;
   firmware: string;
   errorCode: string;
@@ -61,6 +62,7 @@ export interface QueryTabState {
   pageViewer: PageViewerRef | null;
   lastResponse: QuerySearchResponse | null;
   scrollY: number;
+  searchGeneration: number;
 }
 
 export const queryTabStore = createTabStore<QueryTabState>({
@@ -69,6 +71,7 @@ export const queryTabStore = createTabStore<QueryTabState>({
   maxResults: 12,
   productModel: "",
   productFamily: "",
+  selectedFamilyOnly: false,
   docType: "",
   firmware: "",
   errorCode: "",
@@ -82,6 +85,7 @@ export const queryTabStore = createTabStore<QueryTabState>({
   pageViewer: null,
   lastResponse: null,
   scrollY: 0,
+  searchGeneration: 0,
 });
 
 // -------- URL sync --------
@@ -98,6 +102,7 @@ export function serializeQueryStateToUrl(s: QueryTabState): string {
   if (s.maxResults !== 12) params.set("top_k", String(s.maxResults));
   if (s.productModel) params.set("model", s.productModel);
   if (s.productFamily) params.set("family", s.productFamily);
+  if (s.productFamily && s.selectedFamilyOnly) params.set("family_only", "1");
   if (s.docType) params.set("type", s.docType);
   if (s.firmware) params.set("fw", s.firmware);
   if (s.errorCode) params.set("err", s.errorCode);
@@ -130,6 +135,7 @@ export function hydrateQueryStateFromUrl(hash: string): Partial<QueryTabState> {
   if (model) out.productModel = model;
   const family = params.get("family");
   if (family) out.productFamily = family;
+  out.selectedFamilyOnly = !!family && params.get("family_only") === "1";
   const type = params.get("type");
   if (type) out.docType = type;
   const fw = params.get("fw");

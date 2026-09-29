@@ -103,6 +103,11 @@ Tags autocomplete from existing values. Filename codes and phrases
 suggest Document types without overwriting an explicit selection.
 After import, searchable excerpts and metadata are stored locally.
 
+Reset at the right of Upload result clears completed result feedback.
+It does not remove imported documents, pending or failed staged files,
+or editable upload fields. It is unavailable during an active upload.
+New uploads show new results without refreshing the browser.
+
 PDF IMPORT AND PRINTING
 ----------------------
 
@@ -142,6 +147,19 @@ Open Query, enter a question or phrase, and narrow the results with
 Product model, Product family, Document type, confidentiality or tags.
 Smart combines keyword and semantic matching. Phrase searches for
 an exact phrase; Semantic searches by meaning.
+
+Product family normally includes documents with that family and those
+with no family recorded. Select "Selected family only" below the family
+list to exclude documents without the selected family. It is unchecked
+by default and unavailable while Family is Any. Product family and
+Product model remain independent filters. Strict searches with no
+matches are not automatically broadened.
+
+Reset to the right of Search clears the search box, results and all
+filters, including Selected family only. Recent searches and library
+documents are preserved. Search mode and result-limit preferences stay
+unchanged. Recent searches and bookmarked search URLs restore the
+family-only option with the other search filters.
 
 Select a result to open its source document. Use the page controls,
 scrollbar and zoom controls to navigate. In-document search helps
@@ -241,10 +259,39 @@ Quick Backup writes a library ZIP to the chosen folder. "Download
 a copy" sends a backup through the browser instead. Backups include
 the database, retained originals and stored page images.
 
-Scheduled Backups allows a daily or weekly schedule and a retention
-count. The local service must be running for the schedule to execute.
-New backups are verified before older scheduled backups are pruned.
-Keep the destination writable and allow enough free space.
+Scheduled Backups allows a daily or weekly schedule. The local service
+must be running for the schedule to execute. Backups are full ZIPs,
+not incremental changes. Keep the destination writable with enough
+space for new files and verification.
+
+"Keep a set number of backups" is the default mode. "Backups to keep"
+defaults to 7; existing saved counts are preserved. Each run creates a
+dated ZIP. Older matching archives are pruned only after at least one
+retained archive passes verification. Use a separate folder for manual
+master copies so ordinary count-based retention does not include them.
+
+"Latest backup + previous backup" is optional. A new backup is written
+separately and verified before it becomes latest. The former valid
+latest becomes previous; a damaged latest does not replace a valid
+previous. Creation or verification failure leaves existing recovery
+copies available. If neither existing copy verifies, review the files
+or select another destination before retrying.
+
+The pair is stored inside "AdvisePoint-Scheduled-Pair" in the selected
+folder. Settings lists each copy's timestamp and filename; select the
+appropriate ZIP when restoring. Do not edit pair-state.json. The first
+successful run creates latest; previous appears after the second.
+Switching modes preserves the saved count and does not immediately
+delete existing dated archives. Pair mode does not remove manual files
+or historical count-based backups. A later count-mode run still applies
+normal count retention to matching files in the selected parent folder.
+
+Pair mode normally retains two full copies, but needs extra temporary
+space for a new archive and verification. Interrupted runs or cleanup
+failures may temporarily leave additional owned files; cleanup retries
+after a successful backup. No backup is deleted early to make room.
+This is not a permanent master copy or long-term version history.
+Keep an independent backup on another drive for additional protection.
 
 Restore offers two modes:
   * Merge adds documents not already present by document ID.
@@ -293,8 +340,8 @@ network failure.
 VERSION
 -------
 
-AdvisePoint Docs 1.3.2
-Guide revision 1.3.2
-Guide date: September 23, 2026
+AdvisePoint Docs 1.3.3
+Guide revision 1.3.3
+Guide date: September 28, 2026
 Native Windows field acceptance, long-idle Edge testing and physical
 printing remain separate verification steps.

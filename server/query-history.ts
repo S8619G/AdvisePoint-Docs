@@ -53,6 +53,7 @@ function coerceEntry(raw: any): QueryHistoryEntry | null {
   const filters: QueryHistoryFilters = {
     productModel: typeof filtersIn.productModel === "string" ? filtersIn.productModel : "",
     productFamily: typeof filtersIn.productFamily === "string" ? filtersIn.productFamily : "",
+    selectedFamilyOnly: filtersIn.selectedFamilyOnly === true,
     docType: typeof filtersIn.docType === "string" ? filtersIn.docType : "",
     firmware: typeof filtersIn.firmware === "string" ? filtersIn.firmware : "",
     errorCode: typeof filtersIn.errorCode === "string" ? filtersIn.errorCode : "",
@@ -114,6 +115,7 @@ export function dedupeKeyFor(entry: QueryHistoryEntry): string {
     entry.maxResults,
     f.productModel ?? "",
     f.productFamily ?? "",
+    f.productFamily && f.selectedFamilyOnly === true ? "family-only" : "",
     f.docType ?? "",
     f.firmware ?? "",
     f.errorCode ?? "",
