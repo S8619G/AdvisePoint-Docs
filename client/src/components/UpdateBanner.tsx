@@ -3,7 +3,7 @@ import { Download, ExternalLink, X } from "lucide-react";
 import { UpdateCheck, type LatestRelease } from "@/lib/updateCheck";
 
 // Small non-intrusive banner shown under the top nav when a newer release
-// exists on GitHub. Auto-hides when the user skips or after they've dismissed
+// exists online. Auto-hides when the user skips or after they've dismissed
 // via localStorage. Renders nothing when up to date, offline, or skipped.
 export function UpdateBanner() {
   const [release, setRelease] = useState<LatestRelease | null>(null);

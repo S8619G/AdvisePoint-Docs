@@ -225,7 +225,7 @@ async function fetchLatestRelease(arch = readInstalledArch()) {
   try {
     release = JSON.parse(data.toString("utf8"));
   } catch (error) {
-    throw new Error("GitHub returned invalid release information", { cause: error });
+    throw new Error("The update service returned invalid release information", { cause: error });
   }
   if (!release || !/^v?\d+\.\d+\.\d+(?:\.\d+)*$/.test(String(release.tag_name || ""))) {
     throw new Error("Latest release has an invalid version tag");
@@ -1428,7 +1428,7 @@ async function performUpdate() {
       return 3;
     }
     sourceLabel = args.localZip;
-    log(`[updater] using local zip ${args.localZip} (skipping GitHub fetch)`);
+    log(`[updater] using local zip ${args.localZip} (skipping online download)`);
     // v1.2.2: verify integrity BEFORE any staging or install writes. On
     // failure, print user-facing lines that explicitly steer the user to
     // redownload rather than retry against the same corrupt file.
@@ -1452,19 +1452,19 @@ async function performUpdate() {
       console.log(error.message);
       return 3;
     }
-    log(`Latest version available on GitHub: v${latest.version}`);
+    log(`Latest online release: v${latest.version}`);
     const comparison = compareVersions(currentVersion, latest.version);
     if (comparison === 0) {
-      log(`You are running v${currentVersion}, which matches the latest version available on GitHub.`);
+      log(`You are running v${currentVersion}, which matches the latest online release.`);
       await waitForEnter("Press Enter to close.");
       return 0;
     }
     if (comparison > 0) {
-      log(`You are running v${currentVersion}. GitHub's latest published release is v${latest.version}, so this installation is newer than the published release.`);
+      log(`You're running v${currentVersion}. The latest online release is v${latest.version}, so no updates are currently active.`);
       await waitForEnter("Press Enter to close.");
       return 0;
     }
-    log(`GitHub has a newer version: v${latest.version}.`);
+    log(`A newer online release is available: v${latest.version}.`);
     try {
       log(`Downloading ${latest.assetUrl}`);
       archive = await requestBuffer(latest.assetUrl);

@@ -186,7 +186,7 @@ test("current release exits cleanly without changing the install", async () => {
   setRelease("0.9.32", archive);
   const result = await runUpdater(install);
   assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /matches the latest version available on GitHub/i);
+  assert.match(result.stdout, /matches the latest online release/i);
   assert.equal(fs.readFileSync(path.join(install.root, "dist", "index.cjs"), "utf8"), "old-current");
 });
 
@@ -247,15 +247,16 @@ test("verified app server is shut down before update", async () => {
   }
 });
 
-test("newer running build is described separately from GitHub release", async () => {
+test("newer running build is described separately from the online release", async () => {
   const install = createInstall("newer-running", "0.9.33");
   const archive = createReleaseZip("newer-running", "0.9.32");
   setRelease("0.9.32", archive);
   const result = await runUpdater(install);
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /Running version: v0\.9\.33/i);
-  assert.match(result.stdout, /Latest version available on GitHub: v0\.9\.32/i);
-  assert.match(result.stdout, /newer than the published release/i);
+  assert.match(result.stdout, /Latest online release: v0\.9\.32/i);
+  assert.match(result.stdout, /The latest online release is v0\.9\.32, so no updates are currently active/i);
+  assert.doesNotMatch(result.stdout, /github|mistyped|tag/i);
 });
 
 test("successful update swaps dist, retains one backup, and preserves user data", async () => {

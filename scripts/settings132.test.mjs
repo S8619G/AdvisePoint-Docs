@@ -52,7 +52,7 @@ test("Settings placement, dialogs, storage polling and recovery layout", async (
     await p.goto(base + "/#/schema");
     await p.getByTestId("storage-breakdown").waitFor();
     await p.getByTestId("button-check-updates").click();
-    await p.getByText(/Couldn't reach GitHub/).waitFor();
+    await p.getByText(/Couldn't get release information from the update service/).waitFor();
     assert.equal((await fetch(base + "/api/health")).status, 200);
     const scan = p.getByTestId("panel-library-scan"), diagnostics = p.getByTestId("panel-diagnostics");
     const a = await scan.boundingBox(), b = await diagnostics.boundingBox();

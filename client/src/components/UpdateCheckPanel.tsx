@@ -20,23 +20,21 @@ import { LOCAL_TEST } from "@/build-mode";
 // Manual "Check for updates" panel, mounted under Settings.
 //
 // Distinct from the top-nav UpdateBanner, which is background-only. This panel
-// gives the user a Check now button that force-refreshes the GitHub call
-// (bypassing the 24h localStorage cache) and shows a status message inline.
+// gives the user a Check now button that force-refreshes the online release
+// check (bypassing the 24h localStorage cache) and shows a status message inline.
 //
 // States (in order of user visibility):
 //   - idle:      last-known cached result, "Check now" button enabled
-//   - checking:  spinner + "Checking GitHub for a newer release…"
+//   - checking:  spinner + "Checking for a newer online release…"
 //   - uptodate:  green check, "You're on the latest version"
 //   - available: amber, release title/notes, Download + What's new links
-//   - unusual:   amber warning, GitHub says the latest tag is OLDER than the
-//                installed version — added in v0.9.35 after a mistyped tag
-//                (v0.0.34 for what should have been v0.9.34) silently rendered
-//                the up-to-date state because cmpVersion compared numerically.
-//                We surface the mismatch instead of pretending everything is
-//                fine.
-//   - offline:   red, "Couldn't reach GitHub — try again in a moment"
+//   - newer:     v1.3.4 neutral information. A successful check found that
+//                the installed version is newer than the latest online
+//                release. Never offered as an update or downgrade.
+//   - offline:   red, no usable release information (network failure or an
+//                invalid response) — try again in a moment
 
-type Status = "idle" | "checking" | "uptodate" | "available" | "unusual" | "offline";
+type Status = "idle" | "checking" | "uptodate" | "available" | "newer" | "offline";
 
 // Given a fresh release and the installed version, decide which post-check
 // status to show. Split out from the click handler so both the mount-hydrate
@@ -44,7 +42,7 @@ type Status = "idle" | "checking" | "uptodate" | "available" | "unusual" | "offl
 function classifyRelease(latest: LatestRelease, installed: string): Status {
   const cmp = cmpVersion(latest.version, installed);
   if (cmp > 0) return "available";
-  if (cmp < 0) return "unusual";
+  if (cmp < 0) return "newer";
   return "uptodate";
 }
 
@@ -259,7 +257,7 @@ function EnabledUpdateCheckPanel() {
   }, []);
 
   // v1.0.9: drop-a-zip local upgrade. Users can drag a downloaded release zip
-  // onto the panel and skip the GitHub fetch entirely. Server validates the
+  // onto the panel and skip the online download entirely. Server validates the
   // zip layout, hands back a staged temp path, and the client confirms before
   // spawning updater.cjs against it.
   type LocalZipState =
@@ -429,8 +427,8 @@ function EnabledUpdateCheckPanel() {
       <CardHeader>
         <CardTitle className="text-sm">About & updates</CardTitle>
         <CardDescription className="text-xs">
-          AdvisePoint Docs checks GitHub for new releases in the background about once a day.
-          Use the button below to check right now.
+          While it is open, AdvisePoint Docs checks for new online releases about once a day
+          and shows an alert when one is available. Use Check now to check right away.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -489,7 +487,7 @@ function EnabledUpdateCheckPanel() {
             data-testid="status-checking"
           >
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            Checking GitHub for a newer release…
+            Checking for a newer online release…
           </div>
         )}
 
@@ -506,34 +504,20 @@ function EnabledUpdateCheckPanel() {
           </div>
         )}
 
-        {status === "unusual" && release && (
+        {status === "newer" && release && (
           <div
-            className="space-y-2 rounded-md border border-amber-500/50 bg-amber-500/15 px-3 py-3 text-xs text-amber-900 dark:text-amber-200"
-            data-testid="status-unusual"
+            className="flex items-start gap-2 rounded-md border border-border/60 bg-muted/30 px-3 py-3 text-xs text-foreground"
+            data-testid="status-newer-installed"
           >
-            <div className="flex items-center gap-2">
-              <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-              <span className="font-medium">
-                Unexpected release version on GitHub
-              </span>
-            </div>
-            <div className="pl-5">
-              GitHub advertises{" "}
-              <span className="font-mono">v{release.version}</span> as the latest release, but
-              you&apos;re running <span className="font-mono">v{installed}</span>, which is newer.
-              This usually means a release tag was mistyped or an older release was mistakenly
-              re-marked as latest. Not treating this as an update.
-            </div>
-            <div className="flex items-center gap-2 pl-5 pt-1">
-              <a
-                href={release.htmlUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1 rounded px-2 py-1 hover:bg-amber-500/20"
-                data-testid="link-panel-update-unusual"
-              >
-                <ExternalLink className="h-3 w-3" />Open releases page
-              </a>
+            <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <div className="min-w-0 space-y-1">
+              <div className="font-medium" data-testid="text-newer-installed-title">
+                You have a newer version
+              </div>
+              <div className="text-muted-foreground" data-testid="text-newer-installed-body">
+                You&rsquo;re running v{installed}. The latest online release is v{release.version}, so no
+                updates are currently active. You will receive an alert once a newer version is available.
+              </div>
             </div>
           </div>
         )}
@@ -623,7 +607,8 @@ function EnabledUpdateCheckPanel() {
             data-testid="status-offline"
           >
             <WifiOff className="h-3.5 w-3.5 shrink-0" />
-            Couldn&apos;t reach GitHub &mdash; check your connection and try again in a moment.
+            Couldn&apos;t get release information from the update service &mdash; check your
+            connection and try again in a moment.
           </div>
         )}
 
@@ -637,22 +622,10 @@ function EnabledUpdateCheckPanel() {
             <RefreshCw className={`mr-2 h-3.5 w-3.5 ${status === "checking" ? "animate-spin" : ""}`} />
             {status === "checking" ? "Checking…" : "Check now"}
           </Button>
-          <span className="min-w-0 break-words text-[11px] text-muted-foreground">
-            Reads {" "}
-            <a
-              href="https://github.com/S8619G/AdvisePoint-Docs/releases/latest"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="break-all underline hover:text-foreground"
-            >
-              github.com/S8619G/AdvisePoint-Docs
-            </a>
-            . No account needed.
-          </span>
         </div>
 
         {/* v1.0.9: drop-a-zip target. Lets users install a manually-downloaded
-            release zip without going through GitHub. Same updater code path
+            release zip without an online download. Same updater code path
             downstream. */}
         <div className="border-t border-border/60 pt-4">
           <div className="mb-2 text-xs font-medium">Install from a local zip</div>

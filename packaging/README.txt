@@ -20,7 +20,7 @@ large documents. A laptop-size display is recommended.
 
 The interface opens in the default browser at http://127.0.0.1:5000.
 Use a current Edge, Chrome or Firefox version. Document processing
-and search run locally. Internet access is needed for GitHub release
+and search run locally. Internet access is needed for online release
 checks and update downloads, not normal library use.
 
 QUICK START
@@ -62,8 +62,17 @@ UPDATING
 --------
 
 Settings > System shows the installed version and update controls
-for official builds. "Check now" checks GitHub. An internet failure
-does not mean the local library is unavailable.
+for official builds. While the app is open in the browser, it checks
+for a newer online release when it loads and about once a day, and
+shows an alert at the top of the window when one is available.
+"Check now" checks the update service immediately. Skipping a version
+hides its alert until a later release appears. No check runs while
+the browser tab is closed.
+An internet failure does not mean the local library is unavailable.
+
+If the installed version is newer than the latest online release,
+Check now reports "You have a newer version". No update or older
+version is offered; an alert appears once a newer version is online.
 
 Use the offered update action to download the matching architecture.
 The updater validates the package before stopping the old service,
@@ -332,7 +341,7 @@ It excludes the library database and document contents, but logs can
 contain filenames and local paths. Review the bundle before sharing.
 Export promptly after a fault, before repeated restarts rotate logs.
 
-If GitHub cannot be reached but Query and Library still work, retry
+If the update service cannot be reached but Query and Library work, retry
 the update check later. This is separate from local-service health.
 Do not clear library data or change security settings to repair a
 network failure.
@@ -340,8 +349,8 @@ network failure.
 VERSION
 -------
 
-AdvisePoint Docs 1.3.3
-Guide revision 1.3.3
-Guide date: September 28, 2026
+AdvisePoint Docs 1.3.4
+Guide revision 1.3.4
+Guide date: September 29, 2026
 Native Windows field acceptance, long-idle Edge testing and physical
 printing remain separate verification steps.
