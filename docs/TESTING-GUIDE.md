@@ -1,4 +1,4 @@
-# AdvisePoint Docs v1.3.4 testing guide
+# AdvisePoint Docs v1.3.5 testing guide
 
 Use the matching x64 or ARM64 binary ZIP and verify its SHA-256. Keep an
 independent verified library backup before upgrading; shared source is not an
@@ -6,42 +6,67 @@ updater package.
 
 ## Upgrade and isolation
 
-- **Upgrade:** from v1.3.3 or earlier, use Update now or the local-ZIP control
-  with the matching architecture package. Confirm v1.3.4, reconnect and an
-  unchanged searchable library. Preserve diagnostics if updating fails.
+- **Upgrade:** from v1.3.4 or earlier, use the local-ZIP control (or Update
+  now once the release is published) with the matching architecture package.
+  Confirm v1.3.5, reconnect and an unchanged searchable library. Preserve
+  diagnostics if updating fails.
 - **Production:** the normal launcher uses the real library and port 5000.
   Prototype 5100 and separate test launcher 5101 remain distinct. No isolated
   launcher or reset/delete utility is bundled.
 - **Test data:** use an isolated test setup or an approved disposable library
   copy for mutation, restore and backup-failure tests.
 
-## Update messages
+## Library quick search
 
-Open Settings > System > About & updates.
+- **Layout:** the description is on the Library heading line, right-aligned;
+  the search box and Search button are under the heading. Check a full
+  desktop window and a narrow window.
+- **Matching:** "MZ9500 fax" finds the MZ9500 FAX guide. "MZ9500ci FAX",
+  "MZ9500ci-FAX" and "mz9500ci_fax" give the same result. A word found only
+  in a document's text (not its name, file name or details) finds nothing.
+- **Fields:** search by an original file name, a tag, a product family and a
+  document type label; each finds the expected documents.
+- **Typing:** typing alone does not change the list; Enter or Search does.
+  Emptying the box shows the full list again.
+- **Clear:** the X in the box, the X on the pill and Esc each restore the full
+  list with sort and filters intact. Reset clears the search, sort and filters.
+- **With filters:** a search combined with Document type, Product model or
+  Product family narrows by both; the count reads "N of M documents".
+- **No matches:** shows "No documents match" with Clear.
+- **Cards:** matching cards stay folded; Expand all and Collapse all work.
+- **Persistence:** switch to Query and back; the search remains. Restart the
+  app; the search is cleared.
 
-- **Newer installed version:** when the installed version is newer than the
-  latest online release, Check now shows "You have a newer version" in neutral
-  styling, with both actual version numbers. No Update now, releases-page or
-  downgrade action appears, and no alert banner is shown.
-- **Same version:** shows "You're on the latest version".
-- **Newer online release:** the top alert and panel show the release, with
-  What's new, Download manually and Update now. Links open the trusted release
-  page. Skip this version hides the alert until a later release appears.
-- **Failure:** with the network disconnected, Check now reports that release
-  information could not be retrieved from the update service. Query and
-  Library continue to work.
-- **Wording:** the Check now row has no repository address or "No account
-  needed" text. Update titles, checking, failure and help text do not name the
-  hosting provider. Check desktop and a narrow window.
-- **Alert timing:** the check runs when the app loads and about once a day while
-  it stays open in the browser. It does not run while the browser tab is closed
-  and does not send push or email notifications.
+## Query Auto Search
 
-## v1.3.3 features
+- **Default:** the switch at the right of the Filters header is on; Clear sits
+  to its left when filters are set.
+- **Re-run:** run a search, then change Product model; results update after a
+  short pause. Repeat with family, Selected family only, document type,
+  confidentiality, a tag, match mode and Clear.
+- **Slider:** drag Max results; one search runs when it is released.
+- **Rapid changes:** change several filters quickly; one search results, and
+  the final results match the final filters.
+- **No search yet:** before the first search, or with an empty box, changing
+  filters does not search. After Reset, changing filters does not search
+  until Search is used.
+- **Recent searches:** after a manual search and several filter changes, the
+  list shows the manual search and one entry for the latest filters.
+- **Off:** turn the switch off; filter changes wait for Search. Restart the
+  app; the switch keeps its setting.
 
-Repeat a short check of Selected family only, Query Reset, Upload result Reset,
-Backups to keep and Latest backup + previous backup, using the v1.3.3 procedures.
-These features are unchanged in v1.3.4.
+## PDF viewer zoom
+
+Open a retained (native) PDF, both portrait and landscape. From Fit, press +
+once and twice; from Zoom Page, press +; zoom out again. The page keeps its
+shape at every step, with no vertical stretch. Stored page-image documents
+behave as before.
+
+## Earlier features
+
+Repeat a short check of the v1.3.4 update messages and the v1.3.3 Selected
+family only, Query Reset, Upload result Reset, Backups to keep and Latest
+backup + previous backup features. These are unchanged in v1.3.5.
 
 ## Continuing field gates
 

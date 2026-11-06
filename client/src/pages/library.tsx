@@ -53,6 +53,7 @@ import {
   type SortKey as LibrarySortKey,
 } from "@/lib/libraryTabStore";
 import { writeHashQuery, readHashQuery } from "@/lib/tabUrlSync";
+import { quickSearchFields, quickSearchWords, fieldsMatchWords } from "@/lib/libraryQuickSearch";
 
 interface Doc {
   id: string;
@@ -64,6 +65,9 @@ interface Doc {
   product_version: string | null;
   firmware_version: string | null;
   release_channel: string | null;
+  // v1.3.5: also searched by the Library quick search.
+  product_sku?: string | null;
+  keywords?: string[];
   audience: string[];
   tags: string[];
   allowed_tenants: string[];
@@ -145,6 +149,17 @@ function DocList() {
   const [filterModel, setFilterModel] = useStoreField(libraryTabStore, "filterModel");
   // v0.9.36: Product Family filter, symmetric with Product Model.
   const [filterFamily, setFilterFamily] = useStoreField(libraryTabStore, "filterFamily");
+  // v1.3.5: Library quick search. The draft is the box text; the applied
+  // search only changes on Search / Enter (typing alone does not filter).
+  const [quickSearch, setQuickSearch] = useStoreField(libraryTabStore, "quickSearch");
+  const [quickSearchDraft, setQuickSearchDraft] = useStoreField(libraryTabStore, "quickSearchDraft");
+  const quickSearchInputRef = useRef<HTMLInputElement>(null);
+  const applyQuickSearch = () => setQuickSearch(quickSearchDraft.trim());
+  const clearQuickSearch = (focus = true) => {
+    setQuickSearchDraft("");
+    setQuickSearch("");
+    if (focus) quickSearchInputRef.current?.focus();
+  };
 
   // v0.9.31: URL sync + scroll preservation.
   useEffect(() => {
@@ -197,11 +212,23 @@ function DocList() {
     new Set(data.map((d) => d.product_family).filter((v): v is string => Boolean(v))),
   ).sort();
 
-  // Filter first (doc type + model + family), then sort.
+  // v1.3.5: quick search words. Matching uses only the displayed name, the
+  // original file name and metadata fields -- never document text.
+  const quickWords = quickSearchWords(quickSearch);
+  const typeLabels = new Map((documentTypes?.types ?? []).map((t) => [t.key, t.label]));
+
+  // Filter first (doc type + model + family + quick search), then sort.
   const filtered = data.filter((d) => {
     if (filterType !== "__any" && d.document_type !== filterType) return false;
     if (filterModel !== "__any" && d.product_model !== filterModel) return false;
     if (filterFamily !== "__any" && (d.product_family ?? "") !== filterFamily) return false;
+    if (quickWords.length > 0) {
+      const fields = quickSearchFields(d, {
+        typeLabel: typeLabels.get(d.document_type) ?? null,
+        channelLabel: d.release_channel ? releaseChannelLabel(d.release_channel) : null,
+      });
+      if (!fieldsMatchWords(fields, quickWords)) return false;
+    }
     return true;
   });
 
@@ -220,16 +247,99 @@ function DocList() {
     sortBy === "recent" &&
     filterType === "__any" &&
     filterModel === "__any" &&
-    filterFamily === "__any";
+    filterFamily === "__any" &&
+    quickSearch === "" &&
+    quickSearchDraft === "";
 
   return (
     <div className="space-y-6">
       {/* v1.2.4: ProductValuesDialog rendered here was moved to Settings >
           About via ManageValuesPanel. Users looked for "manage values" as a
           config surface; the sort/filter toolbar was the wrong home. */}
-      <div>
-        <h1 className="text-xl font-semibold tracking-tight">Library</h1>
-        <p className="text-sm text-muted-foreground">All uploaded documents. Click a title to browse sections, or the pencil to edit any field.</p>
+      {/* v1.3.5: description moved onto the heading line (right-aligned) and
+          the quick search took its former place under the heading. */}
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+          <h1 className="text-xl font-semibold tracking-tight">Library</h1>
+          <p className="ml-auto text-right text-sm text-muted-foreground" data-testid="text-library-description">All uploaded documents. Click a title to browse sections, or the pencil to edit any field.</p>
+        </div>
+        <form
+          role="search"
+          aria-label="Library quick search"
+          className="flex flex-wrap items-center gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            applyQuickSearch();
+          }}
+          data-testid="form-library-quick-search"
+        >
+          <label htmlFor="library-quick-search" className="sr-only">Quick search by name and details</label>
+          <div className="relative w-full max-w-[420px] min-w-[200px] flex-1 sm:flex-none sm:w-[420px]">
+            <SearchIcon className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+            <Input
+              id="library-quick-search"
+              ref={quickSearchInputRef}
+              type="text"
+              inputMode="search"
+              autoComplete="off"
+              spellCheck={false}
+              value={quickSearchDraft}
+              placeholder="Search names, file names, models, tags…"
+              aria-describedby="library-quick-search-hint"
+              className="h-8 pl-8 pr-8 text-sm"
+              onChange={(e) => {
+                const v = e.target.value;
+                setQuickSearchDraft(v);
+                // Emptying the box removes an applied search; typing alone
+                // never filters.
+                if (v === "" && quickSearch !== "") setQuickSearch("");
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Escape" && (quickSearchDraft !== "" || quickSearch !== "")) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  clearQuickSearch();
+                }
+              }}
+              data-testid="input-library-quick-search"
+            />
+            {quickSearchDraft !== "" && (
+              <button
+                type="button"
+                className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                onClick={() => clearQuickSearch()}
+                aria-label="Clear quick search"
+                title="Clear search (Esc)"
+                data-testid="button-clear-library-quick-search"
+              >
+                <XIcon className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+          <Button type="submit" size="sm" className="h-8 px-4 text-xs" data-testid="button-library-quick-search">
+            Search
+          </Button>
+          {quickSearch !== "" && (
+            <span
+              className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-primary/25 bg-primary/10 py-0.5 pl-2.5 pr-1 text-[11px] text-primary"
+              data-testid="pill-library-quick-search"
+            >
+              <span className="truncate">Matches for “{quickSearch}” in names and details</span>
+              <button
+                type="button"
+                className="rounded-full p-0.5 hover:bg-primary/15"
+                onClick={() => clearQuickSearch()}
+                aria-label="Clear quick search"
+                data-testid="button-pill-clear-library-quick-search"
+              >
+                <XIcon className="h-3 w-3" />
+              </button>
+            </span>
+          )}
+          <span id="library-quick-search-hint" className="sr-only">
+            Searches document names, original file names and details. Does not search document text.
+          </span>
+        </form>
       </div>
 
       {/* Sort + filter controls. Small, single-row on desktop, wraps on mobile. */}
@@ -301,10 +411,12 @@ function DocList() {
             setFilterType("__any");
             setFilterModel("__any");
             setFilterFamily("__any");
+            // v1.3.5: Reset also clears the quick search.
+            clearQuickSearch(false);
           }}
           disabled={filtersAtDefault}
           data-testid="button-reset-filters"
-          title="Reset sort and filters to defaults"
+          title="Reset search, sort and filters to defaults"
         >
           <RotateCcw className="h-3.5 w-3.5" />
           Reset
@@ -340,14 +452,18 @@ function DocList() {
             </Button>
           </div>
         )}
-        <div className={sorted.length > 0 ? "text-xs text-muted-foreground" : "ml-auto text-xs text-muted-foreground"} data-testid="text-library-count">
+        <div className={sorted.length > 0 ? "text-xs text-muted-foreground" : "ml-auto text-xs text-muted-foreground"} data-testid="text-library-count" aria-live="polite">
           {sorted.length} of {data.length} document{data.length === 1 ? "" : "s"}
         </div>
       </div>
 
       {sorted.length === 0 ? (
         <Card className="border-dashed"><CardContent className="py-10 text-center text-sm text-muted-foreground" data-testid="text-no-docs">
-          No documents match the current filters. <button className="underline" onClick={() => { setFilterType("__any"); setFilterModel("__any"); }}>Clear filters</button>
+          {quickSearch !== "" ? (
+            <>No documents match “{quickSearch}”. <button className="underline" onClick={() => clearQuickSearch()} data-testid="button-no-docs-clear-search">Clear</button></>
+          ) : (
+            <>No documents match the current filters. <button className="underline" onClick={() => { setFilterType("__any"); setFilterModel("__any"); }}>Clear filters</button></>
+          )}
         </CardContent></Card>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">

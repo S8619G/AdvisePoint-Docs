@@ -62,7 +62,12 @@ export const NativePdfPage=forwardRef<HTMLCanvasElement,Props>(function NativePd
       el.width=0;el.height=0;
     };
   },[documentId,page,width,height,effectiveBudget,attempt]);
-  return <div className="relative shrink-0" style={{width,height,maxWidth:"100%",...style}}
+  // v1.3.5: the wrapper's height follows its width through aspect-ratio, so
+  // maxWidth:100% narrows the page without stretching it vertically. A fixed
+  // height here made zoom-in from Fit show a page about 2.1x too tall. The
+  // canvas is positioned to fill the wrapper so it never sizes the box.
+  return <div className="relative shrink-0"
+    style={{width,height:"auto",maxWidth:"100%",...style,aspectRatio:`${width} / ${height}`}}
     data-testid={`native-page-${page}`} data-state={state==="ready"?"ready":state==="loading"?"loading":"error"}>
     {state!=="ready"&&<div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-white text-slate-700 text-sm"
       role={state==="loading"?"status":"alert"}>
@@ -70,7 +75,7 @@ export const NativePdfPage=forwardRef<HTMLCanvasElement,Props>(function NativePd
       {state!=="loading"&&<button className="border rounded px-3 py-2" onClick={()=>setAttempt(n=>n+1)}>Retry page {page}</button>}
     </div>}
     <canvas key={`${documentId}:${page}:${width}:${height}:${effectiveBudget}:${attempt}`} ref={canvas} role="img" aria-label={`Page ${page}`} className={className}
-      style={{width:"100%",height:"100%",display:"block",visibility:state==="ready"?"visible":"hidden"}}
+      style={{position:"absolute",inset:0,width:"100%",height:"100%",display:"block",visibility:state==="ready"?"visible":"hidden"}}
       data-testid={`canvas-page-${page}`}/>
   </div>;
 });

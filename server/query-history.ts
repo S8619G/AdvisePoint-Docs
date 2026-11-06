@@ -139,6 +139,7 @@ export function dedupeKeyFor(entry: QueryHistoryEntry): string {
 export function pushQueryHistoryEntry(
   rawDb: Database.Database,
   entry: QueryHistoryEntry,
+  replaces?: unknown,
 ): QueryHistoryEntry[] {
   if (entry.q.trim().length === 0) {
     // Never record blank queries. Return the existing list unchanged.
@@ -146,7 +147,16 @@ export function pushQueryHistoryEntry(
   }
   const current = readQueryHistory(rawDb);
   const key = dedupeKeyFor(entry);
-  const filtered = current.filter((e) => dedupeKeyFor(e) !== key);
+  // v1.3.5: Auto Search re-runs pass the entry recorded by the previous
+  // re-run in the same chain, so a series of filter tweaks leaves one
+  // Recent searches row instead of one per tweak. Only that exact entry is
+  // removed; anything malformed is ignored.
+  const replaced = coerceEntry(replaces);
+  const replacedKey = replaced ? dedupeKeyFor(replaced) : null;
+  const filtered = current.filter((e) => {
+    const k = dedupeKeyFor(e);
+    return k !== key && (replacedKey === null || k !== replacedKey);
+  });
   const next = [entry, ...filtered].slice(0, HISTORY_LIMIT);
   writeRaw(rawDb, next);
   return next;

@@ -170,6 +170,15 @@ documents are preserved. Search mode and result-limit preferences stay
 unchanged. Recent searches and bookmarked search URLs restore the
 family-only option with the other search filters.
 
+Auto Search, at the right of the Filters header, is on by default.
+While it is on and a search has already run, changing a filter
+searches again with the current query after a short pause. The Max
+results slider searches again when it is released. Auto Search does
+not start a search from an empty box, and Reset never searches. A
+series of filter changes leaves one Recent searches entry. Turn Auto
+Search off to change several filters and then select Search. The
+setting is remembered on this PC.
+
 Select a result to open its source document. Use the page controls,
 scrollbar and zoom controls to navigate. In-document search helps
 locate text inside the open document.
@@ -185,6 +194,20 @@ LIBRARY MANAGEMENT
 Library lists the imported documents. Edit metadata to change a title,
 product values, tags or other fields. Save commits the changes;
 Cancel leaves the stored metadata unchanged.
+
+The search box under the Library heading narrows the list by name and
+details. Enter words and select Search or press Enter. It matches the
+displayed document name, the original file name and metadata fields
+such as document type, product model, product family, version,
+firmware and tags. It does not search document text; use Query for
+that. Capital letters do not matter, and spaces, hyphens, underscores
+and periods are treated alike, so "MZ9500ci FAX" and "MZ9500ci-FAX"
+find the same documents. Every word must appear somewhere in those
+fields. The result is the normal list, narrowed, with the current sort
+and filters; the count shows how many documents match. Select the X in
+the box or press Esc to show the full list again. Reset also clears the
+search. The search stays while switching tabs and clears when the app
+restarts.
 
 Deleting a library document removes it from the active library and
 keeps its retained recovery data according to the Recovery settings.
@@ -349,8 +372,8 @@ network failure.
 VERSION
 -------
 
-AdvisePoint Docs 1.3.4
-Guide revision 1.3.4
-Guide date: September 29, 2026
+AdvisePoint Docs 1.3.5
+Guide revision 1.3.5
+Guide date: November 6, 2026
 Native Windows field acceptance, long-idle Edge testing and physical
 printing remain separate verification steps.

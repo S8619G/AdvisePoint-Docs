@@ -53,6 +53,12 @@ export interface LibraryTabState {
   // Value is a wouter-style path with no leading '#', e.g. "/library"
   // or "/library/doc_abc". Null before the user has visited Library.
   lastLibraryPath: string | null;
+  // v1.3.5: Library quick search. `quickSearch` is the applied search (set by
+  // Search / Enter); `quickSearchDraft` is the text in the box. Both are
+  // in-memory only: they survive tab switches, are not written to the URL,
+  // and clear when the app restarts.
+  quickSearch: string;
+  quickSearchDraft: string;
 }
 
 const DOC_DETAIL_MAX = 32;
@@ -66,6 +72,8 @@ export const libraryTabStore = createTabStore<LibraryTabState>({
   docDetail: {},
   expandedDocId: null,
   lastLibraryPath: null,
+  quickSearch: "",
+  quickSearchDraft: "",
 });
 
 // Helper: update a per-doc detail slice, trimming the oldest entries if

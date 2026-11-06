@@ -18,6 +18,13 @@ import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
+import * as SwitchPrimitives from "@radix-ui/react-switch";
+import {
+  readAutoSearchPref,
+  writeAutoSearchPref,
+  AUTO_SEARCH_DELAY_MS,
+  historyKeyFor,
+} from "@/lib/queryAutoSearch";
 import {
   Loader2,
   Search,
@@ -382,8 +389,55 @@ export default function Query() {
   // v0.9.31: Cached last search response so results survive tab switches.
   const [lastResponse, setLastResponse] = useStoreField(queryTabStore, "lastResponse");
 
+  // ---- v1.3.5: Auto Search ----
+  // When on (default), a filter change re-runs the current query, but only
+  // when the box has text and a search has already run in this tab. Rapid
+  // changes are coalesced into one search; the search-generation check in
+  // onSuccess keeps older responses from replacing newer ones. Remembered on
+  // this PC (browser storage for the app's local address).
+  const [autoSearch, setAutoSearchState] = useState<boolean>(() => readAutoSearchPref());
+  const autoSearchRef = useRef(autoSearch);
+  autoSearchRef.current = autoSearch;
+  const setAutoSearch = useCallback((on: boolean) => {
+    setAutoSearchState(on);
+    autoSearchRef.current = on;
+    writeAutoSearchPref(on);
+    if (!on && autoTimerRef.current !== null) {
+      clearTimeout(autoTimerRef.current);
+      autoTimerRef.current = null;
+    }
+  }, []);
+  const autoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const submitRef = useRef<(opts?: { auto?: boolean }) => void>(() => {});
+  const autoHistoryChainRef = useRef<{
+    manualKey: string | null;
+    lastAuto: Omit<QueryHistoryEntry, "ranAt"> | null;
+  }>({ manualKey: null, lastAuto: null });
+  const cancelAutoSearch = useCallback(() => {
+    if (autoTimerRef.current !== null) {
+      clearTimeout(autoTimerRef.current);
+      autoTimerRef.current = null;
+    }
+  }, []);
+  const scheduleAutoSearch = useCallback(() => {
+    if (!autoSearchRef.current) return;
+    const s0 = queryTabStore.getState();
+    // Never start a search from an empty box or before the first search.
+    if (!s0.q.trim() || !s0.lastQuery) return;
+    if (autoTimerRef.current !== null) clearTimeout(autoTimerRef.current);
+    autoTimerRef.current = setTimeout(() => {
+      autoTimerRef.current = null;
+      const s = queryTabStore.getState();
+      if (!autoSearchRef.current || !s.q.trim() || !s.lastQuery) return;
+      submitRef.current({ auto: true });
+    }, AUTO_SEARCH_DELAY_MS);
+  }, []);
+  useEffect(() => () => {
+    if (autoTimerRef.current !== null) clearTimeout(autoTimerRef.current);
+  }, []);
+
   const mut = useMutation({
-    mutationFn: async ({ state, generation }: { state: QueryTabState; generation: number }) => {
+    mutationFn: async ({ state, generation }: { state: QueryTabState; generation: number; auto?: boolean }) => {
       const { q, maxResults, matchMode, productModel, productFamily, selectedFamilyOnly,
         docType, firmware, errorCode, confidentialityMax, selectedTags } = state;
       const filters: any = {};
@@ -421,7 +475,7 @@ export default function Query() {
       });
       return { data: await res.json() as SearchResponse, generation };
     },
-    onSuccess: ({ data, generation }, { state }) => {
+    onSuccess: ({ data, generation }, { state, auto }) => {
       if (generation !== queryTabStore.getState().searchGeneration) return;
       const { q, matchMode, maxResults, productModel, productFamily, selectedFamilyOnly,
         docType, firmware, errorCode, confidentialityMax, selectedTags } = state;
@@ -455,7 +509,22 @@ export default function Query() {
             selectedTags,
           },
         };
-        apiRequest("POST", "/api/query-history", entry)
+        // v1.3.5: Auto Search re-runs replace the entry recorded by the
+        // previous re-run in the same chain, so a series of filter tweaks
+        // leaves one Recent searches row. A manual search starts a new
+        // chain and is never replaced by a later re-run.
+        const chain = autoHistoryChainRef.current;
+        let replaces: Omit<QueryHistoryEntry, "ranAt"> | undefined;
+        if (auto) {
+          if (chain.lastAuto && historyKeyFor(chain.lastAuto) !== chain.manualKey) {
+            replaces = chain.lastAuto;
+          }
+          chain.lastAuto = entry;
+        } else {
+          chain.manualKey = historyKeyFor(entry);
+          chain.lastAuto = null;
+        }
+        apiRequest("POST", "/api/query-history", replaces ? { ...entry, replaces } : entry)
           .then(() => queryClient.invalidateQueries({ queryKey: ["/api/query-history"] }))
           .catch(() => {
             // Non-fatal: the search succeeded, only the history bookkeeping
@@ -474,9 +543,13 @@ export default function Query() {
   const clearFilters = () => {
     setProductModel(""); setProductFamily(""); setDocType(""); setFirmware(""); setErrorCode(""); setConfidentialityMax(""); setTenant(""); setSelectedTags([]);
     setSelectedFamilyOnly(false);
+    scheduleAutoSearch();
   };
 
   const resetQuery = () => {
+    // v1.3.5: Reset never searches; drop any pending Auto Search re-run.
+    cancelAutoSearch();
+    autoHistoryChainRef.current = { manualKey: null, lastAuto: null };
     const s = queryTabStore.getState();
     queryTabStore.setState({
       q: "", productModel: "", productFamily: "", selectedFamilyOnly: false,
@@ -501,14 +574,17 @@ export default function Query() {
   }, [q, matchMode, maxResults, productModel, productFamily, selectedFamilyOnly, docType, firmware, errorCode, confidentialityMax, selectedTags, selectedResultId]);
   const hasFilters = productModel || productFamily || docType || firmware || errorCode || confidentialityMax || tenant || selectedTags.length > 0;
 
-  const submit = useCallback(() => {
+  const submit = useCallback((opts?: { auto?: boolean }) => {
+    // A manual search supersedes any pending Auto Search re-run.
+    if (!opts?.auto) cancelAutoSearch();
     const state = queryTabStore.getState();
     if (state.q.trim()) {
       const generation = state.searchGeneration + 1;
       queryTabStore.setState({ lastQuery: state.q.trim(), searchGeneration: generation });
-      mut.mutate({ state, generation });
+      mut.mutate({ state, generation, auto: !!opts?.auto });
     }
   }, [q, mut]);
+  submitRef.current = submit;
 
   // ---- Intent detection (auto-suggest filters from the query text) ----
   const intents = useMemo(() => detectIntents(q, facets), [q, facets]);
@@ -657,19 +733,41 @@ export default function Query() {
       <div className="space-y-4">
       <Card className="h-fit">
         <CardHeader className="pb-3">
-          <CardTitle className="flex items-center justify-between text-sm">
+          <CardTitle className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-sm">
             <span className="flex items-center gap-2"><FilterIcon className="h-3.5 w-3.5" />Filters</span>
-            {hasFilters && (
-              <button onClick={clearFilters} className="flex items-center gap-1 text-[11px] font-normal text-muted-foreground hover:text-foreground" data-testid="button-clear-filters">
-                <X className="h-3 w-3" />Clear
-              </button>
-            )}
+            <span className="ml-auto flex items-center gap-3">
+              {hasFilters && (
+                <button onClick={clearFilters} className="flex items-center gap-1 text-[11px] font-normal text-muted-foreground hover:text-foreground" data-testid="button-clear-filters">
+                  <X className="h-3 w-3" />Clear
+                </button>
+              )}
+              {/* v1.3.5: Auto Search switch. */}
+              <span className="flex items-center gap-1.5">
+                <label htmlFor="switch-auto-search" className="cursor-pointer text-[11px] font-normal text-muted-foreground">
+                  Auto Search
+                </label>
+                <SwitchPrimitives.Root
+                  id="switch-auto-search"
+                  checked={autoSearch}
+                  onCheckedChange={setAutoSearch}
+                  aria-describedby="switch-auto-search-hint"
+                  title={autoSearch ? "Auto Search is on: changing a filter searches again." : "Auto Search is off: filter changes wait for Search."}
+                  className="peer inline-flex h-4 w-7 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background data-[state=checked]:bg-primary data-[state=unchecked]:bg-input"
+                  data-testid="switch-auto-search"
+                >
+                  <SwitchPrimitives.Thumb className="pointer-events-none block h-3 w-3 rounded-full bg-background shadow ring-0 transition-transform data-[state=checked]:translate-x-3.5 data-[state=unchecked]:translate-x-0.5" />
+                </SwitchPrimitives.Root>
+                <span id="switch-auto-search-hint" className="sr-only">
+                  When on, changing a filter searches again with the current query.
+                </span>
+              </span>
+            </span>
           </CardTitle>
           <CardDescription className="text-xs">Applied before ranking to narrow the search.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <FilterField label="Product model">
-            <Select value={productModel || "__any"} onValueChange={(v) => setProductModel(v === "__any" ? "" : v)}>
+            <Select value={productModel || "__any"} onValueChange={(v) => { setProductModel(v === "__any" ? "" : v); scheduleAutoSearch(); }}>
               <SelectTrigger data-testid="select-filter-model" className="h-8 text-xs"><SelectValue placeholder="Any" /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="__any">Any</SelectItem>
@@ -683,7 +781,7 @@ export default function Query() {
               exposed) so we can restore the filter later without a data
               migration. */}
           <FilterField label="Document type">
-            <Select value={docType || "__any"} onValueChange={(v) => setDocType(v === "__any" ? "" : v)}>
+            <Select value={docType || "__any"} onValueChange={(v) => { setDocType(v === "__any" ? "" : v); scheduleAutoSearch(); }}>
               <SelectTrigger data-testid="select-filter-doctype" className="h-8 text-xs"><SelectValue placeholder="Any" /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="__any">Any</SelectItem>
@@ -724,7 +822,7 @@ export default function Query() {
             );
             return (
               <FilterField label="Product family">
-                <Select value={productFamily || "__any"} onValueChange={(v) => setProductFamily(v === "__any" ? "" : v)} disabled={!familiesExist}>
+                <Select value={productFamily || "__any"} onValueChange={(v) => { setProductFamily(v === "__any" ? "" : v); scheduleAutoSearch(); }} disabled={!familiesExist}>
                   {trigger}
                   <SelectContent>
                     <SelectItem value="__any">Any</SelectItem>
@@ -735,7 +833,7 @@ export default function Query() {
                   title="Exclude documents with no product family assigned.">
                   <input type="checkbox" checked={selectedFamilyOnly}
                     disabled={!productFamily || !familiesExist}
-                    onChange={e => setSelectedFamilyOnly(e.target.checked)}
+                    onChange={e => { setSelectedFamilyOnly(e.target.checked); scheduleAutoSearch(); }}
                     data-testid="checkbox-selected-family-only" />
                   Selected family only
                 </label>
@@ -746,7 +844,7 @@ export default function Query() {
               filter payload and server-side handling remain intact for
               future multi-tenant use; only the UI is removed. */}
           <FilterField label="Show up to">
-            <Select value={confidentialityMax || "__any"} onValueChange={(v) => setConfidentialityMax(v === "__any" ? "" : v)}>
+            <Select value={confidentialityMax || "__any"} onValueChange={(v) => { setConfidentialityMax(v === "__any" ? "" : v); scheduleAutoSearch(); }}>
               <SelectTrigger data-testid="select-filter-confidentiality" className="h-8 text-xs"><SelectValue placeholder="Any confidentiality" /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="__any">Any confidentiality</SelectItem>
@@ -773,11 +871,12 @@ export default function Query() {
                     <button
                       key={t}
                       type="button"
-                      onClick={() =>
+                      onClick={() => {
                         setSelectedTags((prev) =>
                           on ? prev.filter((x) => x !== t) : [...prev, t]
-                        )
-                      }
+                        );
+                        scheduleAutoSearch();
+                      }}
                       className={
                         "rounded-md border px-2 py-0.5 text-[11px] font-medium transition-colors " +
                         (on
@@ -800,7 +899,7 @@ export default function Query() {
               is what techs actually used the input for. */}
           <div className="pt-3 space-y-4 border-t border-border/60">
             <FilterField label={<span className="flex items-center gap-1">Match mode <MatchModeHelp /></span>}>
-              <Select value={matchMode} onValueChange={(v) => setMatchMode(v as MatchMode)}>
+              <Select value={matchMode} onValueChange={(v) => { setMatchMode(v as MatchMode); scheduleAutoSearch(); }}>
                 <SelectTrigger data-testid="select-match-mode" className="h-8 text-xs">
                   <SelectValue />
                 </SelectTrigger>
@@ -824,6 +923,9 @@ export default function Query() {
                 step={1}
                 value={[maxResults]}
                 onValueChange={(v) => setMaxResults(v[0])}
+                // v1.3.5: Auto Search re-runs once the slider is released
+                // (or after a keyboard step), not on every drag step.
+                onValueCommit={() => scheduleAutoSearch()}
                 data-testid="slider-max-results"
               />
             </FilterField>
@@ -910,7 +1012,7 @@ export default function Query() {
                   {previewOn ? "Hide preview pane" : "Show preview pane"}
                 </TooltipContent>
               </Tooltip>
-              <Button onClick={submit} disabled={mut.isPending || !q.trim()} data-testid="button-search">
+              <Button onClick={() => submit()} disabled={mut.isPending || !q.trim()} data-testid="button-search">
                 {mut.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : "Search"}
               </Button>
               <Button type="button" variant="outline" onClick={resetQuery} data-testid="button-reset-query">
@@ -936,7 +1038,7 @@ export default function Query() {
                 {intents.errorCodes.map((code) => (
                   <button
                     key={`err-${code}`}
-                    onClick={() => setErrorCode(errorCode === code ? "" : code)}
+                    onClick={() => { setErrorCode(errorCode === code ? "" : code); scheduleAutoSearch(); }}
                     className={
                       "rounded-full border px-2 py-0.5 text-[11px] font-mono transition-colors " +
                       (errorCode === code
@@ -952,7 +1054,7 @@ export default function Query() {
                 {intents.productModels.map((model) => (
                   <button
                     key={`model-${model}`}
-                    onClick={() => setProductModel(model)}
+                    onClick={() => { setProductModel(model); scheduleAutoSearch(); }}
                     className={
                       "rounded-full border px-2 py-0.5 text-[11px] transition-colors " +
                       (productModel === model

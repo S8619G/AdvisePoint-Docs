@@ -1107,9 +1107,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
     // Ignore any client-supplied ranAt -- the server timestamps every
     // push itself so a mis-clocked client can't reorder history.
-    const entry = { ...(body as QueryHistoryEntry), ranAt: Date.now() };
+    // v1.3.5: optional `replaces` (Auto Search chain) is not stored.
+    const { replaces, ...rest } = body as QueryHistoryEntry & { replaces?: unknown };
+    const entry = { ...(rest as QueryHistoryEntry), ranAt: Date.now() };
     try {
-      const history = pushQueryHistoryEntry(rawDb, entry);
+      const history = pushQueryHistoryEntry(rawDb, entry, replaces);
       return res.json({ history });
     } catch (err) {
       return res.status(500).json({ message: (err as Error).message || "Failed to save query history." });

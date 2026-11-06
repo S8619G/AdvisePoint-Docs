@@ -30,7 +30,9 @@
     "test:doctype-merge": "node --import tsx --test scripts/doctype-merge.test.mjs",
     "test:duplicate-keeper": "node --import tsx --test scripts/duplicate-keeper.test.mjs",
     "test:idle-watchdog": "node --import tsx --test scripts/idle-watchdog.test.mjs",
-    "test:image-path-heal": "node --import tsx --test scripts/image-path-heal.test.mjs"
+    "test:image-path-heal": "node --import tsx --test scripts/image-path-heal.test.mjs",
+    "test:features135": "node --import tsx --test scripts/features135.test.mjs",
+    "test:features135:ui": "node --import tsx --test --test-concurrency=1 scripts/features135-browser.test.mjs scripts/viewer-zoom135.test.mjs"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.4.0",
