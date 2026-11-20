@@ -42,11 +42,12 @@ import Database from "better-sqlite3";
 // there, and fall back to the namespace itself when it is already the
 // factory (e.g. a future migration to a real ESM archiver build, or a
 // bundler that doesn't wrap CJS defaults).
-import * as archiverNs from "archiver";
-const archiver = (((archiverNs as unknown) as { default?: unknown }).default ?? archiverNs) as (
-  format: "zip" | "tar",
-  options?: archiverNs.ArchiverOptions,
-) => archiverNs.Archiver;
+// v1.3.6: archiver 8 is ESM-only and exposes format classes instead of the
+// old factory (`archiver("zip", ...)`). The ZIP writer below is now
+// `new ZipArchive(options)`; options and the streaming API are unchanged.
+// esbuild bundles the ESM build into dist/index.cjs, so the CJS interop
+// workaround described above no longer applies.
+import { ZipArchive } from "archiver";
 
 import { DB_FILE_PATH, getPagesDirForBackup, getDataDirForBackup, rawDb, closeDbForRestore } from "./storage";
 import { getOriginalsDir } from "./originals";
@@ -440,7 +441,7 @@ export async function writeBackupTo(
     db_bytes: dbSize,
   };
 
-  const archive = archiver("zip", { zlib: { level: 6 }, forceZip64: true });
+  const archive = new ZipArchive({ zlib: { level: 6 }, forceZip64: true });
 
   // Attach a rejection handler so pipe errors surface as promise rejections.
   const done = new Promise<void>((resolveDone, rejectDone) => {

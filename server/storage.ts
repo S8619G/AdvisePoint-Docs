@@ -519,6 +519,10 @@ export interface IStorage {
   };
   renameProductModel(from: string, to: string): number;
   renameProductFamily(from: string, to: string): number;
+  // v1.3.6: document tag management (Settings > Formats > Manage Values).
+  listTagValues(): { value: string; count: number }[];
+  renameTag(from: string, to: string): number;
+  deleteTag(tag: string): number;
   renameDocumentType(key: string, nextKey: string, label: string): void;
   /** v1.1.4: merge one document type into another, preserving tagging. */
   mergeDocumentType(fromKey: string, intoKey: string): number;
@@ -793,6 +797,81 @@ export class SqliteStorage implements IStorage {
     return result.changes;
   }
 
+  // ---- v1.3.6: document tag management ----
+  //
+  // Tags are free text per document (documents.tags_json). Only these
+  // document tag labels change here. chunks.tags_json holds the automatic
+  // section-heading words and is deliberately untouched, as are all other
+  // fields. The seeded Welcome Guide is excluded, matching /api/facets.
+  //
+  // Values are listed case-sensitively ("Fuser" and "fuser" are two rows),
+  // exactly as the Query tag box shows them; a document counts once per tag.
+
+  listTagValues(): { value: string; count: number }[] {
+    const rows = sqlite
+      .prepare(`SELECT tags_json FROM documents WHERE id != ?`)
+      .all(SEED_WELCOME_GUIDE_DOC_ID) as { tags_json: string }[];
+    const counts = new Map<string, number>();
+    for (const row of rows) {
+      const seen = new Set<string>();
+      for (const tag of parseTagList(row.tags_json)) {
+        if (seen.has(tag)) continue;
+        seen.add(tag);
+        counts.set(tag, (counts.get(tag) ?? 0) + 1);
+      }
+    }
+    return Array.from(counts.entries())
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([value, count]) => ({ value, count }));
+  }
+
+  /** Rename `from` to `to` on every document carrying it. If `to` already
+   *  exists this is a MERGE: a document that had both ends with one `to`.
+   *  Case-only renames ("fuser" -> "Fuser") fold case variants the same way.
+   *  One transaction; returns the number of documents changed. */
+  renameTag(from: string, to: string): number {
+    const before = from.trim();
+    const after = to.trim();
+    if (!before) throw new Error("Select a tag to rename.");
+    if (!after) throw new Error("Enter a new tag name, or use Delete to remove the tag.");
+    if (before === after) return 0;
+    return this.rewriteTags(before, (tags) => {
+      const out: string[] = [];
+      for (const tag of tags) {
+        const next = tag === before ? after : tag;
+        if (next === after && out.includes(after)) continue;
+        out.push(next);
+      }
+      return out;
+    });
+  }
+
+  /** Remove `tag` from every document carrying it. Documents may end with no
+   *  tags; nothing is reassigned. Returns the number of documents changed. */
+  deleteTag(tag: string): number {
+    const target = tag.trim();
+    if (!target) throw new Error("Select a tag to delete.");
+    return this.rewriteTags(target, (tags) => tags.filter((t) => t !== target));
+  }
+
+  private rewriteTags(match: string, rewrite: (tags: string[]) => string[]): number {
+    let affected = 0;
+    const tx = sqlite.transaction(() => {
+      const rows = sqlite
+        .prepare(`SELECT id, tags_json FROM documents WHERE id != ?`)
+        .all(SEED_WELCOME_GUIDE_DOC_ID) as { id: string; tags_json: string }[];
+      const update = sqlite.prepare("UPDATE documents SET tags_json = ? WHERE id = ?");
+      for (const row of rows) {
+        const tags = parseTagList(row.tags_json);
+        if (!tags.includes(match)) continue;
+        update.run(JSON.stringify(rewrite(tags)), row.id);
+        affected++;
+      }
+    });
+    tx();
+    return affected;
+  }
+
   // v1.1.4: merge fromKey into intoKey.
   //
   // deleteDocumentType() reassigns to the 'document' fallback, which throws
@@ -894,3 +973,15 @@ export class SqliteStorage implements IStorage {
 }
 
 export const storage = new SqliteStorage();
+
+/** v1.3.6: parse a documents.tags_json value into trimmed, non-empty strings.
+ *  Malformed JSON reads as no tags (the same tolerance as the facet code). */
+export function parseTagList(json: string | null | undefined): string[] {
+  try {
+    const value = JSON.parse(json || "[]");
+    if (!Array.isArray(value)) return [];
+    return value.filter((t): t is string => typeof t === "string").map((t) => t.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}

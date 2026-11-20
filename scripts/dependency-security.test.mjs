@@ -50,13 +50,15 @@ after(async () => {
   if (folder) fs.rmSync(folder, { recursive: true, force: true });
 });
 
+// v1.3.6: pins advanced with the November 2026 dependency refresh (multer
+// 2.5.0, qs 6.17.1 override); production and full npm audit report 0.
 test("security dependency versions are pinned at the patched releases", () => {
-  assert.equal(require("multer/package.json").version, "2.4.0");
-  assert.equal(require("qs/package.json").version, "6.16.0");
+  assert.equal(require("multer/package.json").version, "2.5.0");
+  assert.equal(require("qs/package.json").version, "6.17.1");
   const lock = require("../package-lock.json");
   const matches = Object.entries(lock.packages).filter(([name]) => /(?:^|\/)node_modules\/qs$/.test(name));
   assert.ok(matches.length > 0);
-  for (const [, pkg] of matches) assert.equal(pkg.version, "6.16.0");
+  for (const [, pkg] of matches) assert.equal(pkg.version, "6.17.1");
 });
 
 test("qs rejects the bracket-key comma array-limit bypass", () => {

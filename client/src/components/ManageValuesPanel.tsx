@@ -13,6 +13,9 @@
 // moved. The one behavior change this release is a per-row Delete button
 // in the dialog (see ProductValuesDialog.tsx COMPANION NOTE for the
 // rationale and the "reassign, don't cascade" contract).
+//
+// v1.3.6: renamed "Manage Values" (card, button and dialog) and the dialog
+// gained a third choice, Tags.
 
 import { useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -27,12 +30,12 @@ export function ManageValuesPanel() {
       <CardHeader>
         <CardTitle className="flex items-center gap-2 text-sm">
           <Tags className="h-4 w-4 text-primary" />
-          Manage Product Lists
+          Manage Values
         </CardTitle>
         <CardDescription className="text-xs">
-          Rename, merge, or delete Product model and Product family values
-          across the library. Deleting a value reassigns or clears the field;
-          documents are kept.
+          Rename, merge, or delete product models, product families and tags
+          across the library. Documents are always kept; only the value
+          changes.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -44,7 +47,7 @@ export function ManageValuesPanel() {
           className="gap-1.5"
         >
           <Tags className="h-3.5 w-3.5" />
-          Manage Product Lists
+          Manage Values
         </Button>
       </CardContent>
       <ProductValuesDialog open={open} onOpenChange={setOpen} />

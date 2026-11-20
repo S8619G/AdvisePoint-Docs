@@ -79,9 +79,9 @@ test("Settings placement, dialogs, storage polling and recovery layout", async (
     const manager = p.getByTestId("card-manage-values");
     await manager.waitFor();
     const parentOrder = await manager.evaluate(e => [...e.parentElement.children].map(c => c.textContent.slice(0, 60)));
-    assert.match(parentOrder[0], /Document types/); assert.match(parentOrder[1], /Manage Product Lists/);
+    assert.match(parentOrder[0], /Document types/); assert.match(parentOrder[1], /Manage Values/);
     await p.getByTestId("button-open-manage-values").click();
-    await p.getByRole("heading", { name: "Manage Product Lists", exact: true }).waitFor();
+    await p.getByRole("heading", { name: "Manage Values", exact: true }).waitFor();
     await p.screenshot({ path: join(evidence, "product-lists-dialog.png"), animations: "disabled" });
     await p.keyboard.press("Escape");
     await p.evaluate(() => window.scrollTo(0, 0));

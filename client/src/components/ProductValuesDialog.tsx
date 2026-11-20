@@ -70,7 +70,16 @@ import { useToast } from "@/hooks/use-toast";
 // new. This preserves the "destructive operations preserve existing data"
 // rule -- there is still no path here that silently loses a document.
 
-type Field = "product_model" | "product_family";
+// v1.3.6 TAGS
+// Tags are the third choice. They are a list per document (tags_json), so
+// they use their own endpoints (/api/tag-values/*) but the same rename /
+// merge / confirm pattern. Differences, by design:
+//   * a tag cannot be renamed to blank -- removing it is Delete;
+//   * Delete needs no reassignment: documents may have no tags, so it simply
+//     removes the tag from every document after a confirmation.
+// Only the document tag labels change; documents and other fields are kept.
+
+type Field = "product_model" | "product_family" | "tags";
 
 interface ValueEntry {
   value: string;
@@ -80,6 +89,10 @@ interface ValueEntry {
 interface ProductValues {
   models: ValueEntry[];
   families: ValueEntry[];
+}
+
+interface TagValues {
+  tags: ValueEntry[];
 }
 
 interface RenameResult {
@@ -92,7 +105,25 @@ interface RenameResult {
 const FIELD_LABEL: Record<Field, string> = {
   product_model: "Product model",
   product_family: "Product family",
+  tags: "Tags",
 };
+
+// Singular noun used in sentences ("Rename this tag?").
+const FIELD_NOUN: Record<Field, string> = {
+  product_model: "value",
+  product_family: "value",
+  tags: "tag",
+};
+
+function invalidateValueQueries() {
+  // Every surface that reads these strings has to be refreshed: the value
+  // lists, the document list (Library quick search reads tags from it), and
+  // /api/facets, which feeds the filter dropdowns and the tag suggestions.
+  queryClient.invalidateQueries({ queryKey: ["/api/product-values"] });
+  queryClient.invalidateQueries({ queryKey: ["/api/tag-values"] });
+  queryClient.invalidateQueries({ queryKey: ["/api/documents"] });
+  queryClient.invalidateQueries({ queryKey: ["/api/facets"] });
+}
 
 function docCount(n: number) {
   return `${n} ${n === 1 ? "document" : "documents"}`;
@@ -121,10 +152,17 @@ export function ProductValuesDialog({
     queryKey: ["/api/product-values"],
     enabled: open,
   });
+  const { data: tagData, isLoading: tagsLoading } = useQuery<TagValues>({
+    queryKey: ["/api/tag-values"],
+    enabled: open,
+  });
+  const isTags = field === "tags";
+  const listLoading = isTags ? tagsLoading : isLoading;
 
   const entries = useMemo(
-    () => (field === "product_model" ? data?.models : data?.families) ?? [],
-    [data, field],
+    () =>
+      (field === "product_model" ? data?.models : field === "product_family" ? data?.families : tagData?.tags) ?? [],
+    [data, tagData, field],
   );
 
   const trimmed = draft.trim();
@@ -138,24 +176,30 @@ export function ProductValuesDialog({
     return entries.find((e) => e.value.toLowerCase() === trimmed.toLowerCase() && e.value !== current) ?? null;
   }, [entries, trimmed, current]);
 
-  const unchanged = !trimmed && !current ? true : trimmed === current;
-  const clearing = trimmed === "" && current !== "";
+  // Tags cannot be renamed to blank (that is Delete), so an empty draft is
+  // treated as "nothing to apply" for tags.
+  const unchanged = !trimmed && !current ? true : trimmed === current || (isTags && !trimmed);
+  const clearing = !isTags && trimmed === "" && current !== "";
 
   const rename = useMutation({
     mutationFn: async () => {
-      const res = await apiRequest("POST", "/api/product-values/rename", {
-        field,
-        from: current,
-        to: trimmed,
-      });
+      const res = isTags
+        ? await apiRequest("POST", "/api/tag-values/rename", {
+            from: current,
+            // A merge lands on the existing tag's exact spelling, matching
+            // what the merge notice promised (typing "FUSER" when "Fuser"
+            // exists merges into "Fuser").
+            to: mergeTarget ? mergeTarget.value : trimmed,
+          })
+        : await apiRequest("POST", "/api/product-values/rename", {
+            field,
+            from: current,
+            to: trimmed,
+          });
       return (await res.json()) as RenameResult;
     },
     onSuccess: (result) => {
-      // Every surface that reads these strings has to be refreshed: the value
-      // list itself, the document list, and the facet-driven filter dropdowns.
-      queryClient.invalidateQueries({ queryKey: ["/api/product-values"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/documents"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/facets"] });
+      invalidateValueQueries();
       toast({
         title: result.to
           ? `Updated ${docCount(result.affected)}`
@@ -199,6 +243,11 @@ export function ProductValuesDialog({
   const deleteMerge = useMutation({
     mutationFn: async () => {
       if (!deleting) throw new Error("No value selected.");
+      if (isTags) {
+        const res = await apiRequest("POST", "/api/tag-values/delete", { tag: deleting.value, confirm: true });
+        const body = (await res.json()) as { tag: string; affected: number };
+        return { field, from: body.tag, to: "", affected: body.affected } as RenameResult;
+      }
       const to = deleteMode === "clear" ? "" : deleteTarget.trim();
       const res = await apiRequest("POST", "/api/product-values/rename", {
         field,
@@ -208,11 +257,11 @@ export function ProductValuesDialog({
       return (await res.json()) as RenameResult;
     },
     onSuccess: (result) => {
-      queryClient.invalidateQueries({ queryKey: ["/api/product-values"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/documents"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/facets"] });
+      invalidateValueQueries();
       toast({
-        title: result.to
+        title: isTags
+          ? `Removed tag “${result.from}” from ${docCount(result.affected)}`
+          : result.to
           ? `Merged into “${result.to}” on ${docCount(result.affected)}`
           : `Cleared ${FIELD_LABEL[field].toLowerCase()} on ${docCount(result.affected)}`,
         description: result.to ? `“${result.from}” → “${result.to}”` : undefined,
@@ -252,15 +301,15 @@ export function ProductValuesDialog({
       >
         <DialogContent className="max-w-2xl">
           <DialogHeader>
-            <DialogTitle>Manage Product Lists</DialogTitle>
+            <DialogTitle>Manage Values</DialogTitle>
             <DialogDescription>
-              Rename a value everywhere it is used, or merge two values that should be one.
-              Changes apply to every document using the value.
+              Rename a product model, product family or tag everywhere it is used, merge two that
+              should be one, or delete one. Changes apply to every document using it; documents are kept.
             </DialogDescription>
           </DialogHeader>
 
           <div className="flex gap-1">
-            {(["product_model", "product_family"] as Field[]).map((option) => (
+            {(["product_model", "product_family", "tags"] as Field[]).map((option) => (
               <Button
                 key={option}
                 size="sm"
@@ -277,24 +326,24 @@ export function ProductValuesDialog({
             ))}
           </div>
 
-          {isLoading ? (
+          {listLoading ? (
             <div className="flex items-center gap-2 py-8 text-sm text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" />
               Loading values…
             </div>
           ) : entries.length === 0 ? (
             <div className="py-8 text-center text-sm text-muted-foreground" data-testid="text-no-values">
-              No {FIELD_LABEL[field].toLowerCase()} values in use yet.
+              {isTags ? "No tags in use yet." : `No ${FIELD_LABEL[field].toLowerCase()} values in use yet.`}
             </div>
           ) : (
             <div className="max-h-[320px] space-y-1 overflow-y-auto pr-1">
               {entries.map((entry) => (
                 <div
                   key={entry.value}
-                  className="flex items-center justify-between gap-3 rounded-md border px-3 py-2"
+                  className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 rounded-md border px-3 py-2"
                   data-testid={`row-value-${entry.value}`}
                 >
-                  <span className="min-w-0 flex-1 truncate text-sm">{entry.value}</span>
+                  <span className="min-w-[8rem] flex-1 truncate text-sm">{entry.value}</span>
                   <Badge variant="secondary" className="shrink-0 text-[10px]">
                     {docCount(entry.count)}
                   </Badge>
@@ -329,31 +378,36 @@ export function ProductValuesDialog({
           {editing && (
             <div className="space-y-2 rounded-md border bg-muted/40 p-3">
               <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                New {FIELD_LABEL[field].toLowerCase()}
+                {isTags ? "New tag name" : `New ${FIELD_LABEL[field].toLowerCase()}`}
               </Label>
               <Input
                 value={draft}
                 onChange={(e) => setDraft(e.target.value)}
                 maxLength={200}
                 autoFocus
-                placeholder={field === "product_model" ? "Leave blank to clear" : "Leave blank to clear"}
+                placeholder={isTags ? "Enter the new tag name" : "Leave blank to clear"}
                 data-testid="input-rename-value"
               />
               {mergeTarget ? (
                 <p className="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
                   <Merge className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                   <span>
-                    “{mergeTarget.value}” already exists with {docCount(mergeTarget.count)}. This will
-                    merge both into one value used by {docCount(affectedTotal)}.
+                    {isTags
+                      ? `“${mergeTarget.value}” already exists on ${docCount(mergeTarget.count)}. This will merge both into one tag; a document that has both keeps it once.`
+                      : `“${mergeTarget.value}” already exists with ${docCount(mergeTarget.count)}. This will merge both into one value used by ${docCount(affectedTotal)}.`}
                   </span>
                 </p>
               ) : clearing ? (
                 <p className="text-xs text-muted-foreground">
                   This clears {FIELD_LABEL[field].toLowerCase()} on {docCount(editing.count)}.
                 </p>
+              ) : isTags && !trimmed ? (
+                <p className="text-xs text-muted-foreground">
+                  Enter a new name. To remove the tag from every document, use Delete instead.
+                </p>
               ) : (
                 <p className="text-xs text-muted-foreground">
-                  This renames the value on {docCount(editing.count)}.
+                  This renames the {FIELD_NOUN[field]} on {docCount(editing.count)}.
                 </p>
               )}
             </div>
@@ -393,6 +447,17 @@ export function ProductValuesDialog({
               Delete “{deleting?.value ?? ""}”?
             </AlertDialogTitle>
             <AlertDialogDescription asChild>
+              {isTags ? (
+                <div className="space-y-3 text-sm" data-testid="text-delete-tag">
+                  <p>
+                    “{deleting?.value ?? ""}” will be removed from {docCount(deleting?.count ?? 0)}.
+                    The documents themselves are kept, along with their other tags.
+                  </p>
+                  <p className="text-muted-foreground">
+                    There is no undo step — export a backup first from Settings if you want a restore point.
+                  </p>
+                </div>
+              ) : (
               <div className="space-y-3 text-sm">
                 <p>
                   This value is used by {docCount(deleting?.count ?? 0)}. Pick
@@ -446,6 +511,7 @@ export function ProductValuesDialog({
                     : "Pick a value above to merge into."}
                 </p>
               </div>
+              )}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -453,7 +519,7 @@ export function ProductValuesDialog({
             <AlertDialogAction
               disabled={
                 deleteMerge.isPending ||
-                (deleteMode === "merge" && !deleteTarget.trim())
+                (!isTags && deleteMode === "merge" && !deleteTarget.trim())
               }
               onClick={(e) => {
                 e.preventDefault();
@@ -466,6 +532,8 @@ export function ProductValuesDialog({
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                   Applying…
                 </>
+              ) : isTags ? (
+                "Delete tag"
               ) : deleteMode === "clear" ? (
                 "Clear field"
               ) : (
@@ -482,11 +550,25 @@ export function ProductValuesDialog({
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
-              {mergeTarget ? "Merge these values?" : clearing ? "Clear this value?" : "Rename this value?"}
+              {isTags
+                ? mergeTarget
+                  ? "Merge these tags?"
+                  : "Rename this tag?"
+                : mergeTarget
+                ? "Merge these values?"
+                : clearing
+                ? "Clear this value?"
+                : "Rename this value?"}
             </AlertDialogTitle>
             <AlertDialogDescription asChild>
               <div className="space-y-2 text-sm">
-                {mergeTarget ? (
+                {mergeTarget && isTags ? (
+                  <p>
+                    “{current}” ({docCount(editing?.count ?? 0)}) will be merged into “{mergeTarget.value}”
+                    ({docCount(mergeTarget.count)}). {docCount(editing?.count ?? 0)} will change; a document
+                    that already has both keeps “{mergeTarget.value}” once.
+                  </p>
+                ) : mergeTarget ? (
                   <p>
                     “{current}” ({docCount(editing?.count ?? 0)}) will be merged into “{mergeTarget.value}”
                     ({docCount(mergeTarget.count)}), giving one value used by {docCount(affectedTotal)}.

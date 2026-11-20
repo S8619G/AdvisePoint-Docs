@@ -34,6 +34,8 @@ import {
 // The worker thread is idle until /api/updater/shutdown arms it.
 import "./shutdown-watchdog-holder";
 import { APP_VERSION } from "../client/src/version";
+import { crossSiteGuard } from "./request-guard";
+import { runResumeCheck } from "./resume-check";
 
 const app = express();
 const httpServer = createServer(app);
@@ -44,6 +46,10 @@ app.use((req, res, next) => {
   }
   next();
 });
+
+// v1.3.6: refuse cross-site and DNS-rebinding /api writes before any body
+// parser or multer runs. See server/request-guard.ts.
+app.use(crossSiteGuard);
 
 declare module "http" {
   interface IncomingMessage {
@@ -149,6 +155,7 @@ app.get("/api/heartbeat", (_req, res) => {
         log(
           `process timer gap ${Math.round(result.suspendedMs / 1000)}s; heartbeat observation reset (cause unknown)`,
         );
+        scheduleResumeCheck();
       } else {
         log("system clock moved backwards; heartbeat observation reset");
       }
@@ -160,7 +167,7 @@ app.get("/api/heartbeat", (_req, res) => {
   }, IDLE_CHECK_MS).unref();
 }
 
-registerApplicationLifecycle(app, httpServer, () => {
+function isAppBusy(): boolean {
   const snap = getRenderQueueSnapshot();
   let updating = false;
   if (process.env.LOCALAPPDATA) {
@@ -174,7 +181,37 @@ registerApplicationLifecycle(app, httpServer, () => {
   return snap.running || snap.queue_depth > 0 || isRenderedPrintBusy() ||
     isPdfCompatibilityBusy() || isBackupInFlight() || isDbClosedForRestore() ||
     hasActiveEditSessions() || updating;
-}, () => process.exit(0));
+}
+
+registerApplicationLifecycle(app, httpServer, isAppBusy, () => process.exit(0));
+
+// v1.3.6: after a process timer gap, make one request to our own listener
+// and log the result (see server/resume-check.ts). Only one check runs at a
+// time; a listener bound to a specific non-loopback address is skipped
+// because 127.0.0.1 would not reach it.
+let resumeCheckRunning = false;
+function scheduleResumeCheck() {
+  if (resumeCheckRunning) return;
+  const address = httpServer.address();
+  const boundHost = address && typeof address === "object" ? address.address : "";
+  if (boundHost && !["127.0.0.1", "::1", "0.0.0.0", "::", "::ffff:127.0.0.1"].includes(boundHost)) {
+    log(`listener self-check skipped (bound to ${boundHost})`);
+    return;
+  }
+  resumeCheckRunning = true;
+  void runResumeCheck({
+    port: () => {
+      const a = httpServer.address();
+      return a && typeof a === "object" ? a.port : null;
+    },
+    listening: () => httpServer.listening,
+    isBusy: isAppBusy,
+    log,
+    exit: () => process.exit(0),
+  })
+    .catch((error) => log(`listener self-check error: ${(error as Error).message}`))
+    .finally(() => { resumeCheckRunning = false; });
+}
 
 // v0.9.16: log method/path/status/duration only. Previous versions logged the
 // full JSON response body, which meant search results and ingested document

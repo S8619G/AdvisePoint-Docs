@@ -75,10 +75,11 @@ if not exist "%~dp0.unblocked" (
     echo v0.9.29 unblock complete > "%~dp0.unblocked"
 )
 
-REM Free any stale process listening on port 5000 (best-effort)
-for /f "tokens=5" %%a in ('netstat -aon ^| findstr ":5000" ^| findstr "LISTENING"') do (
-    taskkill /F /PID %%a >nul 2>&1
-)
+REM v1.3.6: the "force-close anything listening on :5000" step that used
+REM to sit here is gone. It closed a healthy server, matched unrelated ports
+REM such as 50000-50009, and produced two "exited with error code 1"
+REM windows (field report 2026-11-18). launcher\relaunch.cjs now decides,
+REM after the log folder is known (below).
 
 REM ---------------- Storage paths ----------------
 REM Keep the SQLite DB and rendered page images together under LOCALAPPDATA
@@ -92,6 +93,37 @@ REM ---------------- Log file ----------------
 set "APD_LOG_DIR=%LOCALAPPDATA%\AdvisePoint Docs"
 if not exist "%APD_LOG_DIR%" mkdir "%APD_LOG_DIR%" >nul 2>&1
 set "APD_LOG=%APD_LOG_DIR%\server.log"
+set "APD_FAILURE=%APD_LOG_DIR%\launch-failure.txt"
+
+REM ---------------- v1.3.6: existing server check ----------------
+REM launcher\relaunch.cjs (bundled node) checks port 5000 before anything
+REM is stopped:
+REM   exit 0  : a healthy AdvisePoint Docs of this version is already
+REM             running -> open the browser to it and stop here.
+REM   exit 10 : port free, or the previous server was replaced -> start.
+REM             Replacement order: confirmed Stop request, wait for a clean
+REM             exit, and only then force-close this install's node.exe on
+REM             exactly port 5000. PID and reason go to launcher.log, and a
+REM             ".replaced" note keeps the old launcher from showing a false
+REM             crash window.
+REM   exit 20 : cannot start (for example port 5000 belongs to another
+REM             program); show one window with the reason.
+if exist "%~dp0launcher\relaunch.cjs" (
+    "%~dp0node\node.exe" "%~dp0launcher\relaunch.cjs" --prepare
+) else (
+    cmd /c exit 10
+)
+set "APD_PREP=%ERRORLEVEL%"
+if "%APD_PREP%"=="0" (
+    start "" "http://127.0.0.1:5000/"
+    endlocal
+    exit /b 0
+)
+if "%APD_PREP%"=="20" goto :launch_failed
+REM Start time of THIS launch, taken after the check above: only a later
+REM replacement (by a newer launch) may silence this launcher's crash window.
+set "APD_STARTED_MS=0"
+if exist "%~dp0launcher\relaunch.cjs" for /f "delims=" %%t in ('call "%~dp0node\node.exe" "%~dp0launcher\relaunch.cjs" --now') do set "APD_STARTED_MS=%%t"
 
 REM v1.0.9.23: rotate previous session's log out of the way so this
 REM session starts fresh. Matches the effective behavior of the old
@@ -117,7 +149,15 @@ REM APD_OPEN_BROWSER=1 tells the server to launch the default browser once
 REM it's actually listening (see server/index.ts). That replaces the old
 REM detached PowerShell Start-Sleep + Start-Process one-liner.
 set APD_OPEN_BROWSER=1
-echo [launcher] %DATE% %TIME% node-start log=%APD_LOG% >> "%APD_LOG%"
+REM v1.3.6: if server.log cannot be opened, node's redirect below would fail
+REM with exit code 1 and no explanation. Detect it and say so instead.
+(echo [launcher] %DATE% %TIME% node-start log=%APD_LOG% >> "%APD_LOG%") 2>nul || (
+    > "%APD_FAILURE%" echo AdvisePoint Docs could not start.
+    >> "%APD_FAILURE%" echo.
+    >> "%APD_FAILURE%" echo The log file is in use by another process: %APD_LOG%
+    >> "%APD_FAILURE%" echo Wait a few seconds, then start AdvisePoint Docs again. If it keeps happening, restart Windows.
+    goto :launch_failed
+)
 "%~dp0node\node.exe" --max-old-space-size=4096 "%~dp0dist\index.cjs" >> "%APD_LOG%" 2>&1
 set "APD_EXIT=%ERRORLEVEL%"
 echo [launcher] %DATE% %TIME% node-exit exit_code=%APD_EXIT% >> "%APD_LOG%"
@@ -145,6 +185,13 @@ if not "%APD_EXIT%"=="0" if exist "%APD_UPDATE_SENTINEL%" (
     forfiles /p "%LOCALAPPDATA%\AdvisePoint Docs" /m ".updating" /d -1 >nul 2>&1
     if errorlevel 1 set "APD_SUPPRESS_CRASH=1"
 )
+REM v1.3.6: a newer launch replaced this server (see relaunch.cjs). The exit
+REM code here is then expected, not a crash. Only a replacement recorded
+REM after THIS launcher started counts, so a stale note never hides a crash.
+if not "%APD_EXIT%"=="0" if not defined APD_SUPPRESS_CRASH if exist "%~dp0launcher\relaunch.cjs" (
+    "%~dp0node\node.exe" "%~dp0launcher\relaunch.cjs" --consume-replaced %APD_STARTED_MS% >nul 2>&1
+    if not errorlevel 1 set "APD_SUPPRESS_CRASH=1"
+)
 if not "%APD_EXIT%"=="0" if not defined APD_SUPPRESS_CRASH (
     if defined APD_HIDDEN (
         start "AdvisePoint Docs - crashed" cmd /k "echo. & echo ===================================================================== & echo  AdvisePoint Docs exited with error code %APD_EXIT%. & echo  Full log: %APD_LOG% & echo ===================================================================== & echo."
@@ -161,3 +208,24 @@ if not "%APD_EXIT%"=="0" if not defined APD_SUPPRESS_CRASH (
 )
 
 endlocal
+exit /b
+
+REM ---------------- v1.3.6: single clear failure window ----------------
+REM Reached only when the server cannot be started. launch-failure.txt holds
+REM the reason written by relaunch.cjs (or the log check above).
+:launch_failed
+if not exist "%APD_FAILURE%" (
+    > "%APD_FAILURE%" echo AdvisePoint Docs could not start.
+    >> "%APD_FAILURE%" echo See %APD_LOG_DIR%\launcher.log for details.
+)
+echo [launcher] %DATE% %TIME% launch-failed see=%APD_FAILURE% >> "%APD_LOG_DIR%\launcher.log" 2>nul
+if defined APD_HIDDEN (
+    start "AdvisePoint Docs - could not start" cmd /k "echo. & type "%APD_FAILURE%" & echo. & echo Details: %APD_LOG_DIR%\launcher.log & echo."
+) else (
+    echo.
+    type "%APD_FAILURE%"
+    echo.
+    pause
+)
+endlocal
+exit /b 1

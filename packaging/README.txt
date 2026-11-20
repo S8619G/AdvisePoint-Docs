@@ -38,7 +38,11 @@ origin and checksum before deciding whether to allow it.
 
 Closing the browser tab leaves the local service running. Background
 or suspended tabs do not trigger an automatic shutdown. Reopening
-the launcher reconnects to the existing service.
+the launcher reconnects to the existing service without restarting it.
+If the service is not responding, the launcher asks it to stop and
+starts a fresh one; it closes the old service only as a last resort
+and never closes other programs. If the app cannot start, one window
+explains why, for example when another program uses port 5000.
 
 To stop intentionally, use Settings > System > Diagnostics >
 "Stop application". Confirm only after finishing uploads, printing,
@@ -235,7 +239,7 @@ System:
 
 Formats, in order:
   * Document types, including per-type document usage counts.
-  * Manage Product Lists.
+  * Manage Values.
   * Filename codes.
   * Filename phrases.
 
@@ -258,24 +262,29 @@ copies, logs, backups and retained recovery data are not the active
 library total. SQLite files do not necessarily shrink immediately
 after documents are removed.
 
-DOCUMENT TYPES AND PRODUCT LISTS
--------------------------------
+DOCUMENT TYPES AND VALUES
+-------------------------
 
 Settings > Formats > Document types supports renaming, recoloring,
 reordering, merging and deleting types, with usage counts. Deleting
 a type assigns its documents to the fallback Document type;
 merge instead to preserve a specific classification.
 
-Manage Product Lists is directly below Document types. Its Product
-model and Product family lists come from values used by documents,
-not a separate empty-list registry. Each entry shows usage.
+Manage Values is directly below Document types. Its Product model,
+Product family and Tags lists come from values used by documents,
+not a separate empty-list registry. Each entry shows usage; tags are
+listed most used first.
 
   * Rename changes the value on affected documents.
-  * Merge combines an entry with an existing value.
-  * Delete reassigns the value or clears the field.
+  * Merge combines an entry with an existing value. For tags, a
+    document that had both keeps the tag once; this also combines
+    case variants such as "Fuser" and "fuser".
+  * Delete reassigns or clears a product value. For tags, Delete
+    removes the tag from every document; documents may have no tags.
 
-These changes keep the documents. Review the affected count and
-make a backup before bulk changes; there is no single-click undo.
+Only the chosen value changes, and the documents are kept. Review the
+affected count and make a backup before bulk changes; there is no
+single-click undo.
 
 Filename codes are matched before Filename phrases. Phrases run when
 no code matches. Both use the filename to suggest a Document type;
@@ -355,7 +364,9 @@ Do not delete or reset it as a routine troubleshooting step.
 
 If the interface cannot connect, wait briefly if an update is running,
 then try the normal launcher. A connection warning does not establish
-whether the cause is a crash, restart or other interruption.
+whether the cause is a crash, restart or other interruption. The
+launcher records each decision, including any stopped process and the
+reason, in launcher.log in the data folder.
 
 Settings > System > Diagnostics > "Export logs for analysis" downloads
 a diagnostic ZIP. It includes current and previous server logs,
@@ -372,8 +383,8 @@ network failure.
 VERSION
 -------
 
-AdvisePoint Docs 1.3.5
-Guide revision 1.3.5
-Guide date: November 6, 2026
+AdvisePoint Docs 1.3.6
+Guide revision 1.3.6
+Guide date: November 18, 2026
 Native Windows field acceptance, long-idle Edge testing and physical
 printing remain separate verification steps.

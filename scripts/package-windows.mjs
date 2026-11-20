@@ -47,13 +47,20 @@ import { spawnSync } from "node:child_process";
 // baseline advances accordingly, and NEW_LAUNCHER_SHA256 goes back to
 // null so we ship the baseline copy byte-identical -- the v1.0.11.1
 // hotfix does not touch packaging/Start AdvisePoint Docs.bat.
+// v1.3.6: the baseline (v1.3.5) still ships the f488c598… launcher, so
+// EXPECTED is unchanged. v1.3.6 intentionally replaces the launcher: the
+// old findstr/taskkill restart block moves into launcher/relaunch.cjs
+// (health check, version compare, confirmed Stop, exact-port and
+// exact-path force-close, one failure window). NEW_LAUNCHER_SHA256 is the
+// hash of the repo copy (CRLF line endings).
 const EXPECTED_LAUNCHER_SHA256 =
   "f488c598bf5c80dcb4c1ba5ff445372196c210bc40a9f7f282b8e6d47e175799";
 // Set NEW_LAUNCHER_SHA256 to a hash string when a release intentionally
 // changes the launcher; the packager then overwrites the baseline's
 // launcher with the repo's copy and re-verifies. null = ship the
 // baseline launcher as-is.
-const NEW_LAUNCHER_SHA256 = null;
+const NEW_LAUNCHER_SHA256 =
+  "c815ee2ee6077dd107d38490c363bfe8857ccd0fe29cade63fd2b703dc2bb78b";
 const APP_FOLDER = "AdvisePoint Docs";
 
 function usage() {

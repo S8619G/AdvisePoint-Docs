@@ -928,6 +928,48 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // -------- v1.3.6: document tag management --------
+  //
+  // Same shape as /api/product-values: tags are free text on documents, so
+  // the list is a tally and a rename is a bulk rewrite. Renaming onto an
+  // existing tag is a MERGE. Only documents.tags_json changes.
+  app.get("/api/tag-values", (_req, res) => {
+    try {
+      return res.json({ tags: storage.listTagValues() });
+    } catch (error) {
+      return res.status(500).json({ message: (error as Error).message });
+    }
+  });
+
+  app.post("/api/tag-values/rename", (req, res) => {
+    const from = typeof req.body?.from === "string" ? req.body.from.trim() : "";
+    const to = typeof req.body?.to === "string" ? req.body.to.trim() : "";
+    if (!from) return res.status(400).json({ message: "Select a tag to rename." });
+    if (!to) return res.status(400).json({ message: "Enter a new tag name, or use Delete to remove the tag." });
+    if (to.length > 200) return res.status(400).json({ message: "Enter a tag of 200 characters or fewer." });
+    if (from === to) return res.status(400).json({ message: "The new name is the same as the current one." });
+    try {
+      const affected = storage.renameTag(from, to);
+      return res.json({ from, to, affected, tags: storage.listTagValues() });
+    } catch (error) {
+      return res.status(400).json({ message: (error as Error).message });
+    }
+  });
+
+  app.post("/api/tag-values/delete", (req, res) => {
+    const tag = typeof req.body?.tag === "string" ? req.body.tag.trim() : "";
+    if (!tag) return res.status(400).json({ message: "Select a tag to delete." });
+    if (req.body?.confirm !== true) {
+      return res.status(400).json({ message: "Confirm the deletion to remove this tag from every document." });
+    }
+    try {
+      const affected = storage.deleteTag(tag);
+      return res.json({ tag, affected, tags: storage.listTagValues() });
+    } catch (error) {
+      return res.status(400).json({ message: (error as Error).message });
+    }
+  });
+
   app.patch("/api/document-types/:key", (req, res) => {
     const label = titleCaseLabel(typeof req.body?.label === "string" ? req.body.label : "");
     const nextKey = documentTypeKey(label);
@@ -3090,6 +3132,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         "update.log",
         "update.log.1",
         ".updating",
+        // v1.3.6: launcher relaunch decisions (PID and reason for every stop),
+        // the replacement note and the last start-failure reason.
+        "launcher.log",
+        "launcher.log.1",
+        ".replaced",
+        "launch-failure.txt",
       ]) {
         const p = join(logDir, name);
         if (existsSync(p)) {
@@ -3116,6 +3164,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         { label: "Update AdvisePoint Docs.bat", path: join(process.cwd(), "Update AdvisePoint Docs.bat") },
         { label: "launcher/run-hidden.vbs", path: join(process.cwd(), "launcher", "run-hidden.vbs") },
         { label: "launcher/create-shortcut.ps1", path: join(process.cwd(), "launcher", "create-shortcut.ps1") },
+        { label: "launcher/relaunch.cjs", path: join(process.cwd(), "launcher", "relaunch.cjs") },
         { label: "packaging/updater/updater.cjs", path: join(process.cwd(), "packaging", "updater", "updater.cjs") },
         { label: "VERSION", path: join(process.cwd(), "VERSION") },
         { label: ".unblocked", path: join(process.cwd(), ".unblocked") },
